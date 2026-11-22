@@ -266,34 +266,42 @@ function Read-SetupState([string]$WindowsVolume) {
     # Only allowlisted values leave copied hives. Recovery never writes to the
     # mounted source hive, and passwords/answer-file contents are never emitted.
     Assert-Root
-    $facts=@{hives_unloaded=$true;answer_candidates=@{};locale=@{};winlogon=@{}}
+    $facts=@{hives_unloaded=$true;inspection_complete=$true;answer_candidates=@{};locale=@{};winlogon=@{};hive_diagnostics=@{}}
     foreach($entry in @(@{name='panther_cached';path='Windows\Panther\Unattend.xml'},@{name='panther_explicit';path='Windows\Panther\Unattend\Unattend.xml'},@{name='sysprep';path='Windows\System32\Sysprep\Unattend.xml'})){
         $facts.answer_candidates[$entry.name]=[bool](Test-Path -LiteralPath (Join-Path $WindowsVolume $entry.path) -PathType Leaf)
     }
     foreach($kind in @('SOFTWARE','SYSTEM')){
         $hiveName='K5GuestSetup_'+[guid]::NewGuid().ToString('N');$loaded=$false
+        $note=@{subphase='snapshot_metadata';suffix='main';inspection_complete=$false}
+        $facts.hive_diagnostics[$kind]=$note
         $source=Join-Path $WindowsVolume ('Windows\System32\config\'+$kind)
         $copy=Join-Path $root ($hiveName+'.hiv')
         try{
             foreach($suffix in @('','.LOG1','.LOG2')){
+                $note.subphase='snapshot_metadata';$note.suffix=if($suffix -ceq ''){'main'}elseif($suffix -ceq '.LOG1'){'log1'}else{'log2'}
                 $candidate=$source+$suffix
                 if(-not(Test-Path -LiteralPath $candidate -PathType Leaf)){continue}
                 $info=Get-Item -LiteralPath $candidate
                 if($info.Length -gt 268435456 -or ($info.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0){throw 'Setup hive copy bound refused'}
-                Copy-Item -LiteralPath $candidate -Destination ($copy+$suffix)
+                $note.subphase='snapshot_copy';Copy-Item -LiteralPath $candidate -Destination ($copy+$suffix)
             }
+            $note.subphase='hive_load';$note.suffix='none'
             & (Join-Path $env:SystemRoot 'System32\reg.exe') load ('HKLM\'+$hiveName) $copy 2>&1|Out-Null
+            $note.load_exit_code=$LASTEXITCODE
             if($LASTEXITCODE -ne 0){throw 'Setup hive copy unavailable'};$loaded=$true
             if($kind -ceq 'SOFTWARE'){
+                $note.subphase='image_state_open'
                 $key=[Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($hiveName+'\Microsoft\Windows\CurrentVersion\Setup\State')
                 try{
+                    $note.subphase='image_state_read'
                     if($null -ne $key){
                         $value=[string]$key.GetValue('ImageState','')
                         $facts.image_state=if($value -in @('IMAGE_STATE_COMPLETE','IMAGE_STATE_UNDEPLOYABLE','IMAGE_STATE_GENERALIZE_RESEAL_TO_AUDIT','IMAGE_STATE_GENERALIZE_RESEAL_TO_OOBE','IMAGE_STATE_SPECIALIZE_RESEAL_TO_AUDIT','IMAGE_STATE_SPECIALIZE_RESEAL_TO_OOBE')){$value}elseif($value.Length -eq 0){'absent'}else{'other'}
                     }
                 }finally{if($null -ne $key){$key.Dispose()}}
-                $key=[Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($hiveName+'\Microsoft\Windows NT\CurrentVersion\Winlogon')
+                $note.subphase='winlogon_open';$key=[Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($hiveName+'\Microsoft\Windows NT\CurrentVersion\Winlogon')
                 try{
+                    $note.subphase='winlogon_read'
                     if($null -ne $key){
                         $auto=[string]$key.GetValue('AutoAdminLogon','')
                         $facts.winlogon.auto_admin_logon=if($auto -in @('0','1')){$auto}elseif($auto.Length -eq 0){'absent'}else{'other'}
@@ -302,8 +310,10 @@ function Read-SetupState([string]$WindowsVolume) {
                     }
                 }finally{if($null -ne $key){$key.Dispose()}}
             }else{
+                $note.subphase='setup_open'
                 $key=[Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($hiveName+'\Setup')
                 try{
+                    $note.subphase='setup_read'
                     if($null -ne $key){
                         foreach($name in @('OOBEInProgress','SystemSetupInProgress','SetupType','SetupPhase')){
                             $value=$key.GetValue($name,$null)
@@ -315,18 +325,32 @@ function Read-SetupState([string]$WindowsVolume) {
                         $facts.setup_command=if($value.Length -eq 0){'empty'}elseif($value -imatch '(?:windeploy|msoobe|oobe)'){'oobe'}else{'other'}
                     }
                 }finally{if($null -ne $key){$key.Dispose()}}
-                $select=[Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($hiveName+'\Select')
-                try{$control=if($null -ne $select){$select.GetValue('Current',1)}else{1}}finally{if($null -ne $select){$select.Dispose()}}
+                $note.subphase='select_open';$select=[Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($hiveName+'\Select')
+                try{$note.subphase='select_read';$control=if($null -ne $select){$select.GetValue('Current',1)}else{1}}finally{if($null -ne $select){$select.Dispose()}}
                 if($control -isnot [int] -or $control -lt 1 -or $control -gt 999){throw 'Setup control set refused'}
-                $key=[Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($hiveName+('\ControlSet{0:D3}\Control\Nls\Language' -f $control))
-                try{if($null -ne $key){foreach($name in @('Default','InstallLanguage')){$value=[string]$key.GetValue($name,'');$facts.locale[$name]=if($value -match '^[0-9a-fA-F]{4}$'){$value.ToLowerInvariant()}elseif($value.Length -eq 0){'absent'}else{'other'}}}}finally{if($null -ne $key){$key.Dispose()}}
+                $note.subphase='language_open';$key=[Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($hiveName+('\ControlSet{0:D3}\Control\Nls\Language' -f $control))
+                try{$note.subphase='language_read';if($null -ne $key){foreach($name in @('Default','InstallLanguage')){$value=[string]$key.GetValue($name,'');$facts.locale[$name]=if($value -match '^[0-9a-fA-F]{4}$'){$value.ToLowerInvariant()}elseif($value.Length -eq 0){'absent'}else{'other'}}}}finally{if($null -ne $key){$key.Dispose()}}
+            }
+            $note.inspection_complete=$true
+        }catch{
+            $facts.inspection_complete=$false
+            $note.failure_subphase=$note.subphase;$note.failure_suffix=$note.suffix
+            $note.failure_kind=$_.Exception.GetType().Name;$note.failure_hresult=$_.Exception.HResult
+            $inner=$_.Exception
+            for($depth=0;$null -ne $inner -and $depth -lt 8;$depth++){
+                if($inner -is [ComponentModel.Win32Exception]){$note.failure_native_code=$inner.NativeErrorCode;break};$inner=$inner.InnerException
             }
         }finally{
             if($loaded){
-                & (Join-Path $env:SystemRoot 'System32\reg.exe') unload ('HKLM\'+$hiveName) 2>&1|Out-Null
-                if($LASTEXITCODE -ne 0){$facts.hives_unloaded=$false;throw 'Owned setup hive remains loaded'}
+                $note.subphase='hive_unload'
+                try{& (Join-Path $env:SystemRoot 'System32\reg.exe') unload ('HKLM\'+$hiveName) 2>&1|Out-Null}
+                catch{$receipt.cleanup_complete=$false;$receipt.registry_cleanup_failure=@{hive_kind=$kind;subphase='hive_unload';failure_kind=$_.Exception.GetType().Name;hresult=$_.Exception.HResult};throw}
+                $note.unload_exit_code=$LASTEXITCODE
+                if($LASTEXITCODE -ne 0){$facts.hives_unloaded=$false;$receipt.cleanup_complete=$false;$receipt.registry_cleanup_failure=@{hive_kind=$kind;subphase='hive_unload';native_exit_code=$LASTEXITCODE};throw 'Owned setup hive remains loaded'}
             }
-            foreach($suffix in @('','.LOG1','.LOG2')){if(Test-Path -LiteralPath ($copy+$suffix)){Remove-Item -LiteralPath ($copy+$suffix) -Force}}
+            # Copies remain private until the outer exact-owned-tree cleanup;
+            # only successfully unloaded hives permit VM observation to proceed.
+            $note.subphase='complete';$note.private_copy_cleanup='deferred_to_owned_root'
         }
     }
     return $facts
@@ -386,11 +410,13 @@ function Read-BootFailureOffline {
         }
     }finally{
         if($null -ne $attached){
-            $admitted=Get-VHD -Path $image
-            if(-not $admitted.Attached -or [int]$admitted.DiskNumber -ne [int]$attached.DiskNumber){throw 'Diagnostic disk attachment changed'}
-            if($null -ne $diagnosticPartition){Remove-PartitionAccessPath -DiskNumber ([int]$attached.DiskNumber) -PartitionNumber $diagnosticPartition -AccessPath $diagnosticMount}
-            Dismount-VHD -Path $image
-            if((Get-VHD -Path $image).Attached){throw 'Diagnostic disk remains mounted'}
+            try{
+                $admitted=Get-VHD -Path $image
+                if(-not $admitted.Attached -or [int]$admitted.DiskNumber -ne [int]$attached.DiskNumber){throw 'Diagnostic disk attachment changed'}
+                if($null -ne $diagnosticPartition){Remove-PartitionAccessPath -DiskNumber ([int]$attached.DiskNumber) -PartitionNumber $diagnosticPartition -AccessPath $diagnosticMount}
+                Dismount-VHD -Path $image
+                if((Get-VHD -Path $image).Attached){throw 'Diagnostic disk remains mounted'}
+            }catch{$receipt.cleanup_complete=$false;$receipt.diagnostic_disk_cleanup_failed=$true;throw}
         }
     }
     return $facts
