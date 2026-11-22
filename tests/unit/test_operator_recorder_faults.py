@@ -279,6 +279,61 @@ def test_failed_fault_commit_keeps_visible_fault_then_flushes_after_persistence_
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("transition", ["fault", "recovery"])
+def test_pending_fault_or_recovery_is_unavailable_until_actual_metadata_commit(
+    scenario, monkeypatch, transition
+):
+    entered, release = threading.Event(), threading.Event()
+
+    async def run():
+        s = scenario
+        await s.monitor.sample()
+        if transition == "recovery":
+            s.observed["storage_allowed"] = False
+            await s.monitor.sample()
+        assert s.monitor.snapshot()["available"] is True
+        before = await asyncio.to_thread(RecorderFaultStore(s.audit).load)
+        original = s.monitor.store.commit
+
+        def held(value):
+            entered.set()
+            assert release.wait(3), "Pending recorder metadata commit was not released"
+            return original(value)
+
+        monkeypatch.setattr(s.monitor.store, "commit", held)
+        s.observed["storage_allowed"] = transition == "recovery"
+        writing = asyncio.create_task(s.monitor.sample())
+        try:
+            for _ in range(100):
+                if entered.is_set():
+                    break
+                await asyncio.sleep(0.005)
+            assert entered.is_set() and not writing.done()
+            pending = s.monitor.snapshot()
+            # Read the real database while the actual metadata write is held.
+            # The new in-memory observation must not masquerade as saved state.
+            stored = await asyncio.to_thread(RecorderFaultStore(s.audit).load)
+            assert stored == before
+            assert s.monitor._state["sequence"] == stored["sequence"] + 1
+            assert pending["monitoring"] is True
+            assert bool(pending["active"]) == (transition == "fault")
+            assert pending["available"] is False
+        finally:
+            release.set()
+            await writing
+        confirmed = s.monitor.snapshot()
+        stored = await asyncio.to_thread(RecorderFaultStore(s.audit).load)
+        assert confirmed["available"] is True
+        assert stored["sequence"] == before["sequence"] + 1
+        assert stored["active"] == confirmed["active"]
+        assert stored["history"] == confirmed["history"]
+
+    try:
+        asyncio.run(run())
+    finally:
+        release.set()
+
+
 def test_monitor_close_joins_a_pending_fault_write_before_audit_can_close(scenario, monkeypatch):
     entered, release = threading.Event(), threading.Event()
     original = scenario.monitor.store.commit

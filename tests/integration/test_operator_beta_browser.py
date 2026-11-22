@@ -2203,8 +2203,9 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
         page.wait_for_function("""() => {
             const status = document.getElementById('service-status').textContent;
             const storage = document.getElementById('storage-status').textContent;
+            const alerts = document.getElementById('recorder-alerts');
             return status === 'Media service ready' && storage.includes('recording limit') &&
-              storage.includes('disk free');
+              storage.includes('disk free') && alerts !== null && alerts.hidden;
         }""")
         diagnostics = client.json("/api/v1/operator/status")
         _require(
@@ -2216,12 +2217,26 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
                 "analytics_status",
                 "server_utc",
                 "clock",
+                "recorder_alerts",
             }
             and diagnostics["worker_status"] == "ready"
             and diagnostics["analytics_status"] == "disabled"
             and diagnostics["max_recording_bytes"] == 20 * 1024**3
             and diagnostics["storage"]["recording_allowed"] is True,
             "Operator service and storage status was incomplete",
+        )
+        alerts = diagnostics["recorder_alerts"]
+        _require(
+            type(alerts) is dict
+            and set(alerts) == {"visible", "available", "monitoring", "active", "history"}
+            and alerts["visible"] is True
+            and alerts["available"] is True
+            and alerts["monitoring"] is True
+            and type(alerts["active"]) is list
+            and alerts["active"] == []
+            and type(alerts["history"]) is list
+            and alerts["history"] == [],
+            "Recorder alert monitoring was not ready on the fresh site",
         )
         _assert_recorder_time_health(page, client)
         receipt["recorder_time_health_displayed"] = True

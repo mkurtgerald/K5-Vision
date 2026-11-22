@@ -289,8 +289,34 @@ def _retained_timeline_play(browser_helpers, page, camera_id):
     return decoded["frames"]
 
 
-def _wizard(desktop, api, app_form, cohort):
-    api.click(api.control(app_form, 1012))
+def _migration_control_ready(api, form, identifier):
+    control = api.control(form, identifier)
+    return bool(control and api.api.IsWindowVisible(control) and api.api.IsWindowEnabled(control))
+
+
+def _migration_click(api, form, identifier, diagnostic):
+    try:
+        api.click(api.control(form, identifier))
+    except BaseException:
+        if diagnostic is not None:
+            diagnostic["migration_click_failure_control_id"] = identifier
+            try:
+                control = api.control(form, identifier)
+                diagnostic["migration_click_failure_control_exists"] = bool(control)
+                diagnostic["migration_click_failure_control_visible"] = bool(
+                    control and api.api.IsWindowVisible(control)
+                )
+                diagnostic["migration_click_failure_control_enabled"] = bool(
+                    control and api.api.IsWindowEnabled(control)
+                )
+            except BaseException:
+                pass
+        raise
+
+
+def _wizard(desktop, api, app_form, cohort, diagnostic=None):
+    _migration_click(api, app_form, 1012, diagnostic)
+    admitted = set()
 
     def find():
         for window in api.windows():
@@ -301,18 +327,22 @@ def _wizard(desktop, api, app_form, cohort):
                 current = cohort.native.details((os.getpid(), cohort.native.birth(os.getpid())))
                 assert details["sid"] == current["sid"] and details["elevated"] is True
                 assert details["session"] == current["session"] and details["session"] > 0
-                cohort.add(process, role="gui", expected_identity=(process.pid, birth))
-                return window, process
+                identity = process.pid, birth
+                if identity not in admitted:
+                    cohort.add(process, role="gui", expected_identity=identity)
+                    admitted.add(identity)
+                if _migration_control_ready(api, window, 1104):
+                    return window, process
         return None
 
     return desktop._wait(find, "Actual same-user elevated migration window", timeout=30)
 
 
-def _authorize(api, window, username, password, code):
+def _authorize(api, window, username, password, code, diagnostic=None):
     api.set_text(window, 1101, username)
     api.set_text(window, 1102, password)
     api.set_text(window, 1103, code)
-    api.click(api.control(window, 1104))
+    _migration_click(api, window, 1104, diagnostic)
 
 
 def _refused_signin(desktop, api, window):
@@ -632,22 +662,22 @@ def test_native_windows_legacy_service_migration_and_manual_reversal(record_test
         app = d._start_app(installed, machine_profile, 8000, cohort)
         form = d._wait(lambda: api.form(app.pid), "Service client migration window", process=app)
         d._wait(
-            lambda: api.api.IsWindowEnabled(api.control(form, 1012)),
+            lambda: _migration_control_ready(api, form, 1012),
             "Native existing-site migration control",
             process=app,
         )
-        window, wizard_process = _wizard(d, api, form, cohort)
+        window, wizard_process = _wizard(d, api, form, cohort, diagnostic)
         diagnostic["phase"] = "native_authorization_controls"
-        _authorize(api, window, username, "incorrect-generated-password", "")
+        _authorize(api, window, username, "incorrect-generated-password", "", diagnostic)
         _refused_signin(d, api, window)
         assert not (machine_profile / "identity").exists()
         receipt["existing_admin_password_required"] = True
-        _authorize(api, window, username, password, "")
+        _authorize(api, window, username, password, "", diagnostic)
         _refused_signin(d, api, window)
         assert not (machine_profile / "identity").exists()
         receipt["existing_mfa_required"] = True
         diagnostic["phase"] = "actual_native_cancel"
-        _authorize(api, window, username, password, recovery[1])
+        _authorize(api, window, username, password, recovery[1], diagnostic)
         source_held, cancelled_stage, cancelled_payload, sealed_before_cancel = _hold_copy(
             d, service, profile, wizard_process, cohort
         )
@@ -677,12 +707,12 @@ def test_native_windows_legacy_service_migration_and_manual_reversal(record_test
         }
         diagnostic["phase"] = "authenticated_pending_recovery"
         d._wait(
-            lambda: api.api.IsWindowEnabled(api.control(form, 1012)),
+            lambda: _migration_control_ready(api, form, 1012),
             "Native retry after cancelled pending transaction",
             process=app,
         )
-        window, wizard_process = _wizard(d, api, form, cohort)
-        _authorize(api, window, username, password, recovery[2])
+        window, wizard_process = _wizard(d, api, form, cohort, diagnostic)
+        _authorize(api, window, username, password, recovery[2], diagnostic)
         d._wait(
             lambda: not api.api.IsWindow(window), "Verified native migration completed", timeout=120
         )

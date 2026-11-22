@@ -398,6 +398,7 @@ class RecorderFaultMonitor:
             return {
                 "available": self._loaded
                 and self._persistence_available
+                and self._state["sequence"] == self._durable_sequence
                 and not self.store.audit._failed
                 and self.store.audit._connection is not None
                 and fresh,
