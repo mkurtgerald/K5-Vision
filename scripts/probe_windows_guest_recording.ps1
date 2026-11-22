@@ -36,7 +36,10 @@ Add-Type -TypeDefinition @'
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 public sealed class K5GuestProcessNotes {
   readonly object gate=new object(); readonly StringBuilder text=new StringBuilder();
   public K5GuestProcessNotes(Process process){process.OutputDataReceived+=Receive;process.ErrorDataReceived+=Receive;}
@@ -56,6 +59,22 @@ public sealed class K5GuestProcessNotes {
     if(value.Contains("unmarshal")||value.Contains("yaml:")||value.Contains("invalid configuration"))flags.Add("configuration_parse_refused");
     if(value.Contains("no such file")||value.Contains("cannot find the file")||value.Contains("cannot find the path"))flags.Add("configuration_file_missing");
     return flags.ToArray();
+  }
+}
+public sealed class K5GuestBoundedCopy {
+  long received;
+  public long Received {get{return Interlocked.Read(ref received);}}
+  public async Task Copy(Stream source,Stream destination,long expected,CancellationToken cancellation){
+    byte[] buffer=new byte[1048576];
+    while(true){
+      cancellation.ThrowIfCancellationRequested();
+      int count=await source.ReadAsync(buffer,0,buffer.Length,cancellation).ConfigureAwait(false);
+      if(count==0)break;
+      if(Interlocked.Add(ref received,count)>expected)throw new InvalidDataException("Bounded image length exceeded");
+      await destination.WriteAsync(buffer,0,count,cancellation).ConfigureAwait(false);
+    }
+    if(Received!=expected)throw new EndOfStreamException("Bounded image incomplete");
+    await destination.FlushAsync(cancellation).ConfigureAwait(false);
   }
 }
 '@
@@ -163,8 +182,31 @@ function IPv4-Number([string]$Address){
     if([BitConverter]::IsLittleEndian){[Array]::Reverse($bytes)}
     return [BitConverter]::ToUInt32($bytes,0)
 }
+function Assert-CopyContracts {
+    foreach($case in @(
+        @{bytes=512;expected=512;failure='none';cancel=$false},
+        @{bytes=512;expected=1024;failure='EndOfStreamException';cancel=$false},
+        @{bytes=1024;expected=512;failure='InvalidDataException';cancel=$false},
+        @{bytes=512;expected=512;failure='cancel';cancel=$true}
+    )){
+        $source=[IO.MemoryStream]::new([byte[]]::new($case.bytes));$destination=[IO.MemoryStream]::new()
+        $cancellation=[Threading.CancellationTokenSource]::new();$copy=[K5GuestBoundedCopy]::new();$observed='none'
+        try{
+            if($case.cancel){$cancellation.Cancel()}
+            try{[void]$copy.Copy($source,$destination,$case.expected,$cancellation.Token).GetAwaiter().GetResult()}
+            catch{$observed=$_.Exception.GetBaseException().GetType().Name}
+            if($case.failure -ceq 'none'){
+                if($observed -cne 'none' -or $copy.Received -ne $case.expected -or $destination.Length -ne $case.expected){throw 'Compiled copy exact-byte contract failed'}
+            }elseif($case.failure -ceq 'cancel'){
+                if($observed -notin @('OperationCanceledException','TaskCanceledException') -or $destination.Length -ne 0){throw 'Compiled copy cancellation contract failed'}
+            }elseif($observed -cne $case.failure -or $destination.Length -gt $case.expected){throw 'Compiled copy length-refusal contract failed'}
+        }finally{$source.Dispose();$destination.Dispose();$cancellation.Dispose()}
+    }
+}
 try{
     if($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted' -or $env:RUNNER_OS -ne 'Windows'){throw 'Disposable Windows host required'}
+    Assert-CopyContracts
+    $receipt.compiled_copy_contracts_passed=$true
     foreach($file in @($SetupPath,$BootstrapExe,$MediaMTX,$FFmpeg,$FFprobe,(Join-Path $PSScriptRoot 'windows_guest_witness.ps1'))){
         if(-not(Test-Path -LiteralPath $file -PathType Leaf) -or ((Get-Item -LiteralPath $file).Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0){throw 'Required pinned fixture unavailable'}
     }
@@ -243,7 +285,7 @@ try{
     $handler=[Net.Http.HttpClientHandler]::new();$handler.AllowAutoRedirect=$false
     $client=[Net.Http.HttpClient]::new($handler);$client.Timeout=[TimeSpan]::FromMinutes(12)
     $cancel=[Threading.CancellationTokenSource]::new(720000)
-    $response=$null;$input=$null;$output=$null
+    $response=$null;$input=$null;$output=$null;$copier=$null
     try{
         $url='https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/26100.1742.amd64fre.ge_release_svc_refresh.240906-0331_server_serverdatacentereval_en-us.vhdx'
         $response=$client.GetAsync($url,[Net.Http.HttpCompletionOption]::ResponseHeadersRead,$cancel.Token).GetAwaiter().GetResult()
@@ -252,15 +294,17 @@ try{
         if([int]$response.StatusCode -ne 200 -or $response.Content.Headers.ContentLength -ne $imageBytes){throw 'Official image response differs'}
         $receipt.download_subphase='body_stream'
         $input=$response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
-        $output=[IO.File]::Open($image,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
-        $buffer=[byte[]]::new(1048576)
-        while(($count=$input.ReadAsync($buffer,0,$buffer.Length,$cancel.Token).GetAwaiter().GetResult()) -gt 0){
-            $downloaded+=$count;if($downloaded -gt $imageBytes){throw 'Image length exceeded'};$output.Write($buffer,0,$count)
-        }
+        $output=[IO.FileStream]::new($image,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None,1048576,([IO.FileOptions]::Asynchronous -bor [IO.FileOptions]::SequentialScan))
+        $copier=[K5GuestBoundedCopy]::new()
+        # Keep TLS-fragment read/write dispatch inside compiled .NET rather
+        # than invoking the PowerShell binder once per network fragment.
+        [void]$copier.Copy($input,$output,$imageBytes,$cancel.Token).GetAwaiter().GetResult()
+        $downloaded=$copier.Received
         $receipt.download_subphase='durable_flush'
         $output.Flush($true)
         $receipt.download_copy_complete=$true
     }finally{
+        if($null -ne $copier){$downloaded=$copier.Received}
         $receipt.downloaded_bytes=$downloaded
         $receipt.download_elapsed_seconds=[Math]::Round($downloadWatch.Elapsed.TotalSeconds,3)
         $receipt.download_cancellation_requested=$cancel.IsCancellationRequested
