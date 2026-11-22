@@ -66,6 +66,10 @@ public sealed class K5GuestProcessNotes {
 public sealed class K5GuestBoundedCopy {
   long received;
   public long Received {get{return Interlocked.Read(ref received);}}
+  public async Task CopyAndCancel(Stream source,Stream destination,long expected,CancellationTokenSource cancellation){
+    try{await Copy(source,destination,expected,cancellation.Token).ConfigureAwait(false);}
+    catch{cancellation.Cancel();throw;}
+  }
   public async Task Copy(Stream source,Stream destination,long expected,CancellationToken cancellation){
     byte[] buffer=new byte[1048576];
     while(true){
@@ -80,6 +84,35 @@ public sealed class K5GuestBoundedCopy {
   }
 }
 '@
+function Assert-ImageRangeResponse($Response,[long]$Start,[long]$End,[long]$Total,[string]$ETag) {
+    $range=$Response.Content.Headers.ContentRange
+    if([int]$Response.StatusCode -ne 206 -or $null -eq $range -or -not $range.HasRange -or -not $range.HasLength -or
+       $range.Unit -cne 'bytes' -or $range.From -ne $Start -or $range.To -ne $End -or $range.Length -ne $Total -or
+       $Response.Content.Headers.ContentLength -ne ($End-$Start+1)){throw 'Official image range response differs'}
+    $current=[string]$Response.Headers.ETag
+    if($current.Length -gt 256 -or ($ETag.Length -gt 0 -and $current.Length -gt 0 -and $current -cne $ETag)){throw 'Official image range ETag differs'}
+    return $current
+}
+function Assert-RangeContracts {
+    $header=@{StatusCode=206;Content=@{Headers=@{ContentLength=[long]3;ContentRange=@{HasRange=$true;HasLength=$true;Unit='bytes';From=[long]2921594880;To=[long]2921594882;Length=[long]11686379520}}};Headers=@{ETag='"fixture"'}}
+    $null=Assert-ImageRangeResponse $header 2921594880 2921594882 11686379520 '"fixture"'
+    foreach($case in @('status','from','to','total','length','missing_range','etag')){
+        $copy=$header|ConvertTo-Json -Depth 8|ConvertFrom-Json
+        switch($case){'status'{$copy.StatusCode=200};'from'{$copy.Content.Headers.ContentRange.From=0};'to'{$copy.Content.Headers.ContentRange.To=2921594883};'total'{$copy.Content.Headers.ContentRange.Length=11686379521};'length'{$copy.Content.Headers.ContentLength=4};'missing_range'{$copy.Content.Headers.ContentRange.HasRange=$false};'etag'{$copy.Headers.ETag='"different"'}}
+        $refused=$false;try{$null=Assert-ImageRangeResponse $copy 2921594880 2921594882 11686379520 '"fixture"'}catch{$refused=$true}
+        if(-not $refused){throw 'Official range header negative contract failed'}
+    }
+    foreach($case in @('truncated','oversized','cancelled')){
+        $cancelRange=[Threading.CancellationTokenSource]::new();$sourceRange=[IO.MemoryStream]::new([byte[]]@(1,2,3));$destinationRange=[IO.MemoryStream]::new()
+        try{
+            $expected=if($case -ceq 'truncated'){4}elseif($case -ceq 'oversized'){2}else{3}
+            if($case -ceq 'cancelled'){$cancelRange.Cancel()}
+            $refused=$false
+            try{[void][K5GuestBoundedCopy]::new().CopyAndCancel($sourceRange,$destinationRange,$expected,$cancelRange).GetAwaiter().GetResult()}catch{$refused=$true}
+            if(-not $refused -or -not $cancelRange.IsCancellationRequested -or $destinationRange.Length -gt $expected){throw 'Official range bounded cancellation contract failed'}
+        }finally{$sourceRange.Dispose();$destinationRange.Dispose();$cancelRange.Dispose()}
+    }
+}
 function Private-Directory([string]$Path,[bool]$Guest=$false) {
     $directory=New-Item -ItemType Directory -Path $Path
     $security=[Security.AccessControl.DirectorySecurity]::new()
@@ -438,6 +471,8 @@ try{
     if($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted' -or $env:RUNNER_OS -ne 'Windows'){throw 'Disposable Windows host required'}
     Assert-CopyContracts
     $receipt.compiled_copy_contracts_passed=$true
+    Assert-RangeContracts
+    $receipt.compiled_range_contracts_passed=$true
     foreach($file in @($SetupPath,$BootstrapExe,$MediaMTX,$FFmpeg,$FFprobe,(Join-Path $PSScriptRoot 'windows_guest_witness.ps1'))){
         if(-not(Test-Path -LiteralPath $file -PathType Leaf) -or ((Get-Item -LiteralPath $file).Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0){throw 'Required pinned fixture unavailable'}
     }
@@ -513,33 +548,73 @@ try{
     $downloadWatch=[Diagnostics.Stopwatch]::StartNew()
     [long]$downloaded=0
     Add-Type -AssemblyName System.Net.Http
-    $handler=[Net.Http.HttpClientHandler]::new();$handler.AllowAutoRedirect=$false
+    $handler=[Net.Http.HttpClientHandler]::new();$handler.AllowAutoRedirect=$false;$handler.MaxConnectionsPerServer=4
     $client=[Net.Http.HttpClient]::new($handler);$client.Timeout=[TimeSpan]::FromMinutes(12)
     $cancel=[Threading.CancellationTokenSource]::new(720000)
-    $response=$null;$input=$null;$output=$null;$copier=$null
+    $parts=@();$output=$null;$etag=''
     try{
         $url='https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/26100.1742.amd64fre.ge_release_svc_refresh.240906-0331_server_serverdatacentereval_en-us.vhdx'
-        $response=$client.GetAsync($url,[Net.Http.HttpCompletionOption]::ResponseHeadersRead,$cancel.Token).GetAwaiter().GetResult()
-        $receipt.download_response_status=[int]$response.StatusCode
-        $receipt.download_content_length=[long]$response.Content.Headers.ContentLength
-        if([int]$response.StatusCode -ne 200 -or $response.Content.Headers.ContentLength -ne $imageBytes){throw 'Official image response differs'}
-        $receipt.download_subphase='body_stream'
-        $input=$response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
-        $output=[IO.FileStream]::new($image,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None,1048576,([IO.FileOptions]::Asynchronous -bor [IO.FileOptions]::SequentialScan))
-        $copier=[K5GuestBoundedCopy]::new()
-        # Keep TLS-fragment read/write dispatch inside compiled .NET rather
-        # than invoking the PowerShell binder once per network fragment.
-        [void]$copier.Copy($input,$output,$imageBytes,$cancel.Token).GetAwaiter().GetResult()
-        $downloaded=$copier.Received
+        $output=[IO.FileStream]::new($image,[IO.FileMode]::CreateNew,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)
+        $output.SetLength($imageBytes);$output.Dispose();$output=$null
+        [long]$slice=[Math]::Floor($imageBytes/4)
+        for($index=0;$index -lt 4;$index++){
+            [long]$start=$index*$slice;[long]$end=if($index -eq 3){$imageBytes-1}else{($index+1)*$slice-1}
+            $request=[Net.Http.HttpRequestMessage]::new([Net.Http.HttpMethod]::Get,$url)
+            $request.Headers.Range=[Net.Http.Headers.RangeHeaderValue]::new($start,$end)
+            $request.Headers.AcceptEncoding.ParseAdd('identity')
+            $part=@{index=$index;start=$start;end=$end;expected=($end-$start+1);request=$request;response=$null;input=$null;output=$null;copier=$null;copy_task=$null;headers_observed=$false}
+            $part.header_task=$client.SendAsync($request,[Net.Http.HttpCompletionOption]::ResponseHeadersRead,$cancel.Token)
+            $parts+=@($part)
+        }
+        $receipt.download_range_count=4
+        while(@($parts|Where-Object{-not $_.headers_observed}).Count -gt 0){
+            $pending=@($parts|Where-Object{-not $_.headers_observed})
+            $ready=[Threading.Tasks.Task]::WhenAny([Threading.Tasks.Task[]]@($pending|ForEach-Object{$_.header_task})).GetAwaiter().GetResult()
+            $part=@($pending|Where-Object{[object]::ReferenceEquals($_.header_task,$ready)})[0]
+            $receipt.download_active_range=$part.index;$receipt.download_subphase='range_headers'
+            $part.response=$part.header_task.GetAwaiter().GetResult();$part.headers_observed=$true
+            $part.response_status=[int]$part.response.StatusCode;$receipt.download_response_status=$part.response_status
+            $part.content_length=[long]$part.response.Content.Headers.ContentLength
+            $tag=Assert-ImageRangeResponse $part.response $part.start $part.end $imageBytes $etag
+            $part.content_range_verified=$true;$part.etag_present=($tag.Length -gt 0)
+            if($etag.Length -eq 0 -and $tag.Length -gt 0){$etag=$tag}
+            $receipt.download_content_length+=$part.content_length
+            $part.input=$part.response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
+            $part.output=[IO.FileStream]::new($image,[IO.FileMode]::Open,[IO.FileAccess]::Write,[IO.FileShare]::ReadWrite,1048576,([IO.FileOptions]::Asynchronous -bor [IO.FileOptions]::RandomAccess))
+            $part.output.Position=[long]$part.start;$part.copier=[K5GuestBoundedCopy]::new()
+            $part.copy_task=$part.copier.CopyAndCancel($part.input,$part.output,[long]$part.expected,$cancel)
+        }
+        $receipt.download_subphase='parallel_body_stream'
+        [void][Threading.Tasks.Task]::WhenAll([Threading.Tasks.Task[]]@($parts|ForEach-Object{$_.copy_task})).GetAwaiter().GetResult()
+        foreach($part in $parts){if($part.copier.Received -ne $part.expected){throw 'Official range copy length differs'};$part.output.Dispose();$part.output=$null}
+        if($receipt.download_content_length -ne $imageBytes){throw 'Official aggregate image length differs'}
         $receipt.download_subphase='durable_flush'
-        $output.Flush($true)
+        $output=[IO.FileStream]::new($image,[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)
+        $output.Flush($true);$output.Dispose();$output=$null
         $receipt.download_copy_complete=$true
+    }catch{$cancel.Cancel();throw
     }finally{
-        if($null -ne $copier){$downloaded=$copier.Received}
+        # Retire every pending header/body task before any shared file handle,
+        # HTTP message, or cancellation source is disposed, including faults.
+        if(-not $receipt.download_copy_complete){$cancel.Cancel()}
+        foreach($field in @('header_task','copy_task')){
+            $tasks=@($parts|Where-Object{$null -ne $_[$field]}|ForEach-Object{$_[$field]})
+            if($tasks.Count -gt 0){try{[void][Threading.Tasks.Task]::WhenAll([Threading.Tasks.Task[]]$tasks).GetAwaiter().GetResult()}catch{}}
+        }
+        $receipt.download_ranges=@()
+        foreach($part in $parts){
+            $note=@{index=$part.index;start=[long]$part.start;end=[long]$part.end;expected=[long]$part.expected;received=[long]0;header_state=[string]$part.header_task.Status}
+            if($null -ne $part.copier){$note.received=$part.copier.Received;$downloaded+=$note.received}
+            foreach($field in @('response_status','content_length','content_range_verified','etag_present')){if($part.ContainsKey($field)){$note[$field]=$part[$field]}}
+            if($null -ne $part.copy_task){$note.copy_state=[string]$part.copy_task.Status;if($part.copy_task.IsFaulted){$fault=$part.copy_task.Exception.GetBaseException();$note.copy_failure_kind=$fault.GetType().Name;$note.copy_failure_hresult=$fault.HResult}}
+            $receipt.download_ranges+=@($note)
+            if($null -eq $part.response -and $part.header_task.Status -eq [Threading.Tasks.TaskStatus]::RanToCompletion){$part.response=$part.header_task.GetAwaiter().GetResult()}
+            foreach($field in @('output','input','response','request')){if($null -ne $part[$field]){$part[$field].Dispose()}}
+        }
         $receipt.downloaded_bytes=$downloaded
         $receipt.download_elapsed_seconds=[Math]::Round($downloadWatch.Elapsed.TotalSeconds,3)
         $receipt.download_cancellation_requested=$cancel.IsCancellationRequested
-        if($null -ne $output){$output.Dispose()};if($null -ne $input){$input.Dispose()};if($null -ne $response){$response.Dispose()}
+        if($null -ne $output){$output.Dispose()}
         $cancel.Dispose();$client.Dispose();$handler.Dispose()
     }
     if((Get-Item -LiteralPath $image).Length -ne $imageBytes -or (Get-FileHash -LiteralPath $image -Algorithm SHA256).Hash.ToLowerInvariant() -cne $imageSha){throw 'Pinned official image bytes differ'}
