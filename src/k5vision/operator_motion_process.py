@@ -36,6 +36,7 @@ class MotionSample:
     motion: bool
     age_seconds: float
     jpeg: bytes = field(repr=False)
+    captured_monotonic: float
 
 
 def _relay(value: object) -> str:
@@ -413,6 +414,7 @@ class LiveMotionWorker:
                     metadata["motion"],
                     age,
                     pixels,
+                    captured,
                 )
             except (OSError, ValueError, TypeError, MotionProcessError):
                 self._dispose()
@@ -580,15 +582,28 @@ def _child_main() -> int:
                 if not capture.isOpened():
                     raise ValueError
                 sequence = 0
+                last_captured = None
                 while not stopped.is_set():
                     ready, frame = capture.read()
-                    if not ready or frame is None or frame.ndim != 3 or frame.shape[2] != 3:
+                    if not ready:
+                        # A bounded native read can time out while the last
+                        # actual frame remains current. Try this same reader
+                        # without renewing that frame's clock or sequence.
+                        if (
+                            last_captured is not None
+                            and 0 <= time.monotonic() - last_captured <= _MAX_AGE
+                        ):
+                            stopped.wait(0.05)
+                            continue
+                        raise ValueError
+                    if frame is None or frame.ndim != 3 or frame.shape[2] != 3:
                         raise ValueError
                     height, width = frame.shape[:2]
                     if not _geometry(width, height):
                         raise ValueError
                     sequence += 1
                     captured = time.monotonic()
+                    last_captured = captured
                     with condition:
                         latest = (sequence, captured, frame)
                         condition.notify()

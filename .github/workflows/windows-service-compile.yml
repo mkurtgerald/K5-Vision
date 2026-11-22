@@ -22,6 +22,7 @@ on:
       - scripts/probe_windows_motion_sampler.py
       - scripts/probe_windows_nested_vm.ps1
       - scripts/probe_windows_motion_runtime.py
+      - src/k5vision/operator_motion_process.py
   pull_request:
     branches: [main]
     paths:
@@ -42,6 +43,7 @@ on:
       - scripts/probe_windows_motion_sampler.py
       - scripts/probe_windows_nested_vm.ps1
       - scripts/probe_windows_motion_runtime.py
+      - src/k5vision/operator_motion_process.py
 
 permissions:
   contents: read
@@ -167,10 +169,10 @@ jobs:
             nested-vm-provenance.json
           if-no-files-found: warn
           retention-days: 14
-  motion-sampler-diagnostic:
-    name: DIAGNOSTIC ONLY - actual 333 live motion worker and capture phases
+  motion-worker-ab-diagnostic:
+    name: DIAGNOSTIC ONLY - original 333 versus pinned candidate child A/B
     runs-on: windows-2025
-    timeout-minutes: 5
+    timeout-minutes: 7
     env:
       K5_DESKTOP_HEAD_SHA: 333685876d8f5dfd65cc4dcafeb2b4a694393283
       K5_DIAGNOSTIC_HARNESS_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -186,19 +188,28 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           path: diagnostic-source
           persist-credentials: false
-      - name: Admit the exact diagnostic Git blob without checkout text conversion
+      - name: Admit exact diagnostic and candidate child Git blobs without checkout conversion
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $harnessHead = (& git -C diagnostic-source rev-parse HEAD).Trim()
           & (Join-Path $env:SYSTEMROOT 'System32/cmd.exe') /d /c 'git -C diagnostic-source cat-file blob HEAD:scripts/probe_windows_motion_sampler.py > scripts/probe_windows_motion_sampler.py'
           $scriptSha = (Get-FileHash -LiteralPath scripts/probe_windows_motion_sampler.py -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($LASTEXITCODE -ne 0 -or $scriptSha -ne '9d2d4d51519869b966ec884944b00763fb0899e1e9dee61f926c000040154e0f' -or
+          if ($LASTEXITCODE -ne 0 -or $scriptSha -ne '36cf64b6d0b8240f8bc1b64ad56d1f489b4766d42e5b26e8c0177266a5b75ca0' -or
               $harnessHead -ne $env:K5_DIAGNOSTIC_HARNESS_SHA -or $harnessHead -eq $env:K5_DESKTOP_HEAD_SHA) {
             throw 'Diagnostic motion sampler source identity mismatch'
           }
+          # Keep the candidate outside the original source tree until the
+          # experiment closes its baseline worker and applies the overlay.
+          & (Join-Path $env:SYSTEMROOT 'System32/cmd.exe') /d /c 'git -C diagnostic-source cat-file blob HEAD:src/k5vision/operator_motion_process.py > motion-candidate-child-admitted.py'
+          $candidateSha = (Get-FileHash -LiteralPath motion-candidate-child-admitted.py -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($LASTEXITCODE -ne 0 -or $candidateSha -ne '4fbd5c75385e11b3545b7bbf5a0b309430353fa5ffb911902b2d1a647ccbc1ee') {
+            throw 'Diagnostic candidate child source identity mismatch'
+          }
           @{ schema_version=1; diagnostic_only=$true; product_qualification=$false;
-             runtime_head=$env:K5_DESKTOP_HEAD_SHA; harness_head=$harnessHead; script_sha256=$scriptSha } |
+             mixed_runtime_overlay=$true; baseline_runtime_head=$env:K5_DESKTOP_HEAD_SHA;
+             candidate_source_head=$harnessHead; candidate_module_sha256=$candidateSha;
+             harness_head=$harnessHead; script_sha256=$scriptSha } |
             ConvertTo-Json | Set-Content -LiteralPath motion-sampler-provenance.json -Encoding utf8
       - name: Set up native development Python for the diagnostic probe
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
@@ -212,22 +223,37 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Diagnostic motion sampler dependencies unavailable' }
       - name: Provision original pinned native RTSP and generated-video tools
         uses: ./.github/actions/provision-operator-tools
-      - name: Observe production motion sampling and actual source-stop rejection
-        timeout-minutes: 3
+      - name: Compare two real 120-sample workers with source-stop and restoration observations
+        # Prior 120-sample diagnostic took 117.8 seconds. This is twice the
+        # experiment; product request, capture and freshness budgets stay fixed.
+        timeout-minutes: 5
         shell: pwsh
         run: |
-          python scripts/probe_windows_motion_sampler.py --output native-motion-sampler.json
+          python scripts/probe_windows_motion_sampler.py --output native-motion-sampler.json --candidate-module motion-candidate-child-admitted.py --candidate-module-sha256 4fbd5c75385e11b3545b7bbf5a0b309430353fa5ffb911902b2d1a647ccbc1ee --baseline-source-head $env:K5_DESKTOP_HEAD_SHA --candidate-source-head $env:K5_DIAGNOSTIC_HARNESS_SHA
           if ($LASTEXITCODE -ne 0) { throw 'Diagnostic motion sampler infrastructure or owned cleanup failed' }
           $evidence = Get-Content -LiteralPath native-motion-sampler.json -Raw | ConvertFrom-Json
           if ($evidence.schema_version -ne 1 -or $evidence.status -ne 'diagnostic_complete' -or
               $evidence.diagnostic_only -ne $true -or $evidence.cleanup_complete -ne $true) {
             throw 'Diagnostic motion sampler did not complete its observation'
           }
+          if ($evidence.scope -ne 'diagnostic_mixed_candidate_child_with_unchanged_baseline_parent' -or
+              $evidence.baseline_source_head -ne $env:K5_DESKTOP_HEAD_SHA -or
+              $evidence.candidate_source_head -ne $env:K5_DIAGNOSTIC_HARNESS_SHA -or
+              $evidence.candidate_module_sha256 -ne '4fbd5c75385e11b3545b7bbf5a0b309430353fa5ffb911902b2d1a647ccbc1ee' -or
+              $evidence.child_entrypoint_unchanged -ne $true -or $evidence.motion_child_launches -lt 2 -or
+              $evidence.candidate_source_unchanged_before_restore -ne $true -or
+              $evidence.original_module_restored -ne $true -or
+              @($evidence.observations | Where-Object { $_.phase -eq 'quiet_live' }).Count -ne 120 -or
+              @($evidence.observations | Where-Object { $_.phase -eq 'candidate_quiet_live' }).Count -ne 120 -or
+              @($evidence.observations | Where-Object { $_.phase -eq 'source_stopped' }).Count -ne 3 -or
+              @($evidence.observations | Where-Object { $_.phase -eq 'traced_quiet_live' }).Count -ne 0) {
+            throw 'Diagnostic A/B source, entrypoint, observations or restoration scope mismatch'
+          }
       - name: Retain diagnostic-only motion samples without qualification or promotion
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
-          name: diagnostic-only-motion-sampler-${{ github.run_id }}-${{ github.run_attempt }}
+          name: diagnostic-only-motion-worker-ab-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             native-motion-sampler.json
             motion-sampler-provenance.json

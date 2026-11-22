@@ -127,7 +127,15 @@ def _sample(
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--candidate-module", type=Path)
+    parser.add_argument("--candidate-module-sha256")
+    parser.add_argument("--baseline-source-head")
+    parser.add_argument("--candidate-source-head")
     args = parser.parse_args()
+    if args.candidate_module and not all(
+        (args.candidate_module_sha256, args.baseline_source_head, args.candidate_source_head)
+    ):
+        parser.error("Candidate A/B requires pinned module bytes and both source heads")
     import cv2
     import numpy
 
@@ -151,6 +159,9 @@ def main():
     }
     servers, worker, publisher = [], None, None
     original_popen, original_document = subprocess.Popen, motion._document
+    module_path = Path(motion.__file__).resolve()
+    original_module_bytes = module_path.read_bytes()
+    source_swapped, candidate_bytes = False, None
     metadata = {}
     diagnostic_streams = []
     phase, config_path = "initialization", None
@@ -249,6 +260,24 @@ def main():
                 return value
 
             motion._document = document
+            if args.candidate_module:
+                receipt["child_entrypoint_unchanged"] = True
+                receipt["motion_child_launches"] = 0
+
+                def observe_popen(arguments, **kwargs):
+                    if "k5vision.operator_motion_process" in arguments:
+                        receipt["motion_child_launches"] += 1
+                        receipt["child_entrypoint_unchanged"] &= arguments == [
+                            sys.executable,
+                            "-I",
+                            "-B",
+                            "-m",
+                            "k5vision.operator_motion_process",
+                            "--child",
+                        ]
+                    return original_popen(arguments, **kwargs)
+
+                subprocess.Popen = observe_popen
             token = base64.b64encode(f"local:{password}".encode()).decode()
 
             def source_state():
@@ -328,20 +357,56 @@ def main():
                     ]
                 return original_popen(arguments, **kwargs)
 
-            subprocess.Popen = traced_popen
-            worker = motion.LiveMotionWorker(relay_uri)
-            phase = "traced_sampling"
-            _sample(
-                worker,
-                policy,
-                motion,
-                phase="traced_quiet_live",
-                count=24,
-                observations=receipt["observations"],
-                metadata=metadata,
-                source_state=source_state,
-                publisher=generated,
-            )
+            if args.candidate_module:
+                if (
+                    module_path
+                    != (Path.cwd() / "src/k5vision/operator_motion_process.py").resolve()
+                ):
+                    raise RuntimeError("A/B source is outside the owned diagnostic checkout")
+                candidate_bytes = args.candidate_module.read_bytes()
+                digest = hashlib.sha256(candidate_bytes).hexdigest()
+                if digest != args.candidate_module_sha256:
+                    raise RuntimeError("Candidate module bytes differ from the admitted blob")
+                receipt.update(
+                    scope="diagnostic_mixed_candidate_child_with_unchanged_baseline_parent",
+                    baseline_source_head=args.baseline_source_head,
+                    candidate_source_head=args.candidate_source_head,
+                    candidate_module_sha256=digest,
+                )
+                # No worker is live while changing this development-checkout
+                # child module. The parent's imported original implementation
+                # and wire parser stay unchanged; new children still use -m.
+                phase = "candidate_source_overlay"
+                source_swapped = True
+                module_path.write_bytes(candidate_bytes)
+                worker = motion.LiveMotionWorker(relay_uri)
+                phase = "candidate_sampling"
+                _sample(
+                    worker,
+                    policy,
+                    motion,
+                    phase="candidate_quiet_live",
+                    count=120,
+                    observations=receipt["observations"],
+                    metadata=metadata,
+                    source_state=source_state,
+                    publisher=generated,
+                )
+            else:
+                subprocess.Popen = traced_popen
+                worker = motion.LiveMotionWorker(relay_uri)
+                phase = "traced_sampling"
+                _sample(
+                    worker,
+                    policy,
+                    motion,
+                    phase="traced_quiet_live",
+                    count=24,
+                    observations=receipt["observations"],
+                    metadata=metadata,
+                    source_state=source_state,
+                    publisher=generated,
+                )
             publisher.close()
             publisher = None
             phase = "source_stopped"
@@ -388,6 +453,22 @@ def main():
                     cleanup = False
             subprocess.Popen = original_popen
             motion._document = original_document
+            if source_swapped:
+                try:
+                    receipt["candidate_source_unchanged_before_restore"] = (
+                        module_path.read_bytes() == candidate_bytes
+                    )
+                    module_path.write_bytes(original_module_bytes)
+                    receipt["original_module_restored"] = (
+                        module_path.read_bytes() == original_module_bytes
+                    )
+                    cleanup = (
+                        cleanup
+                        and receipt["original_module_restored"]
+                        and receipt["candidate_source_unchanged_before_restore"]
+                    )
+                except (OSError, RuntimeError):
+                    cleanup = False
             for process, job in reversed(servers):
                 try:
                     if job is not None:
