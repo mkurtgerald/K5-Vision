@@ -370,6 +370,28 @@ class OperatorProductService:
             }
         return self._storage.recording_progress(binding.path_name)
 
+    def cached_recording_observations(self) -> dict:
+        """Alert input from existing maintenance caches, without native or media I/O."""
+        status = self._storage_status
+        cameras = []
+        for source in self._sources:
+            policy = self.recording_policy_status(source.binding)
+            cameras.append(
+                {
+                    "camera_id": str(source.binding.device_id),
+                    "recording_enabled": source.recording_enabled,
+                    "recording_expected": policy["mode"] == "continuous"
+                    or policy["state"] in {"recording", "post_capture"},
+                    "progress": self.recording_progress(source.binding),
+                }
+            )
+        return {
+            "generation": self._media_generation,
+            "worker_ready": self._ready and not any(self._health_failures.values()),
+            "storage_allowed": None if status is None else status.recording_allowed,
+            "cameras": cameras,
+        }
+
     def recording_files(self, binding) -> dict[str, tuple[int, ...]] | None:
         """Private cached inventory for the recorder-owned analytics sampler."""
         if self._storage is None:

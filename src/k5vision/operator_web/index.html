@@ -64,6 +64,16 @@
         <div class="user-menu"><button id="admin-tab" class="button secondary" type="button" aria-pressed="false" hidden>Administration</button><button id="security-tab" class="button quiet" type="button" aria-pressed="false" hidden>Account security</button><span id="account-name"></span><span id="account-role" class="role-tag"></span><button id="sign-out-button" class="button quiet" type="button">Sign out</button></div>
       </header>
 
+      <section id="recorder-alerts" class="recorder-alerts" role="alert" aria-live="polite" hidden>
+        <strong id="recorder-alert-heading"></strong>
+        <p id="recorder-alert-message"></p>
+        <ul id="recorder-alert-list"></ul>
+        <details id="recorder-alert-history" hidden>
+          <summary>Recent recorder alerts · UTC</summary>
+          <ul id="recorder-alert-history-list"></ul>
+        </details>
+      </section>
+
       <div id="camera-workspace" class="workspace-body">
         <aside class="camera-sidebar" aria-label="Cameras">
           <div class="sidebar-heading"><h2>Cameras <span id="camera-count" class="count">0</span></h2><button id="refresh-cameras" class="icon-button" type="button" title="Refresh cameras" aria-label="Refresh cameras">↻</button></div>

@@ -492,6 +492,10 @@
     state.cameras = [];
     state.workerStatus = "ready";
     state.diagnostics = null;
+    state.recorderAlertSignature = "";
+    $("recorder-alerts").hidden = true;
+    $("recorder-alert-list").replaceChildren();
+    $("recorder-alert-history-list").replaceChildren();
     state.statusUnavailable = false;
     state.cameraConnectionNotice = null;
     state.recorderTime = null;
@@ -702,7 +706,63 @@
     return `${size.toFixed(size >= 10 ? 0 : 1)} ${units[unit]}`;
   }
 
+  function renderRecorderAlerts() {
+    const panel = $("recorder-alerts"), data = state.diagnostics?.recorder_alerts;
+    const signature = JSON.stringify([state.statusUnavailable, data, state.cameras.map((camera) => [camera.device_id, camera.name])]);
+    if (signature === state.recorderAlertSignature) return;
+    state.recorderAlertSignature = signature;
+    if (!state.token || data?.visible === false || (!data && !state.statusUnavailable)) {
+      panel.hidden = true;
+      $("recorder-alert-list").replaceChildren();
+      $("recorder-alert-history-list").replaceChildren();
+      return;
+    }
+    const labels = {
+      recorder_unavailable: "Recorder engine unavailable",
+      storage_blocked: "Storage is blocking recording",
+      no_new_recording: "No new recording confirmed",
+    };
+    const recoveries = {
+      worker_ready: "Recorder engine is available again",
+      storage_ready: "Storage allows recording again",
+      recording_observed: "New recording data confirmed",
+      camera_removed: "Camera monitoring ended after removal",
+    };
+    const valid = (row) => row && Object.hasOwn(labels, row.code) && ["active", "resolved"].includes(row.state)
+      && (row.camera_id === null || typeof row.camera_id === "string")
+      && Number.isFinite(Date.parse(row.occurred_at));
+    const malformed = !Array.isArray(data?.active) || !Array.isArray(data?.history)
+      || data.active.length > 66 || data.history.length > 20
+      || !data.active.every(valid) || !data.history.every(valid);
+    const active = malformed || state.statusUnavailable ? [] : data.active;
+    const history = malformed || state.statusUnavailable ? [] : data.history.slice(-5).reverse();
+    const unavailable = state.statusUnavailable || malformed || data.available !== true;
+    panel.hidden = !unavailable && active.length === 0 && history.length === 0;
+    panel.classList.toggle("clear", !unavailable && active.length === 0);
+    $("recorder-alert-heading").textContent = state.statusUnavailable ? "Recorder status unavailable"
+      : unavailable ? "Recorder alert monitoring unavailable"
+        : active.length ? `${active.length} recorder alert${active.length === 1 ? "" : "s"} need attention`
+          : "No active recorder alerts";
+    $("recorder-alert-message").textContent = state.statusUnavailable
+      ? "New alerts cannot be checked. Refresh the connection; recording status is unverified."
+      : unavailable ? "Alert monitoring or its saved history could not be confirmed. Check the recorder overview and storage."
+        : active.length ? "Check camera connections and storage. Alerts remain saved while this workspace is closed."
+          : "Recent recorder transitions remain in saved history.";
+    const rowElement = (row, historical) => {
+      const item = document.createElement("li");
+      const camera = state.cameras.find((candidate) => candidate.device_id === row.camera_id);
+      const name = row.camera_id ? `${camera?.name || "Camera no longer in this list"}: ` : "";
+      const message = historical && row.state === "resolved" ? recoveries[row.resolution] || "Alert cleared" : labels[row.code];
+      item.textContent = `${name}${message} · ${utcLabel(row.occurred_at)} UTC`;
+      return item;
+    };
+    $("recorder-alert-list").replaceChildren(...active.map((row) => rowElement(row, false)));
+    $("recorder-alert-history-list").replaceChildren(...history.map((row) => rowElement(row, true)));
+    $("recorder-alert-history").hidden = history.length === 0;
+  }
+
   function renderDiagnostics() {
+    renderRecorderAlerts();
     const diagnostics = state.diagnostics;
     const service = state.statusUnavailable ? "Service status unavailable · Select refresh to retry"
       : state.workerStatus === "ready" ? "Media service ready"

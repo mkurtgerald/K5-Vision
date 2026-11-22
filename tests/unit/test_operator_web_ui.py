@@ -9,6 +9,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shutil
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
@@ -222,6 +223,160 @@ def _operator_asset(route, assets):
     }[Path(name).suffix]
     route.fulfill(content_type=content_type, body=(assets / name).read_text(encoding="utf-8"))
     return True
+
+
+def test_recorder_alerts_show_persistent_fault_recovery_transport_failure_and_logout():
+    """Use the real assembled app, with the permission-filtered status contract."""
+    browser_api = pytest.importorskip("playwright.sync_api")
+    assets = Path(__file__).resolve().parents[2] / "src/k5vision/operator_web"
+    account = {"username": "fault-operator", "role": "operator", "display_name": "Operator"}
+    cameras = [
+        {
+            "device_id": _CAMERA,
+            "name": "Front door",
+            "host": "127.0.0.1",
+            "status": "live",
+            "recording": False,
+            "recording_enabled": True,
+            "recording_state": "waiting_for_recording",
+            "analytics_status": "disabled",
+        }
+    ]
+    fault = {
+        "code": "no_new_recording",
+        "camera_id": _CAMERA,
+        "state": "active",
+        "resolution": None,
+        "occurred_at": "2026-11-22T06:00:00.000Z",
+    }
+    phase = {"mode": "active"}
+    errors = []
+    with browser_api.sync_playwright() as playwright:
+        options = {"headless": True}
+        if os.name != "nt" and shutil.which("chromium"):
+            options["executable_path"] = shutil.which("chromium")
+        else:
+            options["channel"] = os.getenv("K5_OPERATOR_BROWSER_CHANNEL", "msedge")
+        browser = playwright.chromium.launch(**options)
+        context = None
+        try:
+            context = browser.new_context(viewport={"width": 1440, "height": 900})
+            context.add_init_script("window.Hls = {isSupported: () => false};")
+            page = context.new_page()
+            page.set_default_timeout(10_000)
+            page.on("pageerror", lambda error: errors.append("uncaught_script_error"))
+
+            def intercept(route):
+                if _operator_asset(route, assets):
+                    return
+                path = urlsplit(route.request.url).path
+                data, status = {}, 200
+                if path == "/api/v1/auth/login":
+                    data = {
+                        "session_token": "generated-fault-session-token-000000000000000000",
+                        "account": account,
+                        "expires_at": (datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
+                        "expires_in_seconds": 300,
+                    }
+                elif path == "/api/v1/auth/me":
+                    data = _ui_core(account)
+                elif path == "/api/v1/operator/cameras":
+                    data = _ui_inventory(account, cameras, worker_status="ready")
+                elif path == "/api/v1/operator/status":
+                    mode = phase["mode"]
+                    resolved = {**fault, "state": "resolved", "resolution": "recording_observed"}
+                    alerts = {
+                        "visible": True,
+                        "available": mode != "persistence_failed",
+                        "monitoring": True,
+                        "active": [fault] if mode == "active" else [],
+                        "history": [fault] if mode == "active" else [fault, resolved],
+                    }
+                    if mode == "denied":
+                        alerts = {"visible": False}
+                    if mode == "malformed":
+                        alerts["active"] = [{**fault, "code": "private-test-secret"}]
+                    data = {
+                        "worker_status": "ready",
+                        "server_utc": datetime.now(UTC).isoformat(),
+                        "recorder_alerts": alerts,
+                    }
+                    if mode == "transport_failed":
+                        data, status = {"detail": "private-test-secret"}, 503
+                elif path.endswith("/media-session"):
+                    data = {
+                        "live_url": f"/media/live/{_CAMERA}/index.m3u8",
+                        "playback_url": f"/media/playback?path={_CAMERA}",
+                    }
+                elif path.endswith("/history"):
+                    data = {"spans": []}
+                elif path == "/api/v1/auth/logout":
+                    pass
+                else:
+                    status = 404
+                route.fulfill(status=status, content_type="application/json", body=json.dumps(data))
+
+            page.route("**/*", intercept)
+            page.goto("http://127.0.0.1:8000/operator/")
+            page.locator("#username").fill(account["username"])
+            page.locator("#password").fill("generated-human-account-password")
+            page.locator("#sign-in-button").click()
+            expect = browser_api.expect
+            panel = page.locator("#recorder-alerts")
+            expect(panel).to_be_visible()
+            expect(page.locator("#recorder-alert-heading")).to_have_text(
+                "1 recorder alert need attention"
+            )
+            expect(page.locator("#recorder-alert-list")).to_contain_text(
+                "Front door: No new recording confirmed"
+            )
+            expect(page.locator("#recorder-alert-list")).to_contain_text("2026-11-22 06:00:00 UTC")
+
+            def refresh(mode):
+                phase["mode"] = mode
+                page.locator("#refresh-cameras").click()
+
+            refresh("recovered")
+            expect(page.locator("#recorder-alert-heading")).to_have_text(
+                "No active recorder alerts"
+            )
+            expect(page.locator("#recorder-alert-list li")).to_have_count(0)
+            page.locator("#recorder-alert-history summary").click()
+            expect(page.locator("#recorder-alert-history-list")).to_contain_text(
+                "New recording data confirmed"
+            )
+            expect(page.locator("#recorder-alert-history-list")).to_contain_text(
+                "No new recording confirmed"
+            )
+            refresh("persistence_failed")
+            expect(page.locator("#recorder-alert-heading")).to_have_text(
+                "Recorder alert monitoring unavailable"
+            )
+            refresh("transport_failed")
+            expect(page.locator("#recorder-alert-heading")).to_have_text(
+                "Recorder status unavailable"
+            )
+            expect(page.locator("#recorder-alert-list li")).to_have_count(0)
+            expect(page.locator("#recorder-alert-history-list li")).to_have_count(0)
+            refresh("malformed")
+            expect(page.locator("#recorder-alert-heading")).to_have_text(
+                "Recorder alert monitoring unavailable"
+            )
+            expect(page.locator("body")).not_to_contain_text("private-test-secret")
+            refresh("denied")
+            expect(panel).to_be_hidden()
+            refresh("active")
+            expect(panel).to_be_visible()
+            page.locator("#sign-out-button").click()
+            expect(page.locator("#sign-in-button")).to_be_visible()
+            expect(panel).to_be_hidden()
+            expect(page.locator("#recorder-alert-list li")).to_have_count(0)
+            expect(page.locator("#recorder-alert-history-list li")).to_have_count(0)
+            assert not errors
+        finally:
+            if context is not None:
+                context.close()
+            browser.close()
 
 
 def test_asset_response_preserves_utf8_under_a_legacy_windows_text_locale(monkeypatch):

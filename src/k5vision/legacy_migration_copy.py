@@ -512,7 +512,8 @@ class _WindowsStage:
                         if not self.kernel.CreateDirectoryW(str(path), ctypes.byref(attributes)):
                             raise ValueError
                 self._admit_directory(path)
-                handle = self._open_handle(path, access=0x20080, share=3, create=3, directory=True)
+                # LIST_DIRECTORY makes the read-only handle enforce Windows sharing checks.
+                handle = self._open_handle(path, access=0x20081, share=3, create=3, directory=True)
                 try:
                     key = self._handle_key(handle, directory=True)
                 except BaseException:

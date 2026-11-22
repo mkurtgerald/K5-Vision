@@ -9,11 +9,74 @@ parent/child's displayed birth order.
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import os
 import re
 import stat
 from ctypes import wintypes
 from pathlib import Path, PureWindowsPath
+
+_IMAGE_CATEGORIES = {
+    "k5visionrecorder.exe": "wrapper",
+    "k5vision.exe": "host",
+    "python.exe": "python",
+    "pythonw.exe": "pythonw",
+    "ffmpeg.exe": "ffmpeg",
+    "ffprobe.exe": "ffprobe",
+    "mediamtx.exe": "mediamtx",
+    "caddy.exe": "caddy",
+    "werfault.exe": "werfault",
+    "werfaultsecure.exe": "werfaultsecure",
+    "wermgr.exe": "wermgr",
+    "conhost.exe": "conhost",
+    "openconsole.exe": "openconsole",
+    "mfpmp.exe": "mfpmp",
+    "rundll32.exe": "rundll32",
+    "dllhost.exe": "dllhost",
+    "audiodg.exe": "audiodg",
+    "svchost.exe": "svchost",
+    "csrss.exe": "csrss",
+    "consent.exe": "consent",
+    "crashpad_handler.exe": "crashpad",
+    "cmd.exe": "cmd",
+    "powershell.exe": "powershell",
+    "powershell_ise.exe": "powershell_ise",
+    "pwsh.exe": "pwsh",
+    "w32tm.exe": "w32tm",
+    "sc.exe": "sc",
+    "wmic.exe": "wmic",
+    "reg.exe": "reg",
+    "whoami.exe": "whoami",
+    "hostname.exe": "hostname",
+    "ipconfig.exe": "ipconfig",
+    "taskkill.exe": "taskkill",
+    "tasklist.exe": "tasklist",
+    "where.exe": "where",
+    "find.exe": "find",
+    "findstr.exe": "findstr",
+}
+_PAYLOAD_IMAGE_FILES = {
+    "k5visionrecorder.exe": "K5VisionRecorder.exe",
+    "k5vision.exe": "K5Vision.exe",
+    "python.exe": "runtime/python.exe",
+    "pythonw.exe": "runtime/pythonw.exe",
+    "ffmpeg.exe": "workers/ffmpeg.exe",
+    "ffprobe.exe": "workers/ffprobe.exe",
+    "mediamtx.exe": "workers/mediamtx.exe",
+    "caddy.exe": "workers/caddy.exe",
+}
+_SYSTEM_IMAGE_FILES = {
+    name: name
+    for name in _IMAGE_CATEGORIES
+    if name not in {*_PAYLOAD_IMAGE_FILES, "crashpad_handler.exe", "pwsh.exe"}
+}
+_SYSTEM_IMAGE_FILES.update(
+    {
+        "powershell.exe": "WindowsPowerShell/v1.0/powershell.exe",
+        "powershell_ise.exe": "WindowsPowerShell/v1.0/powershell_ise.exe",
+        "wmic.exe": "wbem/wmic.exe",
+    }
+)
 
 
 class OwnershipFailure(RuntimeError):
@@ -187,22 +250,105 @@ def _same_local_file(image, expected):
     return Path(image).samefile(expected)
 
 
+def _fixed_image_target(basename):
+    """Select only native fixed OS/code paths, never an arbitrary image path."""
+    from k5vision.installed_code_security import _installed_root
+
+    if basename in _SYSTEM_IMAGE_FILES:
+        api = ctypes.WinDLL("kernel32", use_last_error=True).GetSystemDirectoryW
+        api.argtypes, api.restype = [wintypes.LPWSTR, wintypes.UINT], wintypes.UINT
+        buffer = ctypes.create_unicode_buffer(32768)
+        length = api(buffer, len(buffer))
+        if not 1 <= length < len(buffer):
+            raise OSError("Native system directory observation unavailable")
+        root = PureWindowsPath(buffer.value)
+        return root / _SYSTEM_IMAGE_FILES[basename], root, "fixed_system32"
+    if basename in _PAYLOAD_IMAGE_FILES:
+        root = _installed_root()
+        return root / _PAYLOAD_IMAGE_FILES[basename], root, "fixed_installed_payload"
+    if basename == "pwsh.exe":
+        root = _installed_root().parent / "PowerShell" / "7"
+        return root / "pwsh.exe", root, "fixed_programfiles_powershell7"
+    return None
+
+
+def _code_file_snapshot(info, *, type_only=False):
+    return (
+        info.st_dev,
+        info.st_ino,
+        stat.S_IFMT(info.st_mode) if type_only else info.st_mode,
+        info.st_nlink,
+        info.st_size,
+        info.st_mtime_ns,
+        getattr(info, "st_file_attributes", 0),
+    )
+
+
+def _fixed_image_file_diagnostic(image, *, same_file):
+    """Failure-only read of a same-file, custody-checked, finite known target."""
+    from k5vision.installed_code_security import _code_policy, _native_security
+    from k5vision.windows_identity_security import check_windows_volume
+
+    basename = PureWindowsPath(image).name.casefold()
+    if basename not in _IMAGE_CATEGORIES or basename == "crashpad_handler.exe":
+        return {"status": "unlisted_basename"}
+    if os.name != "nt":
+        return {"status": "native_windows_unavailable"}
+    target = _fixed_image_target(basename)
+    if target is None:
+        return {"status": "unlisted_fixed_file"}
+    expected, code_root, scope = target
+    result = {"status": "different_fixed_file", "scope": scope, "same_file": False}
+    # Identity comparison may inspect image metadata; content is read ONLY from
+    # the selected fixed target after matching it to the rejected image.
+    if not same_file(str(image), str(expected)):
+        return result
+    result["same_file"] = True
+    check_windows_volume(str(expected))
+    native, snapshots, leaf_snapshot = _native_security(), [], None
+    for component in reversed((expected, *expected.parents)):
+        info = Path(component).lstat()
+        if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
+            raise ValueError("Fixed image observation refuses reparse code")
+        if component == expected:
+            if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= 256 * 1024**2:
+                raise ValueError("Fixed image observation leaf is not bounded code")
+            leaf_snapshot = _code_file_snapshot(info, type_only=True)
+        elif not stat.S_ISDIR(info.st_mode):
+            raise ValueError("Fixed image observation ancestor is not a directory")
+        _code_policy(native, component, within=component.is_relative_to(code_root))
+        snapshots.append((component, _code_file_snapshot(info)))
+    with Path(expected).open("rb") as stream:
+        before = os.fstat(stream.fileno())
+        # CPython's Windows path stat synthesizes .exe execute permission bits;
+        # handle stat has no filename. Only this path/handle comparison uses
+        # file type; full path/path and handle/handle snapshots remain exact.
+        if _code_file_snapshot(before, type_only=True) != leaf_snapshot:
+            raise ValueError("Fixed image observation open identity changed")
+        sha = hashlib.file_digest(stream, "sha256").hexdigest()
+        after = os.fstat(stream.fileno())
+    if _code_file_snapshot(before) != _code_file_snapshot(after) or not same_file(
+        str(image), str(expected)
+    ):
+        raise ValueError("Fixed image observation content identity changed")
+    for component, snapshot in snapshots:
+        if snapshot != _code_file_snapshot(Path(component).lstat()):
+            raise ValueError("Fixed image observation custody changed")
+    result.update(
+        status="observed",
+        trusted_code_custody_verified=True,
+        file_identity={"volume": before.st_dev, "file_id": before.st_ino, "links": before.st_nlink},
+        file_bytes=before.st_size,
+        file_sha256=sha,
+    )
+    return result
+
+
 def image_diagnostic(image, images, *, same_file=None):
-    """Finite alias evidence; it never admits or repairs an unexpected image."""
-    categories = {
-        "k5visionrecorder.exe": "wrapper",
-        "k5vision.exe": "host",
-        "python.exe": "python",
-        "mediamtx.exe": "mediamtx",
-        "caddy.exe": "caddy",
-        "conhost.exe": "conhost",
-        "mfpmp.exe": "mfpmp",
-        "werfault.exe": "werfault",
-        "pythonw.exe": "pythonw",
-    }
+    """Finite failure evidence; it never admits or repairs an unexpected image."""
     form, local = _local_image_path(image)
     result = {
-        "basename_category": categories.get(PureWindowsPath(image).name.casefold(), "other"),
+        "basename_category": _IMAGE_CATEGORIES.get(PureWindowsPath(image).name.casefold(), "other"),
         "path_form": form,
         "short_component": bool(re.search(r"~[0-9]", str(image))),
         "matching_payload_roles": [],
@@ -229,6 +375,16 @@ def image_diagnostic(image, images, *, same_file=None):
         except (OSError, ValueError, TypeError):
             result["samefile_unavailable_count"] += 1
     result["matching_payload_roles"].sort()
+    try:
+        result["fixed_known_file"] = _fixed_image_file_diagnostic(image, same_file=compare)
+    except Exception as error:
+        kind = type(error).__name__
+        result["fixed_known_file"] = {
+            "status": "unavailable",
+            "error_kind": kind
+            if kind in {"OSError", "PermissionError", "ValueError", "TypeError", "RuntimeError"}
+            else "other",
+        }
     return result
 
 

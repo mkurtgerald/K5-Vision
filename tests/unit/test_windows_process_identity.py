@@ -1253,3 +1253,291 @@ def test_failed_pin_transfer_cannot_hide_native_release_failure_as_disappearance
     assert (
         cohort.ownership_records[(target_pid, births[target_pid])]["outcome"] == "proof_unavailable"
     )
+
+
+@pytest.mark.parametrize(
+    "name,category",
+    [
+        ("WerFaultSecure.exe", "werfaultsecure"),
+        ("wermgr.exe", "wermgr"),
+        ("cmd.exe", "cmd"),
+        ("powershell.exe", "powershell"),
+        ("pwsh.exe", "pwsh"),
+        ("wmic.exe", "wmic"),
+        ("w32tm.exe", "w32tm"),
+        ("sc.exe", "sc"),
+        ("ffmpeg.exe", "ffmpeg"),
+        ("ffprobe.exe", "ffprobe"),
+        ("secret-tenant-name.exe", "other"),
+    ],
+)
+def test_rejected_known_basename_is_finite_and_never_admitted(monkeypatch, name, category):
+    image = str(PureWindowsPath(r"C:\private tenant path") / name)
+    details = _details(12, _BASE, 11)
+    details["image"] = image
+    monkeypatch.setattr(
+        _NATIVE,
+        "_fixed_image_file_diagnostic",
+        lambda *_args, **_kwargs: {"status": "different_fixed_file"},
+    )
+    with pytest.raises(_NATIVE.OwnershipFailure) as failure:
+        _NATIVE.service_candidate(
+            details,
+            _SERVICE_SID,
+            _image_inventory(),
+            diagnose_image=lambda actual, images: _NATIVE.image_diagnostic(
+                actual, images, same_file=lambda *_: False
+            ),
+        )
+    note = failure.value.diagnostic
+    assert note["accepted"] is False and note["outcome"] == "unexpected_service_image"
+    assert note["image_diagnostic"]["basename_category"] == category
+    encoded = str(note)
+    assert image not in encoded and "private tenant" not in encoded
+    assert "secret-tenant-name" not in encoded
+
+
+@pytest.mark.parametrize("kind", ["wrapper", "host", "python", "mediamtx", "caddy"])
+def test_admitted_service_image_does_not_run_failure_observation(kind):
+    details = _details(12, _BASE, 11, kind=kind)
+
+    def forbidden(*_args):
+        pytest.fail("Success-path admission performed failure-only file observation")
+
+    note = _NATIVE.service_candidate(
+        details, _SERVICE_SID, _image_inventory(), diagnose_image=forbidden
+    )
+    assert note["accepted"] is True and "image_diagnostic" not in note
+
+
+def test_unlisted_basename_never_resolves_or_opens_known_file(monkeypatch):
+    def forbidden(*_args):
+        pytest.fail("Unlisted image attempted fixed-path resolution or hashing")
+
+    monkeypatch.setattr(_NATIVE, "_fixed_image_target", forbidden)
+    result = _NATIVE._fixed_image_file_diagnostic(
+        r"C:\private\secret-customer.exe", same_file=forbidden
+    )
+    assert result == {"status": "unlisted_basename"}
+    assert "secret" not in str(result)
+
+
+def _fixed_file_fixture(monkeypatch, tmp_path):
+    import hashlib
+
+    from k5vision import installed_code_security, windows_identity_security
+
+    expected = tmp_path / "fixed-code" / "cmd.exe"
+    expected.parent.mkdir()
+    expected.write_bytes(b"actual retained fixed code bytes")
+    # Bypass only the OS selector in this platform-independent filesystem test.
+    # The actual custody traversal, same-file prerequisite, hash and snapshots run.
+    monkeypatch.setattr(_NATIVE, "os", SimpleNamespace(name="nt", fstat=os.fstat))
+    monkeypatch.setattr(
+        _NATIVE,
+        "_fixed_image_target",
+        lambda _name: (expected, expected.parent, "fixed_system32"),
+    )
+    monkeypatch.setattr(installed_code_security, "_native_security", lambda: "native")
+    checks = []
+    monkeypatch.setattr(
+        installed_code_security,
+        "_code_policy",
+        lambda native, path, *, within: checks.append((native, path, within)),
+    )
+    monkeypatch.setattr(windows_identity_security, "check_windows_volume", lambda *_: None)
+    return expected, checks, hashlib.sha256(expected.read_bytes()).hexdigest()
+
+
+def test_fixed_known_image_hash_requires_same_file_and_custody(monkeypatch, tmp_path):
+    expected, checks, sha = _fixed_file_fixture(monkeypatch, tmp_path)
+    comparisons = []
+
+    def same_file(actual, target):
+        comparisons.append((actual, target))
+        return True
+
+    image = r"C:\Windows\System32\cmd.exe"
+    result = _NATIVE._fixed_image_file_diagnostic(image, same_file=same_file)
+    assert result["status"] == "observed" and result["same_file"] is True
+    assert result["scope"] == "fixed_system32"
+    assert result["trusted_code_custody_verified"] is True
+    assert result["file_sha256"] == sha and result["file_bytes"] == expected.stat().st_size
+    assert result["file_identity"]["file_id"] == expected.stat().st_ino
+    assert len(comparisons) == 2 and all(row[1] == str(expected) for row in comparisons)
+    assert checks and checks[-1] == ("native", expected, True)
+    assert str(expected) not in str(result) and image not in str(result)
+
+
+def test_same_basename_outside_fixed_target_never_hashes(monkeypatch, tmp_path):
+    _expected, checks, _sha = _fixed_file_fixture(monkeypatch, tmp_path)
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("Different file content was opened or hashed")
+
+    monkeypatch.setattr(_NATIVE.hashlib, "file_digest", forbidden)
+    result = _NATIVE._fixed_image_file_diagnostic(r"C:\private\cmd.exe", same_file=lambda *_: False)
+    assert result == {
+        "status": "different_fixed_file",
+        "scope": "fixed_system32",
+        "same_file": False,
+    }
+    assert checks == []
+
+
+@pytest.mark.parametrize("fault", ["custody", "reparse", "changed_identity"])
+def test_fixed_image_observation_faults_preserve_original_rejection(monkeypatch, tmp_path, fault):
+    from k5vision import installed_code_security
+
+    expected, _checks, _sha = _fixed_file_fixture(monkeypatch, tmp_path)
+    if fault == "custody":
+
+        def denied(*_args, **_kwargs):
+            raise PermissionError("private path / secret source URI")
+
+        monkeypatch.setattr(installed_code_security, "_code_policy", denied)
+    elif fault == "reparse":
+        target = expected.with_suffix(".real")
+        expected.rename(target)
+        expected.symlink_to(target)
+    count = 0
+
+    def compare(_actual, target):
+        nonlocal count
+        if target == str(expected):
+            count += 1
+            return fault != "changed_identity" or count < 2
+        return False
+
+    details = _details(12, _BASE, 11)
+    details["image"] = r"C:\Windows\System32\cmd.exe"
+    with pytest.raises(_NATIVE.OwnershipFailure) as failure:
+        _NATIVE.service_candidate(
+            details,
+            _SERVICE_SID,
+            _image_inventory(),
+            diagnose_image=lambda actual, images: _NATIVE.image_diagnostic(
+                actual, images, same_file=compare
+            ),
+        )
+    result = failure.value.diagnostic
+    assert result["accepted"] is False and result["outcome"] == "unexpected_service_image"
+    note = result["image_diagnostic"]["fixed_known_file"]
+    assert note["status"] == "unavailable" and "file_sha256" not in note
+    assert "secret" not in str(result) and str(tmp_path) not in str(result)
+
+
+def test_known_file_facts_survive_actual_failure_property_without_private_source(
+    monkeypatch, tmp_path
+):
+    import ast
+    import json
+
+    expected, _checks, sha = _fixed_file_fixture(monkeypatch, tmp_path)
+    monkeypatch.setattr(_DESKTOP, "_helpers", lambda _name: _NATIVE)
+    monkeypatch.setattr(
+        _NATIVE, "_same_local_file", lambda _actual, target: target == str(expected)
+    )
+    births, parents = {11: _BASE, 12: _BASE + 1}, {12: 11}
+    details = _details(12, births[12], 11)
+    details["image"] = r"C:\Windows\System32\cmd.exe"
+    cohort = _cohort(monkeypatch, births, parents, {12: details})
+    cohort.add(SimpleNamespace(pid=11), role="service")
+    with pytest.raises(_NATIVE.OwnershipFailure):
+        cohort.snapshot()
+    assert cohort.failed
+    # Execute the actual normal Motion failure-property projection, not a mirror.
+    source = ast.parse((_ROOT / "test_windows_motion_recording.py").read_text())
+    failure = next(
+        node
+        for node in ast.walk(source)
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.BoolOp)
+        and ast.unparse(node.test) == "failed or cleanup_failed"
+    )
+    properties = []
+    namespace = {
+        "diagnostic": {
+            "stage": "owned_stop_and_uninstall",
+            "process_ownership": cohort.ownership_diagnostic(),
+            "private_source_url": "rtsp://private-user:secret-password@private-camera",
+        },
+        "failed": True,
+        "cleanup_failed": True,
+        "json": json,
+        "record": lambda name, value: properties.append((name, json.loads(value))),
+    }
+    exec(
+        compile(
+            ast.fix_missing_locations(ast.Module(body=failure.body[:3], type_ignores=[])),
+            "actual_normal_motion_failure_property",
+            "exec",
+        ),
+        namespace,
+    )
+    assert len(properties) == 1 and properties[0][0] == "motion_windows_diagnostic"
+    emitted = properties[0][1]
+    refused = next(row for row in emitted["process_ownership"]["instances"] if not row["accepted"])
+    assert refused["image_diagnostic"]["basename_category"] == "cmd"
+    assert refused["image_diagnostic"]["fixed_known_file"]["file_sha256"] == sha
+    assert emitted["failed"] is True and emitted["cleanup_failed"] is True
+    assert "secret-password" not in json.dumps(emitted) and str(tmp_path) not in json.dumps(emitted)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Fixed System32 evidence requires native Windows")
+def test_native_fixed_known_file_diagnostic_still_rejects_system_command():
+    native = _NATIVE.NativeProcessTree()
+    image = str(PureWindowsPath(native.system_directory()) / "cmd.exe")
+    details = _details(12, _BASE, 11)
+    details["image"] = image
+    with pytest.raises(_NATIVE.OwnershipFailure) as failure:
+        _NATIVE.service_candidate(
+            details,
+            _SERVICE_SID,
+            _image_inventory(),
+            diagnose_image=_NATIVE.image_diagnostic,
+        )
+    note = failure.value.diagnostic
+    assert not note["accepted"] and note["outcome"] == "unexpected_service_image"
+    facts = note["image_diagnostic"]["fixed_known_file"]
+    assert facts["status"] == "observed" and facts["scope"] == "fixed_system32"
+    assert facts["same_file"] and facts["trusted_code_custody_verified"]
+    assert len(facts["file_sha256"]) == 64 and facts["file_bytes"] > 0
+    assert image not in str(note)
+
+
+@pytest.mark.parametrize("changed_type", [False, True])
+def test_windows_executable_path_mode_and_handle_type_comparison(
+    monkeypatch, tmp_path, changed_type
+):
+    import stat
+
+    expected, _checks, sha = _fixed_file_fixture(monkeypatch, tmp_path)
+    expected.chmod(0o755)
+    native_fstat = os.fstat
+
+    def handle_stat(fd):
+        info = native_fstat(fd)
+        return SimpleNamespace(
+            st_dev=info.st_dev,
+            st_ino=info.st_ino,
+            # Model CPython Windows fstat: no path-based synthetic .exe 0111.
+            st_mode=(stat.S_IFDIR if changed_type else stat.S_IFREG)
+            | (stat.S_IMODE(info.st_mode) & ~0o111),
+            st_nlink=info.st_nlink,
+            st_size=info.st_size,
+            st_mtime_ns=info.st_mtime_ns,
+            st_file_attributes=getattr(info, "st_file_attributes", 0),
+        )
+
+    monkeypatch.setattr(_NATIVE.os, "fstat", handle_stat)
+    if changed_type:
+        with pytest.raises(ValueError, match="open identity changed"):
+            _NATIVE._fixed_image_file_diagnostic(
+                r"C:\Windows\System32\cmd.exe", same_file=lambda *_: True
+            )
+    else:
+        facts = _NATIVE._fixed_image_file_diagnostic(
+            r"C:\Windows\System32\cmd.exe", same_file=lambda *_: True
+        )
+        assert facts["status"] == "observed" and facts["file_sha256"] == sha

@@ -160,6 +160,11 @@ def create_operator_product_app(
     application.state.operator_oidc = oidc
     application.state.operator_time_admin = time_admin
     application.state.operator_recording_policies = recording_policies
+    from k5vision.operator_recorder_faults import RecorderFaultMonitor
+
+    # Optional alert persistence cannot prevent camera recording or sign-in.
+    recorder_faults = RecorderFaultMonitor(service, audit)
+    application.state.operator_recorder_faults = recorder_faults
 
     def close_admin_state():
         with ExitStack() as cleanup:
@@ -223,14 +228,18 @@ def create_operator_product_app(
                 return
             cleaned = True
             try:
-                if integration_task is not None:
-                    integration_task.cancel()
-                    with suppress(asyncio.CancelledError):
-                        await integration_task
-                if analytics_task is not None:
-                    analytics_task.cancel()
-                    with suppress(asyncio.CancelledError):
-                        await analytics_task
+                try:
+                    # Join pending fault writes before the audit authority closes.
+                    await recorder_faults.aclose()
+                finally:
+                    if integration_task is not None:
+                        integration_task.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await integration_task
+                    if analytics_task is not None:
+                        analytics_task.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await analytics_task
             finally:
                 try:
                     preparation = getattr(app.state, "operator_person_preparation", None)
@@ -277,6 +286,7 @@ def create_operator_product_app(
             async with previous_lifespan(app):
                 try:
                     await service.start(cameras.list_sources())
+                    recorder_faults.start()
                     if events is not None:
                         await events.start()
 

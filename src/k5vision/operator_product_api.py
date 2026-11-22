@@ -1029,6 +1029,97 @@ def install_operator_product_api(
     async def operator_status(response: Response, _session: tuple[UserAccount, str] = read_session):
         response.headers["Cache-Control"] = "no-store"
         report = {**service.diagnostics(), "analytics_status": person_status}
+        faults = getattr(app.state, "operator_recorder_faults", None)
+        if faults is not None:
+            # Fault history can contain cameras outside this account's grant.
+            # Reauthorize after the snapshot and camera-store reads; expose no
+            # site-wide per-camera counts or inaccessible camera identifiers.
+            observed = await asyncio.to_thread(faults.snapshot)
+            current, _ = await authenticate(_session[1])
+
+            def selected_authority():
+                selected = permitted_selections(current)
+                credential = users.active_session_snapshot(current.id)
+                if credential is None or credential[0].role is not current.role:
+                    raise _unauthorized()
+                return selected, credential[1]
+
+            try:
+                selected, credential = await authority_read(selected_authority)
+            except UserRegistryStorageError:
+                raise HTTPException(503, "Operator identity unavailable") from None
+            current, _ = await authenticate(_session[1])
+            issued_current = sessions.current_session_guard(_session[1], current.id)
+
+            def alert_authority():
+                from k5vision.operator_role_policy import BASE_PERMISSIONS, RolePolicyError
+
+                policy = getattr(app.state, "operator_roles", None)
+                try:
+                    permissions, generation = (
+                        (BASE_PERMISSIONS[current.role], None)
+                        if policy is None
+                        else policy.permission_snapshot(current)
+                    )
+                except RolePolicyError:
+                    raise HTTPException(503, "roles_unavailable") from None
+                # Role writes use role -> users ordering. Release the policy
+                # lock before taking the registry lock for one current account
+                # and grant snapshot. Never wait on either lock on the loop.
+                with users._lock:
+                    admitted = users.resolve_session(current, credential)
+                    if admitted is None or admitted.role is not current.role:
+                        raise _unauthorized()
+                    administrator = admitted.role is UserRole.ADMINISTRATOR
+                    grant = None if administrator else access_policy(admitted)
+                visible = bool(permissions.intersection({"cameras.view_live", "cameras.playback"}))
+                if not visible:
+                    return {"visible": False}, policy, generation
+                allowed = {
+                    str(source.binding.device_id)
+                    for source in selected
+                    if administrator
+                    or grant["mode"] == "all"
+                    or source.binding.device_id in grant["camera_ids"]
+                }
+
+                def permitted_fault(row):
+                    identifier = row["camera_id"]
+                    return administrator or (identifier in allowed if identifier else bool(allowed))
+
+                def public_fault(row):
+                    # Internal IDs and monotonic run bookkeeping would reveal
+                    # activity on cameras outside a restricted operator's grant.
+                    return {
+                        key: row[key]
+                        for key in ("code", "camera_id", "state", "resolution", "occurred_at")
+                    }
+
+                alerts = {
+                    "visible": True,
+                    "available": observed["available"],
+                    "monitoring": observed["monitoring"],
+                    "active": [
+                        public_fault(row) for row in observed["active"] if permitted_fault(row)
+                    ],
+                    "history": [
+                        public_fault(row) for row in observed["history"] if permitted_fault(row)
+                    ][-20:],
+                }
+                return alerts, policy, generation
+
+            try:
+                alerts, policy, generation = await authority_read(alert_authority)
+            except UserRegistryStorageError:
+                raise HTTPException(503, "Operator identity unavailable") from None
+            # No durable reads or awaits follow the final admitted grant.
+            if policy is not getattr(app.state, "operator_roles", None) or (
+                policy is not None and generation != policy.permission_generation
+            ):
+                raise HTTPException(503, "roles_unavailable")
+            if not issued_current():
+                raise _unauthorized()
+            report["recorder_alerts"] = alerts
         if prepare_native_person_on_camera and analytics is not None:
             # Reveal only the finite sealed-worker phase to an authenticated
             # operator. Never expose local model paths, exceptions or pixels.
