@@ -409,7 +409,21 @@ def _permission_journey(page, client, camera, browser_helpers, *, diagnostic=Non
         token = admin._activate(other_admin, client.origin, username, temporary, password)
         status, _ = admin._api(other_admin, token, "GET", policy_route)
         _require(status == 200, "Second administrator lacked current camera authority")
-        preview = client.json(preview_route, method="POST")
+        preview_started = time.monotonic()
+        preview_arguments = {"method": "POST"}
+        if os.environ["K5_MOTION_DIAGNOSTIC_ARM"] == "preview-7s":
+            preview_arguments["request_deadline_seconds"] = 7
+        try:
+            preview = client.json(preview_route, **preview_arguments)
+        finally:
+            diagnostic["permission_preview_request"] = {
+                "elapsed_seconds": round(time.monotonic() - preview_started, 4),
+                "http_status": client.last_http_status,
+                "transport_failure": client.transport_failure,
+                "request_budget_seconds": 7
+                if "request_deadline_seconds" in preview_arguments
+                else 3,
+            }
         owner_status, body, headers = client.get(preview["preview_url"], max_bytes=2 * 1024**2)
         _require(
             owner_status == 200
@@ -530,6 +544,17 @@ def _history_export(
 def test_native_windows_motion_recording_and_zones(record_testsuite_property):
     __tracebackhide__ = True
     diagnostic_only = os.environ.get("K5_MOTION_DIAGNOSTIC_ONLY") == "1"
+    diagnostic_arm = os.environ.get("K5_MOTION_DIAGNOSTIC_ARM")
+    harness_head = os.environ.get("K5_MOTION_DIAGNOSTIC_HARNESS_SHA", "")
+    _require(
+        diagnostic_only
+        and diagnostic_arm in {"baseline", "preview-7s"}
+        and os.environ.get("K5_DESKTOP_HEAD_SHA") == "b6e725ac6e63dbfda5e4f1b7c20d47f311075c3c"
+        and len(harness_head) == 40
+        and all(character in "0123456789abcdef" for character in harness_head)
+        and harness_head != os.environ.get("K5_DESKTOP_HEAD_SHA"),
+        "This replay requires the exact b6 diagnostic-only scope",
+    )
 
     def record(name, value):
         prefix = "diagnostic_only_" if diagnostic_only else ""
@@ -542,7 +567,15 @@ def test_native_windows_motion_recording_and_zones(record_testsuite_property):
                 {
                     "diagnostic_only": True,
                     "installer_head": os.environ.get("K5_DESKTOP_HEAD_SHA"),
-                    "harness_head": os.environ.get("K5_MOTION_DIAGNOSTIC_HARNESS_SHA"),
+                    "harness_head": harness_head,
+                    "arm": diagnostic_arm,
+                    "preview_request_budget_seconds": 7 if diagnostic_arm == "preview-7s" else 3,
+                    "harness_files": {
+                        name: hashlib.sha256(
+                            Path(__file__).with_name(name).read_bytes()
+                        ).hexdigest()
+                        for name in (Path(__file__).name, "test_operator_product_runtime.py")
+                    },
                 },
                 sort_keys=True,
             ),
@@ -999,6 +1032,9 @@ def test_native_windows_motion_recording_and_zones(record_testsuite_property):
         receipt.update(dict.fromkeys(_TRUE_FLAGS, True))
     except BaseException as error:
         failed = True
+        if "client" in locals():
+            diagnostic["client_last_http_status"] = client.last_http_status
+            diagnostic["client_transport_failure"] = client.transport_failure
         diagnostic["failure_kind"] = (
             type(error).__name__
             if type(error).__name__
