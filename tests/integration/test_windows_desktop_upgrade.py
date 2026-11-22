@@ -20,6 +20,8 @@ import sys
 import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from urllib.error import HTTPError
+from urllib.request import Request
 from uuid import uuid4
 
 import psutil
@@ -134,6 +136,45 @@ def _hash_value(value):
     return hashlib.sha256(
         json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
+
+
+def _configure_unicode_provider(client, diagnostic):
+    """Use the historical browser's UTF-8 transport within its exact body cap."""
+    value = {
+        "enabled": False,
+        "display_name": "Retained migration issuer",
+        "issuer": "https://id.example.test",
+        "client_id": "migration-fixture",
+        "client_secret": "\U0001f600" * 3500,
+        "groups_claim": "groups",
+    }
+    payload = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    assert len(payload) < 16 * 1024
+    # This legitimate 14 KiB secret also requires more than a 32 KiB private
+    # migration verify frame once cleartext and DPAPI ciphertext are base64.
+    assert len(value["client_secret"].encode("utf-8")) * 8 // 3 > 32768
+    request = Request(
+        client.origin + "/api/v1/operator/admin/sso/provider",
+        data=payload,
+        method="PUT",
+        headers={
+            "Origin": client.origin,
+            "Content-Type": "application/json",
+            "Authorization": "Bearer " + client.token,
+        },
+    )
+    try:
+        response = client.opener.open(request, timeout=3)
+    except HTTPError as error:
+        response = error
+    with response:
+        status = response.code
+        diagnostic["baseline_sso_http_status"] = (
+            status if status in {200, 400, 401, 403, 413, 422, 500, 503} else 0
+        )
+        assert status == 200, "Historical Unicode provider request was refused"
+        result = json.loads(response.read(16385))
+        assert result.get("has_client_secret") is True
 
 
 def _source_authorities(profile):
@@ -499,18 +540,8 @@ def test_native_windows_legacy_service_migration_and_manual_reversal(record_test
                 "retention_seconds": 86400,
             },
         )
-        client.json(
-            "/api/v1/operator/admin/sso/provider",
-            method="PUT",
-            data={
-                "enabled": False,
-                "display_name": "Retained migration issuer",
-                "issuer": "https://id.example.test",
-                "client_id": "migration-fixture",
-                "client_secret": "\U0001f600" * 4096,
-                "groups_claim": "groups",
-            },
-        )
+        diagnostic["phase"] = "baseline_unicode_sso"
+        _configure_unicode_provider(client, diagnostic)
         diagnostic["phase"] = "baseline_recording_export"
         before_bytes = d._recording_bytes(profile)
         d._wait(
