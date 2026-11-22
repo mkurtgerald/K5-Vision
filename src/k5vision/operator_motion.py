@@ -307,14 +307,15 @@ class MotionRuntime:
         if path not in self.sources and path not in self.inflight:
             self._forget_ephemeral(path)
 
-    def invalidate(self, paths=None, *, clear_preview=True):
+    def invalidate(self, paths=None, *, clear_preview=True, keep_worker=False):
         for path in tuple(self.sources if paths is None else paths):
             self.generations[path] = self.generations.get(path, 0) + 1
             self.holds.pop(path, None)
             self.health[path] = "unavailable"
             self.moving.pop(path, None)
             self.gates.pop(path, None)
-            self._retire(path)
+            if not keep_worker:
+                self._retire(path)
             if clear_preview:
                 self.samples.pop(path, None)
                 self.observed.pop(path, None)
@@ -565,6 +566,7 @@ class MotionRuntime:
         self.samples[path] = {
             "jpeg": result.jpeg,
             "captured_at": captured_at,
+            "generation": self._generation(source, policy),
             "reference": reference,
             "capture_id": secrets.token_urlsafe(24),
         }
@@ -631,6 +633,11 @@ class MotionRuntime:
                             # closed while retaining continuous camera intent.
                             self.service._needs_reconcile = True
                             self.service._ready = False
+                elif worker is not None and self.workers.get(path) is worker:
+                    # A policy edit can retain this decoder while its previous
+                    # request drains. A failed old request still retires its
+                    # own mapped worker, without touching a replacement.
+                    self._retire(path)
 
     def start(self):
         if self.store is not None and self.task is None:
@@ -855,7 +862,20 @@ class MotionRuntime:
                     raise MotionUnavailable("Motion camera selection changed")
                 check_reference()
 
-            self.invalidate((path,), clear_preview=False)
+            sample = self.samples.get(path)
+            keep_worker = (
+                path in self.workers
+                and self.health.get(path) == "ready"
+                and self.policies.get(path) == previous
+                and sample is not None
+                and sample.get("generation") == self._generation(source, previous)
+                and 0 <= time.monotonic() - sample["captured_at"] <= 2
+            )
+            # The child accepts a policy on each sample and resets its pixel
+            # baseline itself. Keep a fresh decoder on the unchanged source,
+            # while fencing all earlier results and requiring a new sample.
+            self.invalidate((path,), clear_preview=False, keep_worker=keep_worker)
+            self.samples.pop(path, None)
             self.policies[path] = candidate
             try:
                 await self._gate(source, self.effective_record(source), before_write=final_fence)
