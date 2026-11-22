@@ -13,9 +13,17 @@ import pytest
 from fastapi import HTTPException
 
 import k5vision.operator_motion as motion
+from k5vision import identity_state
+from k5vision.domain.devices import Device
+from k5vision.media.mediamtx_config import MediaMTXSource
+from k5vision.media.mediamtx_provider import MediaMTXBinding
 from k5vision.operator_motion import MotionUnavailable, SceneMotionDetector, allowed_mask
 from k5vision.operator_motion_process import MotionSample
-from k5vision.operator_recording_policy import MotionPolicy, RecordingPolicyConflict
+from k5vision.operator_recording_policy import (
+    MotionPolicy,
+    RecordingPolicyConflict,
+    RecordingPolicyStore,
+)
 
 _SPEC = importlib.util.spec_from_file_location(
     "motion_service_harness", Path(__file__).with_name("test_operator_product_service.py")
@@ -297,6 +305,136 @@ async def _sample(engine):
     source = engine.sources[0]
     policy = runtime.policies[source.binding.path_name]
     await runtime._sample(source, copy.deepcopy(policy), runtime._generation(source, policy))
+
+
+async def _durable_runtime(tmp_path):
+    identity = identity_state.initialize_identity_state(
+        tmp_path / "identity", username="motion-admin", password="motion-test-private-password"
+    )
+    camera = Device(name="Generated motion camera", host="127.0.0.1")
+    source = MediaMTXSource(
+        MediaMTXBinding(identity.site_id, camera.id), camera, "rtsp://127.0.0.1/live"
+    )
+    store = RecordingPolicyStore(identity.directory, identity.site_id)
+    store.save(source, 0, MotionPolicy(mode="motion").model_dump(mode="json"))
+    service = SimpleNamespace(
+        _media=None,
+        _lock=asyncio.Lock(),
+        _closing=False,
+        _ready=True,
+        _needs_reconcile=False,
+        _disk_full=False,
+        _sources=(source,),
+        media_generation=1,
+        state_root=identity.directory,
+    )
+    runtime = motion.MotionRuntime(service)
+    runtime.install(store)
+    await runtime.load((source,))
+    worker = _Worker()
+    path = source.binding.path_name
+    runtime.workers[path], runtime.gates[path] = worker, False
+    return runtime, source, store
+
+
+def _pause_private_admission(store, monkeypatch):
+    entered, release = threading.Event(), threading.Event()
+    private = store._private
+    paused = False
+
+    def blocked(path):
+        nonlocal paused
+        if not paused:
+            paused = True
+            entered.set()
+            assert release.wait(3), "Controlled private admission was not released"
+        return private(path)
+
+    monkeypatch.setattr(store, "_private", blocked)
+    return entered, release
+
+
+def test_durable_policy_read_does_not_block_fresh_camera_sample(tmp_path, monkeypatch):
+    async def scenario():
+        runtime, source, store = await _durable_runtime(tmp_path)
+        path = source.binding.path_name
+        generation = runtime._generation(source, runtime.policies[path])
+        entered, release = _pause_private_admission(store, monkeypatch)
+        getter = sample = None
+        try:
+            getter = asyncio.create_task(runtime.get_policy(source))
+            assert await asyncio.to_thread(entered.wait, 1)
+            sample = asyncio.create_task(
+                runtime._sample(source, runtime.policies[path], generation)
+            )
+            done, _ = await asyncio.wait({sample}, timeout=0.5)
+            assert sample in done, "Private policy admission blocked camera sampling"
+            assert not getter.done()
+            assert runtime.status(source.binding)["state"] == "armed"
+            release.set()
+            assert (await getter)["status"] == "armed"
+        finally:
+            release.set()
+            await asyncio.gather(
+                *(task for task in (getter, sample) if task), return_exceptions=True
+            )
+            await runtime.close()
+            store.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("change", ["source", "service_source", "policy", "media", "closing"])
+def test_durable_policy_read_rechecks_generation_after_private_admission(
+    tmp_path, monkeypatch, change
+):
+    async def scenario():
+        runtime, source, store = await _durable_runtime(tmp_path)
+        path = source.binding.path_name
+        entered, release = _pause_private_admission(store, monkeypatch)
+        getter = None
+        try:
+            getter = asyncio.create_task(runtime.get_policy(source))
+            assert await asyncio.to_thread(entered.wait, 1)
+            async with runtime.service._lock:
+                if change == "source":
+                    runtime.sources[path] = replace(source, profile_key="a" * 64)
+                    runtime.service._sources = (runtime.sources[path],)
+                elif change == "service_source":
+                    runtime.service._sources = (replace(source, profile_key="a" * 64),)
+                elif change == "policy":
+                    runtime.policies[path] = {**runtime.policies[path], "revision": 2}
+                elif change == "media":
+                    runtime.service.media_generation += 1
+                else:
+                    runtime.closing = True
+                selected = copy.deepcopy(runtime.policies[path])
+            release.set()
+            with pytest.raises(MotionUnavailable, match="selection changed"):
+                await getter
+            assert runtime.policies[path] == selected
+        finally:
+            release.set()
+            if getter is not None:
+                await asyncio.gather(getter, return_exceptions=True)
+            await runtime.close()
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_durable_policy_read_returns_unavailable_status_when_backend_is_down(tmp_path):
+    async def scenario():
+        runtime, source, store = await _durable_runtime(tmp_path)
+        try:
+            runtime.service._ready = False
+            result = await runtime.get_policy(source)
+            assert result["status"] == "unavailable" and result["revision"] == 1
+        finally:
+            await runtime.close()
+            store.close()
+
+    asyncio.run(scenario())
 
 
 def test_real_service_motion_arms_triggers_holds_and_closes_only_one_path(engine, monkeypatch):

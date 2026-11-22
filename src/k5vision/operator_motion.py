@@ -467,17 +467,35 @@ class MotionRuntime:
         return copy.deepcopy(self.observed.get(source.binding.path_name))
 
     async def get_policy(self, source):
-        if self.store is None or self.closing:
+        if self.store is None or self.closing or self.service._closing:
             raise MotionUnavailable("Motion policy is unavailable")
+        path = source.binding.path_name
         async with self.service._lock:
-            current = self.sources.get(source.binding.path_name)
+            current = self.sources.get(path)
             if current is None or not self._same_source(current, source):
                 raise MotionUnavailable("Motion camera selection changed")
-            policy = await self._run(self.store.get, source)
+            generation = self._generation(source, self.policies[path])
+        # Durable file/custody admission must not hold up independent sampling
+        # or a post-capture gate. Revalidate its selection after the read.
+        policy = await self._run(self.store.get, source)
+        async with self.service._lock:
+            current = self.sources.get(path)
+            selected = self.policies.get(path)
+            if (
+                self.closing
+                or self.service._closing
+                or current is None
+                or not self._same_source(current, source)
+                or not any(self._same_source(value, source) for value in self.service._sources)
+                or selected is None
+                or self._generation(current, selected) != generation
+                or self._generation(source, policy) != generation
+            ):
+                raise MotionUnavailable("Motion camera selection changed")
             return {
                 **policy,
                 **self.status(source.binding),
-                "observed_reference": copy.deepcopy(self.observed.get(source.binding.path_name)),
+                "observed_reference": copy.deepcopy(self.observed.get(path)),
             }
 
     async def forget(self, camera_id):

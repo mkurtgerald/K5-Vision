@@ -118,9 +118,19 @@ def _observe_recording(
     seconds=4,
     diagnostic=None,
 ):
+    observation = {
+        "movement": movement,
+        "expected_growing": growing,
+        "expected_states": sorted(state),
+        "phase": "waiting_for_state",
+    }
+    if diagnostic is not None:
+        diagnostic["motion_observation"] = observation
     publisher.movement(movement)
-    _policy_state(client, camera, state, desktop, app=app)
+    boundary = _policy_state(client, camera, state, desktop, app=app)
+    observation["entry_state"] = boundary["status"]
     if not growing:
+        observation["phase"] = "waiting_for_quiescence"
         # A completed record-only PATCH closes its fragment. Require actual
         # file quiescence before starting the measured idle interval.
         previous, stable_since = None, time.monotonic()
@@ -134,27 +144,41 @@ def _observe_recording(
 
         desktop._wait(closed, "Closed motion recording fragment", timeout=10, process=app)
     before = [desktop._recording_bytes(profile, path) for path in paths]
+    frames_before = publisher.frames_written
     began, observed_states = time.monotonic(), set()
+    state_edges, poll_seconds = [], []
+    observation["phase"] = "observing"
     while time.monotonic() - began < seconds:
         publisher.check()
-        observed_states.add(_policy(client, camera)["status"])
+        poll_began = time.monotonic()
+        current = _policy(client, camera)["status"]
+        poll_seconds.append(time.monotonic() - poll_began)
+        observed_states.add(current)
+        if not state_edges or current != state_edges[-1]["state"]:
+            state_edges.append(
+                {"state": current, "elapsed_seconds": round(time.monotonic() - began, 3)}
+            )
         if app is not None:
             _require(app.poll() is None, "Installed motion recorder exited")
         time.sleep(0.2)
     elapsed = time.monotonic() - began
     after = [desktop._recording_bytes(profile, path) for path in paths]
-    if diagnostic is not None:
-        diagnostic["motion_observation"] = {
-            "movement": movement,
-            "expected_growing": growing,
-            "expected_states": sorted(state),
+    observation.update(
+        {
+            "phase": "complete",
             "observed_states": sorted(observed_states),
+            "state_edges": state_edges,
+            "policy_poll_count": len(poll_seconds),
+            "policy_poll_max_seconds": round(max(poll_seconds, default=0), 3),
+            "publisher_frames_before": frames_before,
+            "publisher_frames_after": publisher.frames_written,
             "target_before": before[0],
             "target_after": after[0],
             "other_before": before[1],
             "other_after": after[1],
             "elapsed_seconds": round(elapsed, 3),
         }
+    )
     _require(
         after[0] > before[0] if growing else after[0] == before[0],
         "Actual recording bytes disagreed with the motion gate",
@@ -708,6 +732,7 @@ def test_native_windows_motion_recording_and_zones(record_testsuite_property):
             state={"armed"},
             growing=False,
             app=app,
+            diagnostic=diagnostic,
         )
         observations["outside_inclusion"] = _observe_recording(
             client,
@@ -720,6 +745,7 @@ def test_native_windows_motion_recording_and_zones(record_testsuite_property):
             state={"armed"},
             growing=False,
             app=app,
+            diagnostic=diagnostic,
         )
         publisher.movement("idle")
         observations["zoned_idle"] = _observe_recording(
@@ -733,6 +759,7 @@ def test_native_windows_motion_recording_and_zones(record_testsuite_property):
             state={"armed"},
             growing=False,
             app=app,
+            diagnostic=diagnostic,
         )
         idle_middle = datetime.now(UTC) - timedelta(seconds=2)
         trigger_start = datetime.now(UTC)
@@ -749,6 +776,7 @@ def test_native_windows_motion_recording_and_zones(record_testsuite_property):
             growing=True,
             app=app,
             seconds=6,
+            diagnostic=diagnostic,
         )
         trigger_end = datetime.now(UTC)
         publisher.movement("idle")
@@ -764,6 +792,7 @@ def test_native_windows_motion_recording_and_zones(record_testsuite_property):
             state={"armed"},
             growing=False,
             app=app,
+            diagnostic=diagnostic,
         )
         retained = video_helpers._closed_subset(sorted(paths[0].glob("*.mp4")))
         diagnostic["stage"] = "browser_closed_motion"
@@ -780,6 +809,7 @@ def test_native_windows_motion_recording_and_zones(record_testsuite_property):
             state={"recording"},
             growing=True,
             app=app,
+            diagnostic=diagnostic,
         )
         observations["browser_closed_idle"] = _observe_recording(
             client,
@@ -792,6 +822,7 @@ def test_native_windows_motion_recording_and_zones(record_testsuite_property):
             state={"armed"},
             growing=False,
             app=app,
+            diagnostic=diagnostic,
         )
         diagnostic["stage"] = "native_motion_restart"
         before_restart = _policy(client, target)
@@ -831,6 +862,7 @@ def test_native_windows_motion_recording_and_zones(record_testsuite_property):
             state={"armed"},
             growing=False,
             app=app,
+            diagnostic=diagnostic,
         )
         diagnostic["stage"] = "master_pause_override"
         route = f"/api/v1/operator/cameras/{target}/recording"
@@ -849,6 +881,7 @@ def test_native_windows_motion_recording_and_zones(record_testsuite_property):
             state={"paused"},
             growing=False,
             app=app,
+            diagnostic=diagnostic,
         )
         publisher.movement("idle")
         _require(
@@ -905,6 +938,7 @@ def test_native_windows_motion_recording_and_zones(record_testsuite_property):
             state={"zones_need_review"},
             growing=False,
             app=app,
+            diagnostic=diagnostic,
         )
         browser_helpers._open_camera_watch(page, target)
         page.locator("#camera-recording-settings-button").click()
