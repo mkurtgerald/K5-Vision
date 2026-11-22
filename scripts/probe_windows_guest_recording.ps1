@@ -234,6 +234,11 @@ try{
     $receipt.network_preflight_complete=$true
     $receipt.generated_source_isolated=$true
     $receipt.stage='official_pinned_image_download'
+    $receipt.download_subphase='response_headers'
+    $receipt.download_response_status=0;$receipt.download_content_length=0
+    $receipt.download_copy_complete=$false
+    $downloadWatch=[Diagnostics.Stopwatch]::StartNew()
+    [long]$downloaded=0
     Add-Type -AssemblyName System.Net.Http
     $handler=[Net.Http.HttpClientHandler]::new();$handler.AllowAutoRedirect=$false
     $client=[Net.Http.HttpClient]::new($handler);$client.Timeout=[TimeSpan]::FromMinutes(12)
@@ -242,15 +247,23 @@ try{
     try{
         $url='https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/26100.1742.amd64fre.ge_release_svc_refresh.240906-0331_server_serverdatacentereval_en-us.vhdx'
         $response=$client.GetAsync($url,[Net.Http.HttpCompletionOption]::ResponseHeadersRead,$cancel.Token).GetAwaiter().GetResult()
+        $receipt.download_response_status=[int]$response.StatusCode
+        $receipt.download_content_length=[long]$response.Content.Headers.ContentLength
         if([int]$response.StatusCode -ne 200 -or $response.Content.Headers.ContentLength -ne $imageBytes){throw 'Official image response differs'}
+        $receipt.download_subphase='body_stream'
         $input=$response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
         $output=[IO.File]::Open($image,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
-        $buffer=[byte[]]::new(1048576);[long]$downloaded=0
+        $buffer=[byte[]]::new(1048576)
         while(($count=$input.ReadAsync($buffer,0,$buffer.Length,$cancel.Token).GetAwaiter().GetResult()) -gt 0){
             $downloaded+=$count;if($downloaded -gt $imageBytes){throw 'Image length exceeded'};$output.Write($buffer,0,$count)
         }
+        $receipt.download_subphase='durable_flush'
         $output.Flush($true)
+        $receipt.download_copy_complete=$true
     }finally{
+        $receipt.downloaded_bytes=$downloaded
+        $receipt.download_elapsed_seconds=[Math]::Round($downloadWatch.Elapsed.TotalSeconds,3)
+        $receipt.download_cancellation_requested=$cancel.IsCancellationRequested
         if($null -ne $output){$output.Dispose()};if($null -ne $input){$input.Dispose()};if($null -ne $response){$response.Dispose()}
         $cancel.Dispose();$client.Dispose();$handler.Dispose()
     }
@@ -416,6 +429,17 @@ try{
     $receipt.outcome='installer_guest_recording_observed';$receipt.stage='complete'
 }catch{
     $receipt.failure_kind=$_.Exception.GetType().Name;$receipt.failure_hresult=$_.Exception.HResult
+    $receipt.failure_exception_chain=@()
+    $inner=$_.Exception
+    for($depth=0;$null -ne $inner -and $depth -lt 8;$depth++){
+        $kind=$inner.GetType().Name
+        if($kind -notmatch '^[A-Za-z][A-Za-z0-9_]{0,63}$'){$kind='Other'}
+        $entry=@{kind=$kind;hresult=$inner.HResult}
+        if($inner -is [ComponentModel.Win32Exception]){$entry.native_code=$inner.NativeErrorCode}
+        if($inner -is [Net.WebException]){$entry.transport_status=[string]$inner.Status}
+        $receipt.failure_exception_chain+=$entry
+        $inner=$inner.InnerException
+    }
     $knownReasons=@{'Isolated fixture subnet unavailable'='fixture_subnet_unavailable';'Owned internal adapter unavailable'='owned_internal_adapter_unavailable';'Owned generated source ended'='owned_generated_source_ended';'IPv4 required'='invalid_route_address_family';'Owned address did not become preferred'='owned_address_not_preferred'}
     $receipt.failure_reason='other'
     if($knownReasons.ContainsKey($_.Exception.Message)){$receipt.failure_reason=$knownReasons[$_.Exception.Message]}
