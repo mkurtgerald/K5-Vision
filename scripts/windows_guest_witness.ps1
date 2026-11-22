@@ -257,9 +257,69 @@ function Add-SecurityPolicyDiagnostic($Event,[hashtable]$Diagnostic) {
         }
     }catch{$Diagnostic.policy_detail_unavailable=$true}
 }
+function Add-SecurityRefusalRangeDiagnostic($Events,$Offending,[hashtable]$Diagnostic) {
+    # Already-refused evidence only. Never add an extra census to admission.
+    # Read the already-returned bounded range; no new query or raw XML export.
+    $watch=[Diagnostics.Stopwatch]::StartNew()
+    $Diagnostic.range_census_complete=$false
+    try {
+        $records=@($Events)
+        if($records.Count -lt 1 -or $records.Count -gt 4096){throw 'Refusal census range unavailable'}
+        $startupCount=0;[long]$startupRecord=0
+        foreach($record in $records){
+            if($watch.ElapsedMilliseconds -ge 500){throw 'Refusal census budget expired'}
+            if($record.Id -eq 4608){$startupCount++;$startupRecord=[long]$record.RecordId}
+        }
+        $Diagnostic.range_startup_events=$startupCount
+        if($startupCount -eq 1){
+            $Diagnostic.range_startup_record_id=$startupRecord
+            $Diagnostic.offending_before_only_startup=([long]$Offending.RecordId -lt $startupRecord)
+            $postStartup=0
+            foreach($record in $records){
+                if($watch.ElapsedMilliseconds -ge 500){throw 'Refusal census budget expired'}
+                if([long]$record.RecordId -gt $startupRecord -and $record.Id -in @(1100,1101,1102,1104,1105,4612,4719,4912)){
+                    $postStartup++
+                    if(-not $Diagnostic.ContainsKey('range_first_poststartup_continuity_event_id')){$Diagnostic.range_first_poststartup_continuity_event_id=[int]$record.Id;$Diagnostic.range_first_poststartup_continuity_record_id=[long]$record.RecordId}
+                }
+            }
+            $Diagnostic.range_poststartup_continuity_events=$postStartup
+        }
+        $allInteractive=0;$loggedAfterStartup=0
+        foreach($record in $records){
+            if($watch.ElapsedMilliseconds -ge 500){throw 'Refusal census budget expired'}
+            if($record.Id -ne 4624){continue}
+            $logonRaw=$record.ToXml()
+            if($watch.ElapsedMilliseconds -ge 500 -or $logonRaw.Length -gt 65536){throw 'Refusal census logon detail unavailable'}
+            [xml]$logon=$logonRaw;$types=@($logon.Event.EventData.Data|Where-Object{$_.Name -ceq 'LogonType'})
+            if($types.Count -ne 1 -or [string]$types[0].'#text' -cnotmatch '^\d{1,2}$'){throw 'Refusal census logon type unavailable'}
+            if([string]$types[0].'#text' -in @('2','7','10','11','12','13')){
+                $allInteractive++
+                if($startupCount -eq 1 -and [long]$record.RecordId -gt $startupRecord){$loggedAfterStartup++}
+            }
+        }
+        if($watch.ElapsedMilliseconds -ge 500){throw 'Refusal census budget expired'}
+        $Diagnostic.range_interactive_logons_after_checkpoint=$allInteractive
+        if($startupCount -eq 1){$Diagnostic.range_interactive_logons_logged_after_startup=$loggedAfterStartup}
+        $Diagnostic.range_census_complete=$true
+    }catch{$Diagnostic.range_census_failed=$true;return}
+    if($Diagnostic.offending_event_id -eq 1101){
+        try{
+            if($watch.ElapsedMilliseconds -ge 500){throw 'Refusal detail budget expired'}
+            $raw=$Offending.ToXml()
+            if($watch.ElapsedMilliseconds -ge 500 -or $raw.Length -gt 65536){throw 'Refusal detail unavailable'}
+            [xml]$drop=$raw
+            $reason=@($drop.SelectNodes("/*[local-name()='Event']/*[local-name()='UserData']/*[local-name()='AuditEventsDropped' and namespace-uri()='http://manifests.microsoft.com/win/2004/08/windows/eventlog']/*[local-name()='Reason']"))
+            [uint32]$number=0
+            if($reason.Count -eq 1 -and [string]$reason[0].InnerText -cmatch '^[0-9]{1,10}$' -and [uint32]::TryParse([string]$reason[0].InnerText,[ref]$number)){
+                if($watch.ElapsedMilliseconds -ge 500){throw 'Refusal detail budget expired'}
+                $Diagnostic.transport_drop_reason=[long]$number
+            }
+        }catch{$Diagnostic.transport_drop_detail_unavailable=$true}
+    }
+}
 function Save-SecurityAuditFailure([hashtable]$Diagnostic,$Failure) {
-    $allowedStages=@('checkpoint_admission','oldest_newest_query','checkpoint_query','event_range_query','event_range_validation','startup_validation','logon_validation','retained_anchor_query','native_policy_wts_context','native_logon_policy','native_startup_policy','native_wts_sessions','tail_query','tail_hash','boundary_anchor_query','boundary_tail_query','boundary_tail_hash','tail_stability')
-    $allowedReasons=@('unspecified','sequence_gate','checkpoint_identity','oldest_reset_or_wrap','anchor_not_retained','range_bound','range_gap','record_order','audit_continuity_event','startup_count','logging_shutdown_after_startup','logon_type_unavailable','interactive_logon','anchor_changed','logon_policy_disabled','startup_policy_disabled','interactive_wts_session','stability_deadline','tail_reset','tail_id_reused','context_anchor_changed','final_tail_reset','final_boundary_deadline','final_tail_id_reused','final_hash_deadline','tail_never_stable','event_query_no_matches','native_call_failed')
+    $allowedStages=@('checkpoint_admission','planned_original_checkpoint_query','oldest_newest_query','checkpoint_query','event_range_query','event_range_validation','startup_validation','logon_validation','retained_anchor_query','native_policy_wts_context','native_logon_policy','native_startup_policy','native_wts_sessions','tail_query','tail_hash','boundary_anchor_query','boundary_tail_query','boundary_tail_hash','tail_stability')
+    $allowedReasons=@('unspecified','planned_original_anchor_scope','planned_original_anchor_not_retained','sequence_gate','checkpoint_identity','oldest_reset_or_wrap','anchor_not_retained','range_bound','range_gap','record_order','audit_continuity_event','startup_count','logging_shutdown_after_startup','logon_type_unavailable','interactive_logon','anchor_changed','logon_policy_disabled','startup_policy_disabled','interactive_wts_session','stability_deadline','tail_reset','tail_id_reused','context_anchor_changed','final_tail_reset','final_boundary_deadline','final_tail_id_reused','final_hash_deadline','tail_never_stable','event_query_no_matches','native_call_failed')
     if($null -ne $Failure){
         $Diagnostic.error_kind=$Failure.Exception.GetType().Name;$Diagnostic.hresult=[long]$Failure.Exception.HResult
         if($Diagnostic.reason -ceq 'unspecified'){$Diagnostic.reason=if($Failure.FullyQualifiedErrorId -like 'NoMatchingEventsFound,*'){'event_query_no_matches'}else{'native_call_failed'}}
@@ -273,13 +333,13 @@ function Save-SecurityAuditFailure([hashtable]$Diagnostic,$Failure) {
     $copy=@{schema_version=1;stage='checkpoint_admission';reason='unspecified'}
     if($Diagnostic.stage -cin $allowedStages){$copy.stage=$Diagnostic.stage}
     if($Diagnostic.reason -cin $allowedReasons){$copy.reason=$Diagnostic.reason}
-    foreach($name in @('stability_attempt','elapsed_ms','checkpoint_record_id','checkpoint_oldest_record_id','oldest_record_id','newest_record_id','range_expected','range_actual','startup_events','startup_record_id','offending_event_id','offending_record_id','offending_logon_type','interactive_logons','interactive_sessions','tail_record_id','hresult','native_code')){
+    foreach($name in @('stability_attempt','elapsed_ms','checkpoint_record_id','checkpoint_oldest_record_id','oldest_record_id','newest_record_id','range_expected','range_actual','startup_events','startup_record_id','offending_event_id','offending_record_id','offending_logon_type','interactive_logons','interactive_sessions','tail_record_id','hresult','native_code','range_startup_events','range_startup_record_id','range_poststartup_continuity_events','range_first_poststartup_continuity_event_id','range_first_poststartup_continuity_record_id','transport_drop_reason','range_interactive_logons_after_checkpoint','range_interactive_logons_logged_after_startup')){
         if($Diagnostic.ContainsKey($name)){
             $value=$Diagnostic[$name]
             if($value -is [long] -or $value -is [int] -or $value -is [uint32] -or $value -is [uint16]){$copy[$name]=[long]$value}
         }
     }
-    foreach($name in @('startup_scan_complete','logon_policy_enabled','startup_policy_enabled','policy_detail_unavailable','policy_change_tokens_recognized','policy_success_removed','policy_success_added','policy_failure_removed','policy_failure_added')){
+    foreach($name in @('range_census_complete','range_census_failed','offending_before_only_startup','transport_drop_detail_unavailable','startup_scan_complete','logon_policy_enabled','startup_policy_enabled','policy_detail_unavailable','policy_change_tokens_recognized','policy_success_removed','policy_success_added','policy_failure_removed','policy_failure_added')){
         if($Diagnostic.ContainsKey($name) -and $Diagnostic[$name] -is [bool]){$copy[$name]=$Diagnostic[$name]}
     }
     if($Diagnostic.ContainsKey('policy_subcategory_guid') -and $Diagnostic.policy_subcategory_guid -cmatch '^0cce92[1-7][0-9a-f]-69ae-11d9-bed3-505054503030$'){$copy.policy_subcategory_guid=$Diagnostic.policy_subcategory_guid}
@@ -287,6 +347,17 @@ function Save-SecurityAuditFailure([hashtable]$Diagnostic,$Failure) {
     $first=Get-Variable -Name securityAuditFirstFailure -Scope Script -ErrorAction SilentlyContinue
     if($null -eq $first -or $null -eq $first.Value){$script:securityAuditFirstFailure=$copy.Clone()}
     $script:securityAuditLastFailure=$copy.Clone()
+}
+function Planned-OffCheckpoint($Baseline){
+    $raw=[string]$config.final_off_checkpoint_json
+    if($raw.Length -lt 2 -or $raw.Length -gt 16384 -or $config.final_off_checkpoint_sha256 -cnotmatch '^[a-f0-9]{64}$'){throw 'Planned Off checkpoint unavailable'}
+    $sha=[Security.Cryptography.SHA256]::Create()
+    try{$digest=[BitConverter]::ToString($sha.ComputeHash([Text.UTF8Encoding]::new($false).GetBytes($raw))).Replace('-','').ToLowerInvariant()}finally{$sha.Dispose()}
+    if($digest -cne $config.final_off_checkpoint_sha256){throw 'Planned Off checkpoint digest differs'}
+    $off=$raw|ConvertFrom-Json;$original=$Baseline.security_checkpoint
+    if($off.schema_version -ne 1 -or $off.harness_head -cne $config.harness_head -or $off.harness_head -cnotmatch '^[a-f0-9]{40}$' -or $off.witness_sha256 -cne $config.witness_sha256 -or $off.witness_sha256 -cne (Get-FileHash -LiteralPath (Join-Path $root 'windows_guest_witness.ps1') -Algorithm SHA256).Hash.ToLowerInvariant() -or $off.image_sha256 -cne '2d175924c8e647969a82e36f931b22397108bd94a030e0e947b7e66e47e0be9a' -or $off.owned_vm_id -cne $config.planned_owned_vm_id -or $off.owned_vm_id -cnotmatch '^[a-f0-9-]{36}$' -or $off.phase -cne 'reboot' -or $off.reboot_operation -cne 'planned-shutdown-start' -or $off.transfer_id -cne $transfer -or $off.head_sha -cne $config.head_sha -or $off.setup_sha256 -cne $config.setup_sha256 -or $off.boot_id -cne $Baseline.boot_id -or $off.boot_sequence -ne $Baseline.boot_sequence -or $off.baseline_sha256 -cne (Get-FileHash -LiteralPath (Join-Path $root 'baseline.json') -Algorithm SHA256).Hash.ToLowerInvariant()){throw 'Planned Off checkpoint scope differs'}
+    if($off.original_record_id -ne $original.record_id -or $off.original_oldest_record_id -ne $original.oldest_record_id -or $off.original_xml_sha256 -cne $original.xml_sha256 -or $off.oldest_record_id -ne $original.oldest_record_id -or $off.record_id -lt $original.record_id -or $off.xml_sha256 -cnotmatch '^[a-f0-9]{64}$' -or $off.pre_off_original_checkpoint_retained -ne $true -or $off.pre_off_range_contiguous -ne $true -or $off.pre_off_interactive_logons -ne 0 -or $off.pre_off_loss_or_policy_events -ne 0){throw 'Planned original or final Off checkpoint differs'}
+    return $off
 }
 function Assert-SecurityAuditContext {
     $script:securityAuditActiveDiagnostic.stage='native_logon_policy'
@@ -299,16 +370,22 @@ function Assert-SecurityAuditContext {
     $script:securityAuditActiveDiagnostic.interactive_sessions=@([K5GuestNative]::InteractiveSessions()).Count
     if($script:securityAuditActiveDiagnostic.interactive_sessions -ne 0){$script:securityAuditActiveDiagnostic.reason='interactive_wts_session';throw 'Interactive session during audit boundary'}
 }
-function Security-RebootAudit($Checkpoint,[string]$PreviousBoot,[string]$CurrentBoot,[long]$PreviousSequence,[long]$CurrentSequence) {
+function Security-RebootAudit($Checkpoint,[string]$PreviousBoot,[string]$CurrentBoot,[long]$PreviousSequence,[long]$CurrentSequence,[bool]$RejectAllShutdown=$false,$OriginalCheckpoint=$null) {
     $stability=[Diagnostics.Stopwatch]::StartNew()
     for($attempt=0;$attempt -lt 8;$attempt++){
-        $oldest=@();$newest=@();$anchor=@();$events=@();$oldestAfter=@();$anchorAfter=@();$tailAfter=@();$boundaryOldest=@();$boundaryAnchor=@();$boundaryTail=@()
+        $oldest=@();$newest=@();$anchor=@();$events=@();$oldestAfter=@();$anchorAfter=@();$tailAfter=@();$boundaryOldest=@();$boundaryAnchor=@();$boundaryTail=@();$originalAnchor=@();$originalFinal=@()
         $diagnostic=@{stage='checkpoint_admission';reason='sequence_gate';stability_attempt=($attempt+1);startup_events=0;startup_scan_complete=$false}
         $script:securityAuditActiveDiagnostic=$diagnostic
         try{
             Assert-NextBootSequence $PreviousSequence $CurrentSequence
             $diagnostic.reason='unspecified'
             if($Checkpoint.boot_id -cne $PreviousBoot -or $CurrentBoot -cne $PreviousBoot -or $Checkpoint.boot_sequence -ne $PreviousSequence -or $Checkpoint.record_id -lt 1 -or $Checkpoint.oldest_record_id -lt 1 -or $Checkpoint.xml_sha256 -cnotmatch '^[a-f0-9]{64}$'){$diagnostic.reason='checkpoint_identity';throw 'Security reboot checkpoint differs'}
+            if($RejectAllShutdown){
+                $diagnostic.stage='planned_original_checkpoint_query'
+                if($null -eq $OriginalCheckpoint -or $OriginalCheckpoint.boot_id -cne $PreviousBoot -or $OriginalCheckpoint.boot_sequence -ne $PreviousSequence -or $OriginalCheckpoint.oldest_record_id -ne $Checkpoint.oldest_record_id -or $OriginalCheckpoint.record_id -gt $Checkpoint.record_id -or $OriginalCheckpoint.xml_sha256 -cnotmatch '^[a-f0-9]{64}$'){$diagnostic.reason='planned_original_anchor_scope';throw 'Planned original checkpoint scope differs'}
+                $originalAnchor=@(Get-WinEvent -LogName Security -FilterXPath ('*[System[EventRecordID={0}]]' -f [long]$OriginalCheckpoint.record_id) -MaxEvents 2 -ErrorAction Stop)
+                if($originalAnchor.Count -ne 1 -or (Security-EventHash $originalAnchor[0]) -cne $OriginalCheckpoint.xml_sha256){$diagnostic.reason='planned_original_anchor_not_retained';throw 'Planned original checkpoint was not retained'}
+            }
             $diagnostic.checkpoint_record_id=[long]$Checkpoint.record_id;$diagnostic.checkpoint_oldest_record_id=[long]$Checkpoint.oldest_record_id
             $diagnostic.stage='oldest_newest_query'
             $oldest=@(Get-WinEvent -LogName Security -MaxEvents 1 -Oldest -ErrorAction Stop)
@@ -329,7 +406,7 @@ function Security-RebootAudit($Checkpoint,[string]$PreviousBoot,[string]$Current
             $expected=[long]$Checkpoint.record_id+1;$startup=@()
             foreach($event in $events){
                 if([long]$event.RecordId -ne $expected){$diagnostic.offending_event_id=[int]$event.Id;$diagnostic.offending_record_id=[long]$event.RecordId;$diagnostic.reason='record_order';throw 'Security event record range changed'};$expected++
-                if($event.Id -in @(1101,1102,1104,1105,4612,4719,4912)){$diagnostic.offending_event_id=[int]$event.Id;$diagnostic.offending_record_id=[long]$event.RecordId;Add-SecurityPolicyDiagnostic $event $diagnostic;$diagnostic.reason='audit_continuity_event';throw 'Security log or audit policy continuity changed'}
+                if($event.Id -in @(1101,1102,1104,1105,4612,4719,4912)){$diagnostic.offending_event_id=[int]$event.Id;$diagnostic.offending_record_id=[long]$event.RecordId;$diagnostic.reason='audit_continuity_event';try{Add-SecurityPolicyDiagnostic $event $diagnostic;Add-SecurityRefusalRangeDiagnostic $events $event $diagnostic}catch{$diagnostic.range_census_failed=$true};throw 'Security log or audit policy continuity changed'}
                 if($event.Id -eq 4608){$startup+=@($event);$diagnostic.startup_events=$startup.Count;if($startup.Count -eq 1){$diagnostic.startup_record_id=[long]$event.RecordId}}
             }
             $diagnostic.startup_events=$startup.Count;$diagnostic.startup_scan_complete=$true
@@ -337,8 +414,10 @@ function Security-RebootAudit($Checkpoint,[string]$PreviousBoot,[string]$Current
             $diagnostic.stage='startup_validation'
             [long]$startupId=$startup[0].RecordId;$interactive=0;$diagnostic.startup_record_id=$startupId;$diagnostic.stage='logon_validation'
             foreach($event in $events){
-                if($event.Id -eq 1100 -and [long]$event.RecordId -gt $startupId){$diagnostic.offending_event_id=[int]$event.Id;$diagnostic.offending_record_id=[long]$event.RecordId;$diagnostic.reason='logging_shutdown_after_startup';throw 'Event logging stopped after startup'}
-                if($event.Id -ne 4624 -or [long]$event.RecordId -le $startupId){continue}
+                if($event.Id -eq 1100 -and ($RejectAllShutdown -or [long]$event.RecordId -gt $startupId)){$diagnostic.offending_event_id=[int]$event.Id;$diagnostic.offending_record_id=[long]$event.RecordId;$diagnostic.reason='logging_shutdown_after_startup';throw 'Event logging stopped after startup'}
+                # Exclude every successful interactive logon after the sealed
+                # checkpoint; record storage order is not an epoch assignment.
+                if($event.Id -ne 4624){continue}
                 [xml]$xml=$event.ToXml();$types=@($xml.Event.EventData.Data|Where-Object{$_.Name -ceq 'LogonType'})
                 if($types.Count -ne 1 -or [string]$types[0].'#text' -notmatch '^\d{1,2}$'){$diagnostic.offending_event_id=[int]$event.Id;$diagnostic.offending_record_id=[long]$event.RecordId;$diagnostic.reason='logon_type_unavailable';throw 'Logon audit type unavailable'}
                 if([string]$types[0].'#text' -in @('2','7','10','11','12','13')){$interactive++;if(-not $diagnostic.ContainsKey('offending_event_id')){$diagnostic.offending_event_id=[int]$event.Id;$diagnostic.offending_record_id=[long]$event.RecordId;$diagnostic.offending_logon_type=[int]([string]$types[0].'#text')}}
@@ -367,6 +446,10 @@ function Security-RebootAudit($Checkpoint,[string]$PreviousBoot,[string]$Current
             $boundaryAnchor=@(Get-WinEvent -LogName Security -FilterXPath ('*[System[EventRecordID={0}]]' -f [long]$Checkpoint.record_id) -MaxEvents 2 -ErrorAction Stop)
             if($boundaryOldest.Count -ne 1 -or $boundaryOldest[0].RecordId -ne $Checkpoint.oldest_record_id -or $boundaryAnchor.Count -ne 1 -or (Security-EventHash $boundaryAnchor[0]) -cne $Checkpoint.xml_sha256){$diagnostic.reason='context_anchor_changed';throw 'Security log reset during native context'}
             $diagnostic.stage='boundary_tail_query'
+            if($RejectAllShutdown){
+                $originalFinal=@(Get-WinEvent -LogName Security -FilterXPath ('*[System[EventRecordID={0}]]' -f [long]$OriginalCheckpoint.record_id) -MaxEvents 2 -ErrorAction Stop)
+                if($originalFinal.Count -ne 1 -or (Security-EventHash $originalFinal[0]) -cne $OriginalCheckpoint.xml_sha256){$diagnostic.reason='planned_original_anchor_not_retained';throw 'Planned original checkpoint changed at final boundary'}
+            }
             $boundaryTail=@(Get-WinEvent -LogName Security -MaxEvents 1 -ErrorAction Stop)
             if($boundaryTail.Count -eq 1){$diagnostic.tail_record_id=[long]$boundaryTail[0].RecordId}
             if($boundaryTail.Count -ne 1 -or $boundaryTail[0].RecordId -lt $through){$diagnostic.reason='final_tail_reset';throw 'Security final tail reset'}
@@ -376,7 +459,7 @@ function Security-RebootAudit($Checkpoint,[string]$PreviousBoot,[string]$Current
             if((Security-EventHash $boundaryTail[0]) -cne $tailHash){$diagnostic.reason='final_tail_id_reused';throw 'Security final tail ID was reused'}
             if($stability.Elapsed.TotalSeconds -ge 5){$diagnostic.reason='final_hash_deadline';throw [TimeoutException]::new('Security audit final hash exceeded budget')}
             return @{checkpoint_retained=$true;no_clear_reset_wrap=$true;policy_coverage_verified=$true;tail_stable=$true;startup_event_id=4608;startup_record_id=$startupId;through_record_id=$through;interactive_logons=0;stability_attempts=($attempt+1)}
-        }catch{$diagnostic.elapsed_ms=$stability.ElapsedMilliseconds;Save-SecurityAuditFailure $diagnostic $_;throw}finally{foreach($event in (@($oldest)+@($newest)+@($anchor)+@($events)+@($oldestAfter)+@($anchorAfter)+@($tailAfter)+@($boundaryOldest)+@($boundaryAnchor)+@($boundaryTail))){if($event -is [IDisposable]){$event.Dispose()}}}
+        }catch{$diagnostic.elapsed_ms=$stability.ElapsedMilliseconds;Save-SecurityAuditFailure $diagnostic $_;throw}finally{foreach($event in (@($oldest)+@($newest)+@($anchor)+@($events)+@($oldestAfter)+@($anchorAfter)+@($tailAfter)+@($boundaryOldest)+@($boundaryAnchor)+@($boundaryTail)+@($originalAnchor)+@($originalFinal))){if($event -is [IDisposable]){$event.Dispose()}}}
     }
     $diagnostic.stage='tail_stability';$diagnostic.reason='tail_never_stable';$diagnostic.elapsed_ms=$stability.ElapsedMilliseconds;$diagnostic.error_kind='TimeoutException'
     Save-SecurityAuditFailure $diagnostic $null
@@ -440,7 +523,7 @@ try{
 }
 $receipt = [ordered]@{
     schema_version=1; phase=$phase; transfer_id=$transfer; status='failed'; boot_id=$boot; boot_sequence=$bootSequence; native_boot_sequence_verified=$true;
-    head_sha=$config.head_sha; installer_sha256=$config.setup_sha256; observer_sid='SYSTEM'; observer_session=0;
+    head_sha=$config.head_sha; installer_sha256=$config.setup_sha256; harness_head=$config.harness_head;witness_sha256=$config.witness_sha256; reboot_operation=$config.reboot_operation; observer_sid='SYSTEM'; observer_session=0;
     startup_before_interactive_login=$false; recording_after_reboot=$false; recording_after_signout=$false;
     retained_closed_hashes_unchanged=$false; logon_audit_enabled=$false; cleanup_credentials_removed=$false
 }
@@ -496,6 +579,12 @@ try {
         $baseline = Get-Content -LiteralPath (Join-Path $root 'baseline.json') -Raw | ConvertFrom-Json
         if ($baseline.transfer_id -cne $transfer -or $baseline.boot_id -cne $config.previous_boot_id -or $boot -cne $baseline.boot_id -or $baseline.boot_sequence -ne $config.previous_boot_sequence) { throw 'Reboot source identity differs' }
         Assert-NextBootSequence $baseline.boot_sequence $bootSequence
+        $securityCheckpoint=$baseline.security_checkpoint;$rejectAllShutdown=$false
+        if($config.reboot_operation -ceq 'planned-shutdown-start'){
+            $securityCheckpoint=Planned-OffCheckpoint $baseline;$rejectAllShutdown=$true
+            $receipt.planned_final_off_checkpoint_sha256=$config.final_off_checkpoint_sha256
+            $receipt.planned_final_off_record_id=[long]$securityCheckpoint.record_id
+        }elseif($config.reboot_operation -cne 'hard-reset'){throw 'Unknown reboot proof operation'}
         $receipt.startup_audit_enabled=[K5GuestNative]::StartupAuditEnabled()
         if(-not $receipt.startup_audit_enabled){throw 'Startup audit disabled'}
         $observationStage='service_before_login'
@@ -503,7 +592,7 @@ try {
         $watch = [Diagnostics.Stopwatch]::StartNew()
         while ($true) {
             if (@([K5GuestNative]::InteractiveSessions()).Count -ne 0) { throw 'Interactive session preceded boot witness' }
-            try { $observationStage='boot_security_audit';$audit=Security-RebootAudit $baseline.security_checkpoint $baseline.boot_id $boot $baseline.boot_sequence $bootSequence;$observationStage='service_before_login';$service = Recorder-Facts; break } catch { if ($watch.Elapsed.TotalSeconds -gt 90) { throw }; Start-Sleep -Milliseconds 250 }
+            try { $observationStage='boot_security_audit';$audit=Security-RebootAudit $securityCheckpoint $baseline.boot_id $boot $baseline.boot_sequence $bootSequence $rejectAllShutdown $baseline.security_checkpoint;$observationStage='service_before_login';$service = Recorder-Facts; break } catch { if ($watch.Elapsed.TotalSeconds -gt 90) { throw }; Start-Sleep -Milliseconds 250 }
         }
         $before = Recording-Bytes
         $observationStage='prelogin_recording_growth'
@@ -531,7 +620,7 @@ try {
             $postboot=@(Closed-Recordings|Where-Object{(Join-Path $recordingRoot $_.path) -notin $startupPaths})
             if($postboot.Count -gt 0){break}
             if($rebootWatch.Elapsed.TotalSeconds -ge 200){throw 'New closed postboot recording unavailable'}
-            if($auditWatch.Elapsed.TotalSeconds -ge 1){$audit=Security-RebootAudit $baseline.security_checkpoint $baseline.boot_id $boot $baseline.boot_sequence $bootSequence;$auditWatch.Restart()}
+            if($auditWatch.Elapsed.TotalSeconds -ge 1){$audit=Security-RebootAudit $securityCheckpoint $baseline.boot_id $boot $baseline.boot_sequence $bootSequence $rejectAllShutdown $baseline.security_checkpoint;$auditWatch.Restart()}
             Start-Sleep -Milliseconds 250
         }while($true)
         $receipt.postboot_closed_recording=$postboot[0]
@@ -539,8 +628,9 @@ try {
         $receipt.reboot_observation_total_seconds=[Math]::Round($rebootWatch.Elapsed.TotalSeconds,3)
         $observationStage='final_boot_security_audit'
         Write-EntryDiagnostic 'observer-stage-reboot.json' @{schema_version=1;phase=$phase;status='observing';stage=$observationStage;boot_id=$boot;observer_session=$guestWitnessSession}
-        $audit=Security-RebootAudit $baseline.security_checkpoint $baseline.boot_id $boot $baseline.boot_sequence $bootSequence
+        $audit=Security-RebootAudit $securityCheckpoint $baseline.boot_id $boot $baseline.boot_sequence $bootSequence $rejectAllShutdown $baseline.security_checkpoint
         $receipt.security_audit_checkpoint_retained=$audit.checkpoint_retained
+        if($rejectAllShutdown){$receipt.security_final_off_checkpoint_retained=$audit.checkpoint_retained;$receipt.security_original_checkpoint_retained=$true;$receipt.security_all_post_off_shutdown_loss_policy_and_interactive_events_refused=$true}
         $receipt.security_no_clear_reset_wrap=$audit.no_clear_reset_wrap
         $receipt.security_policy_coverage_verified=$audit.policy_coverage_verified
         $receipt.security_tail_stable=$audit.tail_stable

@@ -9,7 +9,8 @@ param(
     [Parameter(Mandatory=$true)][string]$MediaMTX,
     [Parameter(Mandatory=$true)][string]$FFmpeg,
     [Parameter(Mandatory=$true)][string]$FFprobe,
-    [switch]$BootstrapObservation
+    [switch]$BootstrapObservation,
+    [ValidateSet('hard-reset','planned-shutdown-start')][string]$RebootOperation='hard-reset'
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference='Stop'
@@ -27,21 +28,97 @@ $receipt=[ordered]@{
     actual_guest_boot=$false; recording_after_reboot_before_login=$false;
     recording_after_actual_signout=$false; retained_media_decoded=$false; postboot_prelogin_media_decoded=$false;
     github_credentials_entered_guest=$false; cleanup_complete=$true; stage='host_guard';
-    bootstrap_observation_only=$BootstrapObservation.IsPresent
+    bootstrap_observation_only=$BootstrapObservation.IsPresent; reboot_operation=$RebootOperation; reboot_operation_executed=$false
+    proof_scope=if($RebootOperation -ceq 'planned-shutdown-start'){'planned-shutdown-start-recording'}else{'hard-reset-recording'}
 }
 $root=$null; $rootIdentity=$null; $image=$null; $mounted=$false; $diskNumber=$null; $diskId=$null
-$partitionNumber=$null; $accessPath=$null; $vmId=$null; $vmName=$null; $switchId=$null; $switchName=$null
+$partitionNumber=$null; $guestPartitionNumber=$null; $accessPath=$null; $vmId=$null; $vmName=$null; $switchId=$null; $switchName=$null
 $hostInterface=$null; $hostIPAddress=$null; $firewallName=$null; $direct=$null; $password=$null; $credential=$null
-$mediaProcess=$null; $publisherProcess=$null
+$mediaProcess=$null; $publisherProcess=$null; $plannedBoundaryMountIntent=$null
 $processNotes=@{}
 Add-Type -TypeDefinition @'
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+public sealed class K5GuestConfigSnapshot {
+  public string Identity,SecuritySha256,ContentSha256,Text;
+  public long Length;
+}
+public static class K5GuestFileIdentity {
+  [StructLayout(LayoutKind.Sequential)] struct Information {
+    public uint Attributes;
+    public System.Runtime.InteropServices.ComTypes.FILETIME Creation,Access,Write;
+    public uint VolumeSerial,SizeHigh,SizeLow,Links,IndexHigh,IndexLow;
+  }
+  [DllImport("kernel32.dll",CharSet=CharSet.Unicode,ExactSpelling=true,SetLastError=true)] static extern SafeFileHandle CreateFileW(string path,uint access,uint share,IntPtr security,uint creation,uint flags,IntPtr template);
+  [DllImport("kernel32.dll",ExactSpelling=true,SetLastError=true)] [return:MarshalAs(UnmanagedType.Bool)] static extern bool GetFileInformationByHandle(SafeFileHandle handle,out Information information);
+  [DllImport("advapi32.dll",ExactSpelling=true,SetLastError=true)] [return:MarshalAs(UnmanagedType.Bool)] static extern bool GetKernelObjectSecurity(SafeFileHandle handle,uint sections,[Out] byte[] descriptor,uint bytes,out uint needed);
+  static string Identity(SafeFileHandle handle) {
+    if(!Environment.Is64BitProcess || Marshal.SizeOf(typeof(Information))!=52 || handle.IsInvalid) throw new InvalidOperationException();
+    Information information;if(!GetFileInformationByHandle(handle,out information)) throw new Win32Exception();
+    if((information.Attributes&0x410)!=0 || information.Links!=1) throw new InvalidOperationException();
+    return information.VolumeSerial.ToString("x8")+"-"+information.IndexHigh.ToString("x8")+information.IndexLow.ToString("x8");
+  }
+  static string Hash(byte[] bytes) {
+    using(var sha=System.Security.Cryptography.SHA256.Create())return BitConverter.ToString(sha.ComputeHash(bytes)).Replace("-","").ToLowerInvariant();
+  }
+  static string PrivateSecurity(SafeFileHandle handle) {
+    uint needed;bool initial=GetKernelObjectSecurity(handle,7,null,0,out needed);int error=Marshal.GetLastWin32Error();
+    if(initial || error!=122 || needed<20 || needed>65536) throw new Win32Exception(error);
+    var descriptor=new byte[needed];uint returned;
+    if(!GetKernelObjectSecurity(handle,7,descriptor,(uint)descriptor.Length,out returned)) throw new Win32Exception();
+    if(returned<20 || returned>descriptor.Length) throw new InvalidOperationException();
+    if(returned!=descriptor.Length)Array.Resize(ref descriptor,(int)returned);
+    var security=new System.Security.AccessControl.RawSecurityDescriptor(descriptor,0);
+    var flags=System.Security.AccessControl.ControlFlags.DiscretionaryAclPresent|System.Security.AccessControl.ControlFlags.DiscretionaryAclProtected;
+    if((security.ControlFlags&flags)!=flags || security.Owner==null || (security.Owner.Value!="S-1-5-18" && security.Owner.Value!="S-1-5-32-544") || security.DiscretionaryAcl==null || security.DiscretionaryAcl.Count!=2)throw new InvalidOperationException();
+    var admitted=new HashSet<string>(StringComparer.Ordinal);
+    foreach(System.Security.AccessControl.GenericAce generic in security.DiscretionaryAcl){
+      var ace=generic as System.Security.AccessControl.CommonAce;
+      if(ace==null || ace.AceQualifier!=System.Security.AccessControl.AceQualifier.AccessAllowed || ace.AceFlags!=System.Security.AccessControl.AceFlags.None || ace.AccessMask!=0x1f01ff || (ace.SecurityIdentifier.Value!="S-1-5-18" && ace.SecurityIdentifier.Value!="S-1-5-32-544") || !admitted.Add(ace.SecurityIdentifier.Value))throw new InvalidOperationException();
+    }
+    return Hash(descriptor);
+  }
+  public static string Read(string path) {
+    using(var handle=CreateFileW(path,0x80,7,IntPtr.Zero,3,0x00200000,IntPtr.Zero))return Identity(handle);
+  }
+  public static K5GuestConfigSnapshot ReadConfig(string path) {
+    using(var handle=CreateFileW(path,0x80020080,1,IntPtr.Zero,3,0x00200000,IntPtr.Zero)){
+      var snapshot=new K5GuestConfigSnapshot();snapshot.Identity=Identity(handle);snapshot.SecuritySha256=PrivateSecurity(handle);
+      using(var stream=new FileStream(handle,FileAccess.Read,4096,false)){
+        snapshot.Length=stream.Length;if(snapshot.Length<2 || snapshot.Length>65536)throw new InvalidOperationException();
+        var bytes=new byte[(int)snapshot.Length];int offset=0;
+        while(offset<bytes.Length){int got=stream.Read(bytes,offset,bytes.Length-offset);if(got==0)throw new EndOfStreamException();offset+=got;}
+        if(stream.ReadByte()!=-1)throw new InvalidOperationException();
+        snapshot.ContentSha256=Hash(bytes);snapshot.Text=new UTF8Encoding(false,true).GetString(bytes);
+      }
+      return snapshot;
+    }
+  }
+  public static void WriteConfig(string path,string expectedIdentity,string expectedSecurity,string expectedContent,long expectedLength,string text) {
+    byte[] bytes=new UTF8Encoding(false,true).GetBytes(text);
+    if(bytes.Length<2 || bytes.Length>65536 || expectedLength<2 || expectedLength>65536)throw new InvalidOperationException();
+    // Acquire and admit this exact write handle before any truncation. ShareRead
+    // denies other data writers and deletion; never follow a leaf reparse point.
+    using(var handle=CreateFileW(path,0xc0020080,1,IntPtr.Zero,3,0x80200000,IntPtr.Zero)){
+      if(Identity(handle)!=expectedIdentity || PrivateSecurity(handle)!=expectedSecurity)throw new InvalidOperationException();
+      using(var stream=new FileStream(handle,FileAccess.ReadWrite,4096,false)){
+        if(stream.Length!=expectedLength)throw new InvalidOperationException();
+        string current;using(var sha=System.Security.Cryptography.SHA256.Create())current=BitConverter.ToString(sha.ComputeHash(stream)).Replace("-","").ToLowerInvariant();
+        if(current!=expectedContent || stream.Position!=expectedLength)throw new InvalidOperationException();
+        stream.Position=0;stream.SetLength(0);stream.Write(bytes,0,bytes.Length);stream.Flush(true);
+        if(stream.Length!=bytes.Length || Identity(handle)!=expectedIdentity || PrivateSecurity(handle)!=expectedSecurity)throw new InvalidOperationException();
+      }
+    }
+  }
+}
 public sealed class K5GuestProcessNotes {
   readonly object gate=new object(); readonly StringBuilder text=new StringBuilder();
   public K5GuestProcessNotes(Process process){process.OutputDataReceived+=Receive;process.ErrorDataReceived+=Receive;}
@@ -146,6 +223,264 @@ function Bounded-Job($Job,[int]$Seconds){
         Remove-Job -Job $Job -Force -ErrorAction SilentlyContinue
     }
 }
+function Planned-BoundaryGuard {
+    if($script:plannedBoundaryWatch.ElapsedMilliseconds -ge 40000){throw [TimeoutException]::new('Planned offline boundary exceeded its bound')}
+    $vm=Owned-VM
+    if([string]$vm.State -cne 'Off'){throw 'Planned boundary requires exact owned Off'}
+    if($script:plannedBoundaryWatch.ElapsedMilliseconds -ge 40000){throw [TimeoutException]::new('Planned offline ownership query exceeded its bound')}
+}
+function Offline-File([string]$Volume,[string]$Relative) {
+    $current=$Volume
+    foreach($part in $Relative.Split('\')){
+        if($part -notmatch '^[A-Za-z0-9_. -]+$' -or $part -in @('.','..')){throw 'Offline path refused'}
+        $current=Join-Path $current $part
+        if(((Get-Item -LiteralPath $current -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0){throw 'Offline path reparse point refused'}
+    }
+    return $current
+}
+function File-Digest([string]$Path){return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()}
+function Text-Digest([string]$Text){
+    $sha=[Security.Cryptography.SHA256]::Create()
+    try{return [BitConverter]::ToString($sha.ComputeHash([Text.UTF8Encoding]::new($false).GetBytes($Text))).Replace('-','').ToLowerInvariant()}finally{$sha.Dispose()}
+}
+function Config-Custody([string]$Volume){
+    $directory=Offline-File $Volume 'K5GuestWitness'
+    $path=Offline-File $Volume 'K5GuestWitness\public-config.json'
+    foreach($item in @($directory,$path)){
+        $acl=Get-Acl -LiteralPath $item
+        if(-not $acl.AreAccessRulesProtected -or $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -notin @('S-1-5-18','S-1-5-32-544')){throw 'Planned config private owner or DACL refused'}
+        $rules=@($acl.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier]))
+        if($rules.Count -ne 2 -or @($rules|ForEach-Object{$_.IdentityReference.Value}|Select-Object -Unique).Count -ne 2){throw 'Planned config ACL cardinality refused'}
+        foreach($rule in $rules){
+            if($rule.IdentityReference.Value -notin @('S-1-5-18','S-1-5-32-544') -or $rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow -or $rule.IsInherited -or $rule.FileSystemRights -ne [Security.AccessControl.FileSystemRights]::FullControl){throw 'Planned config foreign or nonprivate ACL refused'}
+        }
+    }
+    $snapshot=[K5GuestFileIdentity]::ReadConfig($path)
+    return @{path=$path;identity=$snapshot.Identity;acl_sha256=$snapshot.SecuritySha256;sha256=$snapshot.ContentSha256;text=$snapshot.Text;length=$snapshot.Length}
+}
+function Write-PlannedConfig([string]$Volume,[hashtable]$Expected,[string]$Text){
+    $before=Config-Custody $Volume
+    if($before.identity -cne $Expected.identity -or $before.acl_sha256 -cne $Expected.acl_sha256 -or $before.sha256 -cne $Expected.sha256){throw 'Planned config changed before write'}
+    [K5GuestFileIdentity]::WriteConfig($before.path,$Expected.identity,$Expected.acl_sha256,$Expected.sha256,[long]$Expected.length,$Text)
+    $after=Config-Custody $Volume
+    if($after.identity -cne $before.identity -or $after.acl_sha256 -cne $before.acl_sha256 -or $after.text -cne $Text){throw 'Planned config file identity, DACL or durable text changed'}
+    return $after
+}
+function Assert-PlannedCustodyContracts {
+    $volume=Join-Path $root ('planned-native-custody-'+[guid]::NewGuid().ToString('N'))
+    $null=Private-Directory $volume
+    $directory=Join-Path $volume 'K5GuestWitness';$null=Private-Directory $directory $true
+    $path=Join-Path $directory 'public-config.json';$alias=Join-Path $directory 'config-alias.json'
+    try{
+        [IO.File]::WriteAllText($path,'{"phase":"owned_smoke_before"}',[Text.UTF8Encoding]::new($false))
+        $security=[Security.AccessControl.FileSecurity]::new();$security.SetOwner([Security.Principal.SecurityIdentifier]::new('S-1-5-32-544'));$security.SetAccessRuleProtection($true,$false)
+        foreach($sid in @('S-1-5-18','S-1-5-32-544')){$security.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new($sid),'FullControl','Allow'))}
+        Set-Acl -LiteralPath $path -AclObject $security
+        $before=Config-Custody $volume;$after=Write-PlannedConfig $volume $before '{"phase":"owned_smoke_after"}'
+        if($before.identity -cne $after.identity -or $before.acl_sha256 -cne $after.acl_sha256){throw 'Native planned custody smoke differs'}
+        $controls=1
+        foreach($case in @('identity','security','content','length','oversized_utf8','short_utf8')){
+            $current=Config-Custody $volume;$identity=$current.identity;$aclHash=$current.acl_sha256;$contentHash=$current.sha256;$length=[long]$current.length;$text='{"phase":"must_never_write"}'
+            switch($case){'identity'{$identity='00000000-0000000000000000'};'security'{$aclHash='0'*64};'content'{$contentHash='0'*64};'length'{$length++};'oversized_utf8'{$text=([string][char]0x20ac)*23000};'short_utf8'{$text='{'} }
+            $refused=$false
+            try{[K5GuestFileIdentity]::WriteConfig($path,$identity,$aclHash,$contentHash,$length,$text)}catch{if($_.Exception.GetBaseException() -is [InvalidOperationException]){$refused=$true}else{throw}}
+            if(-not $refused -or (File-Digest $path) -cne $current.sha256){throw 'Native planned no-mutation control failed'};$controls++
+        }
+        # Replace the name with a distinct task-owned object having matching
+        # content/ACL, between the saved custody and the native write acquisition.
+        $current=Config-Custody $volume;$saved=Join-Path $directory 'saved-config.json'
+        Move-Item -LiteralPath $path -Destination $saved
+        try{
+            [IO.File]::WriteAllText($path,$current.text,[Text.UTF8Encoding]::new($false))
+            Set-Acl -LiteralPath $path -AclObject (Get-Acl -LiteralPath $saved)
+            $replacement=Config-Custody $volume
+            if($replacement.identity -ceq $current.identity -or $replacement.sha256 -cne $current.sha256 -or $replacement.acl_sha256 -cne $current.acl_sha256){throw 'Native replacement control fixture differs'}
+            $refused=$false
+            try{[K5GuestFileIdentity]::WriteConfig($path,$current.identity,$current.acl_sha256,$current.sha256,[long]$current.length,'{"phase":"must_never_write"}')}catch{if($_.Exception.GetBaseException() -is [InvalidOperationException]){$refused=$true}else{throw}}
+            if(-not $refused -or (File-Digest $path) -cne $replacement.sha256 -or (File-Digest $saved) -cne $current.sha256){throw 'Native replacement wrote another object'};$controls++
+        }finally{if(Test-Path -LiteralPath $path){Remove-Item -LiteralPath $path -Force};Move-Item -LiteralPath $saved -Destination $path}
+        $current=Config-Custody $volume;$changed=$current.text.Replace('after','AFTER')
+        if($changed -ceq $current.text){throw 'Native content control fixture did not change'}
+        [IO.File]::WriteAllText($path,$changed,[Text.UTF8Encoding]::new($false))
+        $changedHash=File-Digest $path;$refused=$false
+        try{[K5GuestFileIdentity]::WriteConfig($path,$current.identity,$current.acl_sha256,$current.sha256,[long]$current.length,'{"phase":"must_never_write"}')}catch{if($_.Exception.GetBaseException() -is [InvalidOperationException]){$refused=$true}else{throw}}
+        if(-not $refused -or (File-Digest $path) -cne $changedHash){throw 'Native same-object changed content was overwritten'};$controls++
+        $modified=Config-Custody $volume;$null=Write-PlannedConfig $volume $modified $current.text
+        New-Item -ItemType HardLink -Path $alias -Target $path|Out-Null
+        $refused=$false;try{$null=[K5GuestFileIdentity]::Read($path)}catch{$refused=$true}
+        if(-not $refused){throw 'Native planned hardlink smoke was accepted'}
+        Remove-Item -LiteralPath $alias -Force
+        if([K5GuestFileIdentity]::Read($path) -cne $before.identity){throw 'Native planned identity changed after alias removal'}
+        $controls++
+        $receipt.planned_native_config_custody_controls_passed=$true;$receipt.planned_native_config_custody_control_count=$controls
+    }finally{
+        if(Test-Path -LiteralPath $alias){Remove-Item -LiteralPath $alias -Force}
+        Remove-Item -LiteralPath $volume -Recurse -Force
+        if(Test-Path -LiteralPath $volume){throw 'Native planned custody smoke remains'}
+    }
+}
+function Invoke-PlannedOffline([bool]$ReadOnly,[scriptblock]$Action){
+    Planned-BoundaryGuard
+    if((Get-VHD -Path $image).Attached){throw 'Planned disk already attached'}
+    Planned-BoundaryGuard
+    $mount=(Join-Path $root ('planned-boundary-'+[guid]::NewGuid().ToString('N')))+'\'
+    New-Item -ItemType Directory -Path $mount|Out-Null
+    $mountAttempted=$false;$partitionAttempted=$false
+    try{
+        Planned-BoundaryGuard
+        # Record intent before native operations: a cmdlet can mutate then throw.
+        $mountAttempted=$true
+        $script:plannedBoundaryMountIntent=@{access_path=$mount;partition_number=$guestPartitionNumber}
+        $attached=Mount-VHD -Path $image -ReadOnly:$ReadOnly -NoDriveLetter -PassThru
+        $script:mounted=$true;$script:diskNumber=[int]$attached.DiskNumber;$script:accessPath=$mount;$script:partitionNumber=$null
+        $disk=Get-Disk -Number $script:diskNumber
+        if([string]$disk.UniqueId -cne $diskId -or [bool]$disk.IsReadOnly -ne $ReadOnly){throw 'Planned disk identity or access differs'}
+        Planned-BoundaryGuard
+        $partition=Get-Partition -DiskNumber $script:diskNumber -PartitionNumber $guestPartitionNumber
+        if($partition.DiskNumber -ne $script:diskNumber -or $partition.PartitionNumber -ne $guestPartitionNumber){throw 'Planned Windows partition differs'}
+        Planned-BoundaryGuard
+        $partitionAttempted=$true;$script:partitionNumber=$guestPartitionNumber
+        Add-PartitionAccessPath -DiskNumber $script:diskNumber -PartitionNumber $guestPartitionNumber -AccessPath $mount
+        Planned-BoundaryGuard
+        $value=&$Action $mount
+        Planned-BoundaryGuard
+        return $value
+    }finally{
+        if($mountAttempted){
+            try{
+                $cleanupVM=Owned-VM
+                if([string]$cleanupVM.State -cne 'Off'){throw 'Planned cleanup requires exact owned Off'}
+                $current=Get-VHD -Path $image
+                if($current.Attached){
+                    $number=[int]$current.DiskNumber
+                    if([string](Get-Disk -Number $number).UniqueId -cne $diskId){throw 'Planned cleanup foreign disk refused'}
+                    $script:mounted=$true;$script:diskNumber=$number;$script:accessPath=$mount
+                    # Query the exact owned access path even when Add-* threw
+                    # after creating it. Never remove another path or disk.
+                    $partition=Get-Partition -DiskNumber $number -PartitionNumber $guestPartitionNumber
+                    $ownedPath=@($partition.AccessPaths|Where-Object{[string]::Equals([string]$_,$mount,[StringComparison]::OrdinalIgnoreCase)})
+                    if($ownedPath.Count -gt 1){throw 'Planned cleanup access path differs'}
+                    $pathCleanupError=$null
+                    if($ownedPath.Count -eq 1){
+                        try{Remove-PartitionAccessPath -DiskNumber $number -PartitionNumber $guestPartitionNumber -AccessPath $mount}catch{$pathCleanupError=$_}
+                        if(@((Get-Partition -DiskNumber $number -PartitionNumber $guestPartitionNumber).AccessPaths|Where-Object{[string]::Equals([string]$_,$mount,[StringComparison]::OrdinalIgnoreCase)}).Count){throw 'Planned access path remains'}
+                    }
+                    $script:partitionNumber=$null
+                    Dismount-VHD -Path $image
+                    if((Get-VHD -Path $image).Attached){throw 'Planned disk remains attached'}
+                    $script:mounted=$false
+                    if($null -ne $pathCleanupError){throw $pathCleanupError}
+                }
+                if(((Get-Item -LiteralPath $mount -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0){throw 'Planned offline mount path remains'}
+                $script:plannedBoundaryMountIntent=$null
+            }catch{$receipt.cleanup_complete=$false;$receipt.planned_boundary_cleanup_failed=$true;throw}
+        }
+    }
+}
+function Set-PlannedFinalOffBoundary($Initial){
+    $script:plannedBoundaryWatch=[Diagnostics.Stopwatch]::StartNew()
+    $snapshot=Invoke-PlannedOffline $true {
+        param($volume)
+        $custody=Config-Custody $volume;$configuration=$custody.text|ConvertFrom-Json
+        if($configuration.transfer_id -cne $transfer -or $configuration.head_sha -cne $ProductHead -or $configuration.setup_sha256 -cne $SetupSha256 -or $configuration.phase -cne 'reboot' -or $configuration.reboot_operation -cne 'planned-shutdown-start' -or $configuration.previous_boot_id -cne $Initial.boot_id -or $configuration.previous_boot_sequence -ne $Initial.boot_sequence){throw 'Planned config scope differs'}
+        $baselinePath=Offline-File $volume 'K5GuestWitness\baseline.json'
+        if((Get-Item -LiteralPath $baselinePath -Force).Length -gt 65536 -or (File-Digest $baselinePath) -cne $Initial.baseline_sha256){throw 'Planned original baseline digest differs'}
+        $baseline=[IO.File]::ReadAllText($baselinePath)|ConvertFrom-Json
+        if($baseline.transfer_id -cne $transfer -or $baseline.boot_id -cne $Initial.boot_id -or $baseline.boot_sequence -ne $Initial.boot_sequence){throw 'Planned original baseline scope differs'}
+        $original=$baseline.security_checkpoint
+        $log=Offline-File $volume 'Windows\System32\winevt\Logs\Security.evtx'
+        if((Get-Item -LiteralPath $log -Force).Length -gt 67108864){throw 'Planned Security log bound exceeded'}
+        $logIdentity=[K5GuestFileIdentity]::Read($log);$logHash=File-Digest $log
+        $oldest=@();$tail=@();$anchor=@();$range=@()
+        try{
+            $oldest=@(Get-WinEvent -Path $log -Oldest -MaxEvents 1 -ErrorAction Stop)
+            $tail=@(Get-WinEvent -Path $log -MaxEvents 1 -ErrorAction Stop)
+            if($oldest.Count -ne 1 -or $tail.Count -ne 1 -or [long]$oldest[0].RecordId -ne $original.oldest_record_id -or [long]$tail[0].RecordId -lt $original.record_id){throw 'Planned pre-Off log reset or wrap'}
+            $anchor=@(Get-WinEvent -Path $log -FilterXPath ('*[System[EventRecordID={0}]]' -f [long]$original.record_id) -MaxEvents 2 -ErrorAction Stop)
+            if($anchor.Count -ne 1 -or (Text-Digest $anchor[0].ToXml()) -cne $original.xml_sha256){throw 'Planned original checkpoint not retained'}
+            [long]$count=[long]$tail[0].RecordId-[long]$original.record_id
+            if($count -lt 0 -or $count -gt 4096){throw 'Planned pre-Off range bound exceeded'}
+            if($count -gt 0){$range=@(Get-WinEvent -Path $log -FilterXPath ('*[System[EventRecordID>{0} and EventRecordID<={1}]]' -f [long]$original.record_id,[long]$tail[0].RecordId) -Oldest -MaxEvents 4097 -ErrorAction Stop)}
+            if($range.Count -ne $count){throw 'Planned pre-Off range gap'}
+            [long]$expected=[long]$original.record_id+1
+            foreach($event in $range){
+                Planned-BoundaryGuard
+                if([long]$event.RecordId -ne $expected){throw 'Planned pre-Off record order changed'};$expected++
+                if($event.Id -in @(1101,1102,1104,1105,4612,4719,4912)){throw 'Planned pre-Off audit continuity lost'}
+                if($event.Id -eq 4624){
+                    [xml]$xml=$event.ToXml();$types=@($xml.Event.EventData.Data|Where-Object{$_.Name -ceq 'LogonType'})
+                    if($types.Count -ne 1 -or [string]$types[0].'#text' -notmatch '^\d{1,2}$'){throw 'Planned pre-Off logon type unavailable'}
+                    if([string]$types[0].'#text' -in @('2','7','10','11','12','13')){throw 'Planned pre-Off interactive logon observed'}
+                }
+            }
+            $checkpoint=@{schema_version=1;phase='reboot';reboot_operation='planned-shutdown-start';harness_head=$configuration.harness_head;witness_sha256=$configuration.witness_sha256;image_sha256=$imageSha;owned_vm_id=$vmId.ToString();transfer_id=$transfer;head_sha=$ProductHead;setup_sha256=$SetupSha256;boot_id=$Initial.boot_id;boot_sequence=[long]$Initial.boot_sequence;baseline_sha256=$Initial.baseline_sha256;record_id=[long]$tail[0].RecordId;oldest_record_id=[long]$oldest[0].RecordId;xml_sha256=(Text-Digest $tail[0].ToXml());original_record_id=[long]$original.record_id;original_oldest_record_id=[long]$original.oldest_record_id;original_xml_sha256=$original.xml_sha256;pre_off_original_checkpoint_retained=$true;pre_off_range_contiguous=$true;pre_off_interactive_logons=0;pre_off_loss_or_policy_events=0}
+            if([K5GuestFileIdentity]::Read($log) -cne $logIdentity -or (File-Digest $log) -cne $logHash){throw 'Planned read-only Security log changed'}
+            return @{custody=$custody;checkpoint=$checkpoint;log_identity=$logIdentity;log_sha256=$logHash}
+        }finally{foreach($event in (@($oldest)+@($tail)+@($anchor)+@($range))){if($event -is [IDisposable]){$event.Dispose()}}}
+    }
+    Planned-BoundaryGuard
+    $checkpointJson=$snapshot.checkpoint|ConvertTo-Json -Depth 6 -Compress;$checkpointHash=Text-Digest $checkpointJson
+    $published=Invoke-PlannedOffline $false {
+        param($volume)
+        $before=Config-Custody $volume
+        if($before.identity -cne $snapshot.custody.identity -or $before.acl_sha256 -cne $snapshot.custody.acl_sha256 -or $before.sha256 -cne $snapshot.custody.sha256){throw 'Planned config custody changed between mounts'}
+        $log=Offline-File $volume 'Windows\System32\winevt\Logs\Security.evtx'
+        if([K5GuestFileIdentity]::Read($log) -cne $snapshot.log_identity -or (File-Digest $log) -cne $snapshot.log_sha256){throw 'Planned Security boundary changed before publication'}
+        $configuration=$before.text|ConvertFrom-Json
+        $configuration|Add-Member NoteProperty planned_owned_vm_id $vmId.ToString()
+        $configuration|Add-Member NoteProperty final_off_checkpoint_json $checkpointJson
+        $configuration|Add-Member NoteProperty final_off_checkpoint_sha256 $checkpointHash
+        $after=Write-PlannedConfig $volume $before ($configuration|ConvertTo-Json -Depth 8 -Compress)
+        $verified=$after.text|ConvertFrom-Json
+        if($after.identity -cne $before.identity -or $after.acl_sha256 -cne $before.acl_sha256 -or $verified.final_off_checkpoint_sha256 -cne $checkpointHash -or $verified.final_off_checkpoint_json -cne $checkpointJson -or $verified.transfer_id -cne $transfer -or $verified.phase -cne 'reboot'){throw 'Planned config durable publication differs'}
+        if([K5GuestFileIdentity]::Read($log) -cne $snapshot.log_identity -or (File-Digest $log) -cne $snapshot.log_sha256){throw 'Planned Security boundary changed during publication'}
+        return @{config_identity_sha256=(Text-Digest $after.identity);config_acl_sha256=$after.acl_sha256}
+    }
+    Planned-BoundaryGuard
+    if((Get-VHD -Path $image).Attached){throw 'Planned disk still mounted before Start'}
+    Planned-BoundaryGuard
+    $receipt.planned_final_off_checkpoint=$snapshot.checkpoint;$receipt.planned_final_off_checkpoint_sha256=$checkpointHash
+    $receipt.planned_final_off_security_evtx_sha256=$snapshot.log_sha256;$receipt.planned_final_off_security_identity_sha256=Text-Digest $snapshot.log_identity
+    $receipt.planned_config_identity_sha256=$published.config_identity_sha256;$receipt.planned_config_acl_sha256=$published.config_acl_sha256
+    $receipt.planned_final_off_boundary_verified=$true;$receipt.planned_boundary_dismounted_before_start=$true
+    $receipt.planned_boundary_elapsed_ms=$script:plannedBoundaryWatch.ElapsedMilliseconds
+}
+function Restart-OwnedGuest($Initial) {
+    $operation=[Diagnostics.Stopwatch]::StartNew()
+    if($RebootOperation -ceq 'hard-reset'){
+        # Preserve the existing hardware-reset operation and its proof gates.
+        $receipt.reboot_operation_subphase='hard_reset'
+        Bounded-Job (Restart-VM -VM (Owned-VM) -Force -AsJob -Confirm:$false) 40|Out-Null
+    }elseif($RebootOperation -ceq 'planned-shutdown-start'){
+        # Separately labelled planned cold start. Never convert a refused
+        # shutdown into a force power-off or continue to Start after refusal.
+        $receipt.reboot_operation_subphase='planned_shutdown'
+        $stop=[Diagnostics.Stopwatch]::StartNew()
+        Bounded-Job (Stop-VM -VM (Owned-VM) -AsJob -Confirm:$false) 40|Out-Null
+        $off=Owned-VM
+        if([string]$off.State -cne 'Off'){throw 'Planned shutdown did not reach owned Off'}
+        $stopElapsed=$stop.ElapsedMilliseconds
+        if($stopElapsed -ge 40000){throw [TimeoutException]::new('Planned shutdown exceeded its bound')}
+        $receipt.planned_shutdown_off_observed=$true
+        $receipt.planned_shutdown_elapsed_ms=$stopElapsed
+        $receipt.reboot_operation_subphase='planned_final_off_boundary'
+        Set-PlannedFinalOffBoundary $Initial
+        Planned-BoundaryGuard
+        if($receipt.planned_boundary_elapsed_ms -lt 0 -or $receipt.planned_boundary_elapsed_ms -ge 40000){throw [TimeoutException]::new('Planned boundary was not admitted within its bound')}
+        $receipt.reboot_operation_subphase='planned_start'
+        $start=[Diagnostics.Stopwatch]::StartNew()
+        Bounded-Job (Start-VM -VM (Owned-VM) -AsJob) 40|Out-Null
+        $running=Owned-VM
+        if([string]$running.State -cne 'Running'){throw 'Planned start did not reach owned Running'}
+        $startElapsed=$start.ElapsedMilliseconds
+        if($startElapsed -ge 40000){throw [TimeoutException]::new('Planned start exceeded its bound')}
+        $receipt.planned_start_running_observed=$true
+        $receipt.planned_start_elapsed_ms=$startElapsed
+    }else{throw 'Unknown owned reboot operation'}
+    $receipt.reboot_operation_elapsed_ms=$operation.ElapsedMilliseconds
+    $receipt.reboot_operation_executed=$true
+    $receipt.reboot_operation_subphase='await_sealed_system_startup'
+}
 function Stop-OwnedDiagnosticVM {
     $vm=Owned-VM
     if([string]$vm.State -eq 'Off'){return}
@@ -239,7 +574,7 @@ function Read-GuestReceipt([string]$Phase,$Seal){
     try{$digest=[BitConverter]::ToString($sha.ComputeHash($bytes)).Replace('-','').ToLowerInvariant()}finally{$sha.Dispose()}
     if($digest -cne $Seal.sha256){throw 'Sealed witness bytes differ'}
     $result=[Text.Encoding]::UTF8.GetString($bytes)|ConvertFrom-Json
-    if($result.transfer_id -cne $transfer -or $result.head_sha -cne $ProductHead -or $result.installer_sha256 -cne $SetupSha256 -or $result.boot_id -cne $Seal.boot_id){throw 'Sealed witness scope differs'}
+    if($result.transfer_id -cne $transfer -or $result.head_sha -cne $ProductHead -or $result.installer_sha256 -cne $SetupSha256 -or $result.boot_id -cne $Seal.boot_id -or $result.reboot_operation -cne $RebootOperation -or $result.harness_head -cne $env:GITHUB_SHA -or $result.witness_sha256 -cne (File-Digest (Join-Path $PSScriptRoot 'windows_guest_witness.ps1'))){throw 'Sealed witness scope differs'}
     return $result
 }
 function IPv4-Number([string]$Address){
@@ -604,6 +939,7 @@ try{
     $receipt.available_bytes=[long]$drives[0].AvailableFreeSpace
     $root=Join-Path $drives[0].RootDirectory.FullName ('K5GuestRecording-'+[guid]::NewGuid().ToString('N'))
     $rootIdentity=Private-Directory $root
+    if($RebootOperation -ceq 'planned-shutdown-start'){Assert-PlannedCustodyContracts}
     $image=Join-Path $root 'official-evaluation.vhdx'
     $receipt.stage='isolated_camera_network'
     $receipt.network_subphase='select_conflict_free_subnet'
@@ -757,6 +1093,7 @@ try{
         Remove-PartitionAccessPath -DiskNumber $diskNumber -PartitionNumber $partitionNumber -AccessPath $accessPath;$partitionNumber=$null
     }
     if($null -eq $windows){throw 'Pinned Desktop Experience image unavailable'}
+    $guestPartitionNumber=$partitionNumber
     $kernel=Get-AuthenticodeSignature -LiteralPath (Join-Path $windows 'Windows\System32\ntoskrnl.exe')
     if($kernel.Status -ne 'Valid' -or $kernel.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation'){throw 'Pinned Windows kernel signature unavailable'}
     $receipt.microsoft_kernel_verified=$true
@@ -768,7 +1105,7 @@ try{
     Copy-Item -LiteralPath $BootstrapExe -Destination (Join-Path $guestRoot 'windows_guest_bootstrap.exe')
     Copy-Item -LiteralPath $SetupPath -Destination (Join-Path $guestRoot 'K5VisionSetup.exe')
     $mac='00155D'+([guid]::NewGuid().ToString('N').Substring(0,6)).ToUpperInvariant()
-    $public=@{schema_version=1;transfer_id=$transfer;head_sha=$ProductHead;setup_sha256=$SetupSha256;phase='bootstrap';previous_boot_id='';previous_boot_sequence=-1;guest_mac=$mac;guest_ip=$guestIP;host_ip=$hostIPAddress}
+    $public=@{schema_version=1;transfer_id=$transfer;head_sha=$ProductHead;setup_sha256=$SetupSha256;phase='bootstrap';harness_head=$env:GITHUB_SHA;witness_sha256=(File-Digest $witness);reboot_operation=$RebootOperation;previous_boot_id='';previous_boot_sequence=-1;guest_mac=$mac;guest_ip=$guestIP;host_ip=$hostIPAddress}
     $request=@{schema_version=1;head_sha=$ProductHead;setup_sha256=$SetupSha256;source_uri=$source;transfer_id=$transfer;receipt_path='C:\K5GuestWitness\bootstrap-receipt.json'}
     [IO.File]::WriteAllText((Join-Path $guestRoot 'public-config.json'),($public|ConvertTo-Json -Depth 5),[Text.UTF8Encoding]::new($false))
     [IO.File]::WriteAllText((Join-Path $guestRoot 'bootstrap-request.json'),($request|ConvertTo-Json -Depth 5),[Text.UTF8Encoding]::new($false))
@@ -858,13 +1195,16 @@ try{
         if($verified.phase -cne 'reboot' -or $verified.previous_boot_id -cne $boot -or $verified.previous_boot_sequence -ne $sequence){throw 'Durable reboot phase verification failed'}
     } -ArgumentList $initial.boot_id,$initial.boot_sequence -ErrorAction Stop
     Remove-PSSession -Session $direct;$direct=$null
-    Bounded-Job (Restart-VM -VM (Owned-VM) -Force -AsJob -Confirm:$false) 40|Out-Null
+    Restart-OwnedGuest $initial
     $rebootSeal=Kvp-Seal 'reboot' 240
     $receipt.stage='reboot_receipt_read'
     $direct=Open-Direct
     $reboot=Read-GuestReceipt 'reboot' $rebootSeal;$receipt.reboot_witness=$reboot
     if($reboot.status -cne 'reboot_sealed' -or -not $reboot.startup_before_interactive_login -or -not $reboot.recording_after_reboot -or -not $reboot.retained_closed_hashes_unchanged -or $reboot.boot_id -cne $initial.boot_id -or $reboot.native_boot_sequence_verified -ne $true -or $reboot.native_boot_sequence_increment_verified -ne $true -or $reboot.previous_boot_sequence -ne $initial.boot_sequence -or $reboot.boot_sequence -ne ($initial.boot_sequence+1)){throw 'Reboot recording witness failed'}
     if(-not $reboot.security_policy_coverage_verified -or -not $reboot.security_tail_stable -or -not $reboot.startup_audit_enabled -or -not $reboot.startup_audit_4608_verified -or -not $reboot.security_audit_checkpoint_retained -or -not $reboot.security_no_clear_reset_wrap -or -not $reboot.postboot_clip_created_after_system_inventory -or $null -eq $reboot.postboot_closed_recording){throw 'Reboot audit or new closed recording witness unavailable'}
+    if($RebootOperation -ceq 'planned-shutdown-start'){
+        if(-not $receipt.planned_final_off_boundary_verified -or -not $receipt.planned_boundary_dismounted_before_start -or $reboot.planned_final_off_checkpoint_sha256 -cne $receipt.planned_final_off_checkpoint_sha256 -or $reboot.security_final_off_checkpoint_retained -ne $true -or $reboot.security_original_checkpoint_retained -ne $true -or $reboot.security_all_post_off_shutdown_loss_policy_and_interactive_events_refused -ne $true){throw 'Planned sealed witness differs from exact final-Off boundary'}
+    }
     $receipt.recording_after_reboot_before_login=$true
     $receipt.stage='actual_console_logon'
     # After the pre-login receipt has been sealed and verified, simulate an
@@ -980,7 +1320,8 @@ try{
             $vm=Owned-VM;if([string]$vm.State -ne 'Off'){throw 'Owned VM did not stop'}
             Bounded-Job (Remove-VM -VM $vm -Force -AsJob -Confirm:$false) 30|Out-Null
             if($null -ne (Get-VM -Id $vmId -ErrorAction SilentlyContinue)){throw 'Owned VM remains'}
-            if($receipt.stage -ceq 'bootstrap_observation'){
+            if($mounted -or $null -ne $plannedBoundaryMountIntent){$receipt.offline_diagnostic_skipped_for_pending_cleanup=$true}
+            elseif($receipt.stage -ceq 'bootstrap_observation'){
                 try{$receipt.bootstrap_observation_offline=Read-BootFailureOffline}catch{$receipt.bootstrap_offline_diagnostic_error=$_.Exception.GetType().Name}
             }elseif($receipt.stage -ceq 'actual_guest_boot' -and -not $receipt.actual_guest_boot){
                 try{$receipt.bootstrap_failure_offline=Read-BootFailureOffline}catch{$receipt.bootstrap_offline_diagnostic_error=$_.Exception.GetType().Name}
@@ -997,6 +1338,17 @@ try{
             if($switch.Name -cne $switchName -or [string]$switch.SwitchType -ne 'Internal'){throw 'Owned internal switch changed'}
             if($null -ne $hostInterface){Get-NetIPAddress -InterfaceIndex $hostInterface -IPAddress $hostIPAddress -ErrorAction SilentlyContinue|Remove-NetIPAddress -Confirm:$false}
             Remove-VMSwitch -VMSwitch $switch -Force -Confirm:$false
+        }
+        if($null -ne $plannedBoundaryMountIntent){
+            $pending=Get-VHD -Path $image
+            if($pending.Attached){
+                $pendingNumber=[int]$pending.DiskNumber
+                if([string](Get-Disk -Number $pendingNumber).UniqueId -cne $diskId){throw 'Pending planned cleanup disk differs'}
+                $mounted=$true;$diskNumber=$pendingNumber;$accessPath=$plannedBoundaryMountIntent.access_path
+                $paths=@((Get-Partition -DiskNumber $diskNumber -PartitionNumber $plannedBoundaryMountIntent.partition_number).AccessPaths|Where-Object{[string]::Equals([string]$_,$accessPath,[StringComparison]::OrdinalIgnoreCase)})
+                $partitionNumber=if($paths.Count -eq 1){$plannedBoundaryMountIntent.partition_number}else{$null}
+                if($paths.Count -gt 1){throw 'Pending planned cleanup path differs'}
+            }else{$mounted=$false}
         }
         if($mounted){
             $attached=Get-VHD -Path $image

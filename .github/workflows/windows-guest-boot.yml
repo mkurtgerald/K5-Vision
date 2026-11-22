@@ -5,7 +5,7 @@ on:
       scope:
         type: choice
         default: recording
-        options: [recording, image-discovery, bootstrap-observation]
+        options: [recording, planned-restart-recording, image-discovery, bootstrap-observation]
   push:
     branches: [codex/windows-guest-20261122]
     paths:
@@ -64,18 +64,19 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
   guest-recording:
-    if: github.event_name == 'push' || inputs.scope == 'recording' || inputs.scope == 'bootstrap-observation'
+    if: github.event_name == 'push' || inputs.scope == 'recording' || inputs.scope == 'planned-restart-recording' || inputs.scope == 'bootstrap-observation'
     # Branch pushes diagnose initialization for four minutes. A manual recording
     # dispatch retains the original complete qualification criteria and budgets.
-    name: ${{ (github.event_name == 'push' || inputs.scope == 'bootstrap-observation') && 'DIAGNOSTIC ONLY - 4-minute Windows initialization observation (no qualification)' || 'DIAGNOSTIC ONLY - actual f96 Windows guest reboot and sign-out recording' }}
+    name: ${{ (github.event_name == 'push' || inputs.scope == 'bootstrap-observation') && 'DIAGNOSTIC ONLY - 4-minute Windows initialization observation (no qualification)' || (inputs.scope == 'planned-restart-recording' && 'DIAGNOSTIC ONLY - actual 23a planned guest shutdown/start and sign-out recording' || 'DIAGNOSTIC ONLY - actual 23a hard-reset guest reboot and sign-out recording') }}
     runs-on: windows-2025
     timeout-minutes: 38
     permissions:
       contents: read
       actions: read
     env:
-      K5_GUEST_PRODUCT_HEAD: f96c828f4fdeb63596e2b6a27da9b29487387160
-      K5_GUEST_SETUP_SHA256: 319fb86611298aab6127547959d2007bcd08782aaa49c6b52c5594bef95017b5
+      K5_GUEST_PRODUCT_HEAD: 23a24e57679534d77a5ea3881902f24a2d8e8e5f
+      K5_GUEST_SETUP_SHA256: ee8868069902cc2112b619df3240f10c6c5214acfa91846e14b295e20dd98935
+      K5_GUEST_REBOOT_OPERATION: ${{ inputs.scope == 'planned-restart-recording' && 'planned-shutdown-start' || 'hard-reset' }}
       K5_GUEST_BOOTSTRAP_OBSERVATION: ${{ (github.event_name == 'push' || inputs.scope == 'bootstrap-observation') && 'true' || 'false' }}
     steps:
       - name: Checkout the separately identified guest controller and helper
@@ -101,7 +102,7 @@ jobs:
               if (@($errors).Count) { throw 'Guest controller source did not parse' }
             }
           }
-          if ($sourceHashes['windows_guest_witness.ps1'] -ne '1bd76a02b3740b4e798e310f6d3a7c26917c518478fb77dd8239e555752cf85d') { throw 'Native guest witness Git blob differs' }
+          if ($sourceHashes['windows_guest_witness.ps1'] -ne '387f5ef4300a1726d0a1d2a623cd4f326fbb6d3c562f715965532be112ab4d22') { throw 'Native guest witness Git blob differs' }
           if ($sourceHashes['windows_guest_bootstrap.cs'] -ne 'b8ef1a885d876d0a66833b3350221bd66794f972843e418815628278b9163909' -or
               $sourceHashes['windows_guest_bootstrap_controls.cs'] -ne '4757e92ab04d387d9d04f0572949c1224dbfa2f25222cb5680290577ec30c837') { throw 'Guest GUI bootstrap controls source differs' }
           if ($sourceHashes['windows_guest_boot_sequence_controls.ps1'] -ne '84204b182165214c3cf46558ff812c87892b6213a0529d7641a2ea3606cb48c0') { throw 'Native boot sequence controls source differs' }
@@ -161,9 +162,9 @@ jobs:
           @{schema_version=1; diagnostic_only=$true; product_qualification=$false; harness_head=$env:GITHUB_SHA;
             product_head=$env:K5_GUEST_PRODUCT_HEAD; installer_sha256=$env:K5_GUEST_SETUP_SHA256;
             image_sha256='2d175924c8e647969a82e36f931b22397108bd94a030e0e947b7e66e47e0be9a';
-            source_hashes=$sourceHashes; native_boot_sequence_read=$counter; run_id=$env:GITHUB_RUN_ID; run_attempt=$env:GITHUB_RUN_ATTEMPT} |
+            source_hashes=$sourceHashes; native_boot_sequence_read=$counter; reboot_operation=$env:K5_GUEST_REBOOT_OPERATION; run_id=$env:GITHUB_RUN_ID; run_attempt=$env:GITHUB_RUN_ATTEMPT} |
             ConvertTo-Json -Depth 5 | Set-Content -LiteralPath windows-guest-recording-provenance.json -Encoding utf8
-      - name: Admit the exact f96 GUI producer and its unqualified candidate
+      - name: Admit the exact 23a GUI producer and its unqualified candidate
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -171,13 +172,13 @@ jobs:
           $ErrorActionPreference='Stop'
           $headers=@{Authorization="Bearer $env:GH_TOKEN";Accept='application/vnd.github+json';'X-GitHub-Api-Version'='2022-11-28'}
           $api="https://api.github.com/repos/$env:GITHUB_REPOSITORY/actions"
-          $meta=Invoke-RestMethod -Uri "$api/artifacts/14743856449" -Headers $headers
-          $attempt=Invoke-RestMethod -Uri "$api/runs/44995396561/attempts/1" -Headers $headers
-          $jobs=Invoke-RestMethod -Uri "$api/runs/44995396561/attempts/1/jobs?per_page=100" -Headers $headers
-          $producer=@($jobs.jobs | Where-Object { $_.id -eq 137125226351 })
-          if ($meta.id -ne 14743856449 -or $meta.expired -ne $false -or
-              $meta.digest -ne 'sha256:55d17517e904e4782fc2190b5687706d6c7ef4d656dd8ec1da60091a10d690b1' -or
-              $meta.size_in_bytes -ne 285142063 -or $meta.workflow_run.id -ne 44995396561 -or
+          $meta=Invoke-RestMethod -Uri "$api/artifacts/14745897366" -Headers $headers
+          $attempt=Invoke-RestMethod -Uri "$api/runs/45001731180/attempts/1" -Headers $headers
+          $jobs=Invoke-RestMethod -Uri "$api/runs/45001731180/attempts/1/jobs?per_page=100" -Headers $headers
+          $producer=@($jobs.jobs | Where-Object { $_.id -eq 137144542629 })
+          if ($meta.id -ne 14745897366 -or $meta.expired -ne $false -or
+              $meta.digest -ne 'sha256:d25e812247d592866c1f02c05754e9d2d62dea667a9aa3b31766f2f0a2f4a489' -or
+              $meta.size_in_bytes -ne 285148987 -or $meta.workflow_run.id -ne 45001731180 -or
               $meta.workflow_run.head_sha -ne $env:K5_GUEST_PRODUCT_HEAD -or
               $attempt.run_attempt -ne 1 -or $attempt.head_sha -ne $env:K5_GUEST_PRODUCT_HEAD -or
               $producer.Count -ne 1 -or $producer[0].conclusion -ne 'success') {
@@ -186,9 +187,9 @@ jobs:
       - name: Download the fixed original installer artifact without rebuilding it
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:
-          artifact-ids: 14743856449
+          artifact-ids: 14745897366
           github-token: ${{ github.token }}
-          run-id: 44995396561
+          run-id: 45001731180
           path: guest-product-input
           merge-multiple: true
       - name: Bind original installer, package and manifest bytes
@@ -199,13 +200,13 @@ jobs:
           $manifest=Get-Content -LiteralPath guest-product-input/payload-manifest.json -Raw | ConvertFrom-Json
           $setup=Get-Item -LiteralPath guest-product-input/K5VisionSetup.exe
           $sha=(Get-FileHash -LiteralPath $setup.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($sha -ne $env:K5_GUEST_SETUP_SHA256 -or $setup.Length -ne 286580248 -or
+          if ($sha -ne $env:K5_GUEST_SETUP_SHA256 -or $setup.Length -ne 286587086 -or
               $package.setup_sha256 -ne $sha -or $package.setup_bytes -ne $setup.Length -or
-              $package.qualification_status -ne 'unqualified' -or $package.run_id -ne 44995396561 -or
+              $package.qualification_status -ne 'unqualified' -or $package.run_id -ne 45001731180 -or
               $package.run_attempt -ne 1 -or $package.head_sha -ne $env:K5_GUEST_PRODUCT_HEAD -or
               $manifest.head_sha -ne $env:K5_GUEST_PRODUCT_HEAD -or
-              (Get-FileHash -LiteralPath guest-product-input/desktop-package.json -Algorithm SHA256).Hash.ToLowerInvariant() -ne '3a763a152d8b503215c57dcbc19affa7e4c64e8597259821d313feb178e2c680' -or
-              (Get-FileHash -LiteralPath guest-product-input/payload-manifest.json -Algorithm SHA256).Hash.ToLowerInvariant() -ne '6de282a8ccadbd925cc7f29c17b4b0bfb81c8866ee5b1188f60e05e841815e27' -or
+              (Get-FileHash -LiteralPath guest-product-input/desktop-package.json -Algorithm SHA256).Hash.ToLowerInvariant() -ne '88eaaf6a3e0b0f9001e8076ddbb110aab2f128e33f088d9dfe906c5066d38d6a' -or
+              (Get-FileHash -LiteralPath guest-product-input/payload-manifest.json -Algorithm SHA256).Hash.ToLowerInvariant() -ne '41878219fa16c6e68b79dffabb468673e7821c3688fb181cd7749685551ea821' -or
               $package.payload_manifest_sha256 -ne (Get-FileHash -LiteralPath guest-product-input/payload-manifest.json -Algorithm SHA256).Hash.ToLowerInvariant() -or
               $manifest.files.path -notcontains 'K5VisionRecorder.exe' -or
               $manifest.files.path -notcontains 'K5VisionRecorder.xml') { throw 'Original guest candidate bytes differ' }
@@ -221,7 +222,7 @@ jobs:
           $helper=(Resolve-Path guest-native-build/windows_guest_bootstrap.exe).Path
           $observationArguments=@()
           if ($env:K5_GUEST_BOOTSTRAP_OBSERVATION -eq 'true') { $observationArguments=@('-BootstrapObservation') }
-          & (Join-Path $env:SYSTEMROOT 'System32/WindowsPowerShell/v1.0/powershell.exe') -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $controller -SetupPath $setup -ProductHead $env:K5_GUEST_PRODUCT_HEAD -SetupSha256 $env:K5_GUEST_SETUP_SHA256 -BootstrapExe $helper -MediaMTX $env:K5_MEDIAMTX_DONOR_EXE -FFmpeg $env:K5_DONOR_FFMPEG -FFprobe $env:K5_DONOR_FFPROBE @observationArguments |
+          & (Join-Path $env:SYSTEMROOT 'System32/WindowsPowerShell/v1.0/powershell.exe') -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $controller -SetupPath $setup -ProductHead $env:K5_GUEST_PRODUCT_HEAD -SetupSha256 $env:K5_GUEST_SETUP_SHA256 -BootstrapExe $helper -MediaMTX $env:K5_MEDIAMTX_DONOR_EXE -FFmpeg $env:K5_DONOR_FFMPEG -FFprobe $env:K5_DONOR_FFPROBE -RebootOperation $env:K5_GUEST_REBOOT_OPERATION @observationArguments |
             Tee-Object -FilePath windows-guest-recording.json
           if ($LASTEXITCODE -ne 0) { throw 'Guest recording diagnostic could not retire its exact resources' }
           $evidence=Get-Content -LiteralPath windows-guest-recording.json -Raw | ConvertFrom-Json
@@ -229,7 +230,25 @@ jobs:
               $evidence.product_qualification -ne $false -or $evidence.cleanup_complete -ne $true -or
               $evidence.github_credentials_entered_guest -ne $false -or
               $evidence.product_head -ne $env:K5_GUEST_PRODUCT_HEAD -or
-              $evidence.installer_sha256 -ne $env:K5_GUEST_SETUP_SHA256) { throw 'Guest recording diagnostic scope differs' }
+              $evidence.installer_sha256 -ne $env:K5_GUEST_SETUP_SHA256 -or
+              $evidence.reboot_operation -cne $env:K5_GUEST_REBOOT_OPERATION) { throw 'Guest recording diagnostic scope differs' }
+          if ($env:K5_GUEST_BOOTSTRAP_OBSERVATION -ne 'true') {
+            if ($evidence.reboot_operation_executed -ne $true) { throw 'Requested owned reboot operation was not observed' }
+            if ($env:K5_GUEST_REBOOT_OPERATION -ceq 'planned-shutdown-start') {
+              if ($evidence.proof_scope -cne 'planned-shutdown-start-recording' -or
+                  $evidence.planned_shutdown_off_observed -ne $true -or $evidence.planned_start_running_observed -ne $true -or
+                  $evidence.planned_shutdown_elapsed_ms -lt 0 -or $evidence.planned_shutdown_elapsed_ms -ge 40000 -or
+                  $evidence.planned_start_elapsed_ms -lt 0 -or $evidence.planned_start_elapsed_ms -ge 40000 -or
+                  $evidence.planned_native_config_custody_controls_passed -ne $true -or $evidence.planned_native_config_custody_control_count -ne 10 -or
+                  $evidence.planned_final_off_boundary_verified -ne $true -or $evidence.planned_boundary_dismounted_before_start -ne $true -or
+                  $evidence.planned_boundary_elapsed_ms -lt 0 -or $evidence.planned_boundary_elapsed_ms -ge 40000 -or
+                  $evidence.planned_final_off_checkpoint_sha256 -cnotmatch '^[a-f0-9]{64}$' -or
+                  $evidence.reboot_witness.planned_final_off_checkpoint_sha256 -cne $evidence.planned_final_off_checkpoint_sha256 -or
+                  $evidence.reboot_witness.security_final_off_checkpoint_retained -ne $true -or
+                  $evidence.reboot_witness.security_original_checkpoint_retained -ne $true -or
+                  $evidence.reboot_witness.security_all_post_off_shutdown_loss_policy_and_interactive_events_refused -ne $true) { throw 'Planned shutdown/start identity or operation bounds differ' }
+            } elseif ($evidence.proof_scope -cne 'hard-reset-recording') { throw 'Hard-reset proof scope differs' }
+          }
           if ($env:K5_GUEST_BOOTSTRAP_OBSERVATION -eq 'true') {
             if ($evidence.bootstrap_observation_only -ne $true -or
                 $evidence.outcome -ne 'guest_initialization_diagnostic_observed' -or
