@@ -96,8 +96,15 @@ jobs:
               if (@($errors).Count) { throw 'Guest controller source did not parse' }
             }
           }
+          if ($sourceHashes['windows_guest_witness.ps1'] -ne '03ca31f5acff5bd8eaef17ff333b5bbfc274955d7fc969f7f3493dce391506e7') { throw 'Native guest witness Git blob differs' }
           $compiler=Join-Path $env:SYSTEMROOT 'Microsoft.NET/Framework64/v4.0.30319/csc.exe'
-          & $compiler /nologo /target:winexe /platform:x64 /optimize+ /r:System.Core.dll /r:System.Web.Extensions.dll /r:System.ServiceProcess.dll /out:guest-native-build/windows_guest_bootstrap.exe guest-native-build/windows_guest_bootstrap.cs
+          $buildRoot=(Resolve-Path -LiteralPath guest-native-build).Path
+          $helperSource=(Get-Item -LiteralPath (Join-Path $buildRoot 'windows_guest_bootstrap.cs')).FullName
+          $helperOutput=Join-Path $buildRoot 'windows_guest_bootstrap.exe'
+          $compileArguments=@('/nologo','/target:winexe','/platform:x64','/optimize+',
+            '/r:System.Core.dll','/r:System.Web.Extensions.dll','/r:System.ServiceProcess.dll',
+            ('/out:'+$helperOutput),$helperSource)
+          & $compiler @compileArguments
           if ($LASTEXITCODE -ne 0) { throw 'Native Framework guest GUI bootstrap did not compile' }
           # Test only the QA helper's TOTP codec, using a public RFC seed and an
           # independent Python standard-library result before any guest download.

@@ -31,7 +31,7 @@ public static class K5GuestNative {
   [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
   [DllImport("advapi32.dll",SetLastError=true)] static extern bool OpenProcessToken(IntPtr process,uint access,out IntPtr token);
   [DllImport("advapi32.dll",SetLastError=true)] static extern bool GetTokenInformation(IntPtr token,int kind,IntPtr buffer,int length,out int needed);
-  [DllImport("advapi32.dll",SetLastError=true)] static extern bool AuditQuerySystemPolicy(ref Guid subcategory,uint count,out IntPtr policy);
+  [DllImport("advapi32.dll",SetLastError=true)] [return:MarshalAs(UnmanagedType.U1)] static extern bool AuditQuerySystemPolicy(ref Guid subcategory,uint count,out IntPtr policy);
   [DllImport("advapi32.dll")] static extern void AuditFree(IntPtr buffer);
   public static string BootId() { var b=new Boot(); int n; if(NtQuerySystemInformation(90,ref b,Marshal.SizeOf(b),out n)<0 || b.Id==Guid.Empty) throw new InvalidOperationException(); return b.Id.ToString(); }
   public static bool LogonAuditEnabled() { var g=new Guid("0cce9215-69ae-11d9-bed3-505054503030"); IntPtr p; if(!AuditQuerySystemPolicy(ref g,1,out p)) throw new Win32Exception(); try{return (((Audit)Marshal.PtrToStructure(p,typeof(Audit))).Flags&1)!=0;} finally{AuditFree(p);} }
