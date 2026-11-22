@@ -7,6 +7,7 @@ and a saved MP4 are observed. Camera events and motion decisions are not mocked.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import importlib.util
 import json
@@ -14,19 +15,22 @@ import os
 import platform
 import secrets
 import shutil
+import socket
 import subprocess
 import time
 from datetime import UTC, datetime, timedelta
 from importlib.metadata import version
 from pathlib import Path
+from urllib.error import HTTPError
 from urllib.parse import urlencode, urlsplit
+from urllib.request import ProxyHandler, Request, build_opener
 from uuid import UUID, uuid4
 
 import psutil
 import pytest
 
 from k5vision import identity_state
-from k5vision.media.mediamtx_provider import MediaMTXBinding
+from k5vision.media.mediamtx_provider import MediaMTXBinding, _NoRedirect
 
 _INPUTS = (
     "K5_DESKTOP_SETUP",
@@ -328,8 +332,137 @@ def _author_zones(page, camera):
     return saved, preview
 
 
+def _installed_path_snapshot(profile, target_path, source_uri, cohort, desktop):
+    """Admin-only read of generated fixture data; never grants product trust."""
+    note = {}
+    try:
+        profile = Path(profile)
+        if os.name != "nt" or profile != desktop._machine_paths()[1]:
+            raise RuntimeError("Diagnostic profile is not the fixed machine profile")
+        path = profile / "identity/operator-mediamtx.json"
+        if path.resolve() != profile.resolve() / "identity/operator-mediamtx.json":
+            raise RuntimeError("Diagnostic configuration changed its fixed location")
+        with path.open("rb") as source:
+            raw = source.read(1_048_577)
+        if not 0 < len(raw) <= 1_048_576:
+            raise RuntimeError("Diagnostic configuration exceeded its bound")
+        config = json.loads(raw)
+        origin = urlsplit("http://" + config["apiAddress"])
+        if (
+            config.get("api") is not True
+            or origin.hostname != "127.0.0.1"
+            or origin.username
+            or origin.password
+            or origin.path
+            or origin.query
+            or origin.fragment
+            or origin.port is None
+            or origin.netloc != f"127.0.0.1:{origin.port}"
+        ):
+            raise RuntimeError("Diagnostic API is not the fixed loopback origin")
+        with cohort.lock:
+            candidates = [
+                identity
+                for identity, item in cohort.ownership_records.items()
+                if item["accepted"] and item["role"] == "service" and item["kind"] == "mediamtx"
+            ]
+        live = [(pid, birth) for pid, birth in candidates if cohort.native.birth(pid) == birth]
+        note["owned_media"] = [{"pid": pid, "created_100ns": birth} for pid, birth in live]
+        note["owned_media_seen"] = len(candidates)
+        owners = {
+            item.pid
+            for item in psutil.net_connections(kind="tcp")
+            if item.status == psutil.CONN_LISTEN
+            and item.laddr
+            and item.laddr.ip == "127.0.0.1"
+            and item.laddr.port == origin.port
+        }
+        note["api_owner_verified"] = len(owners) == 1 and owners <= {pid for pid, _ in live}
+        if not note["api_owner_verified"]:
+            raise RuntimeError("Diagnostic API lacks an admitted media owner")
+        user = config["authInternalUsers"][0]
+        token = base64.b64encode(f"{user['user']}:{user['pass']}".encode()).decode()
+        opener = build_opener(ProxyHandler({}), _NoRedirect())
+
+        def read(route):
+            request = Request(origin.geturl() + route, headers={"Authorization": "Basic " + token})
+            try:
+                with opener.open(request, timeout=1) as response:
+                    data = response.read(65_537)
+                    if len(data) > 65_536:
+                        raise ValueError
+                    return response.status, json.loads(data)
+            except HTTPError as error:
+                error.close()
+                return error.code, {}
+
+        name = target_path.name
+        status, value = read("/v3/paths/get/" + name)
+        note["path_http_status"] = status
+        for key in ("online", "available", "ready"):
+            note[key] = value.get(key) if type(value.get(key)) is bool else None
+        for key in ("inboundBytes", "outboundBytes"):
+            note[key] = value.get(key) if type(value.get(key)) is int else None
+        note["reader_count"] = len(value.get("readers", []))
+        status, running = read("/v3/config/paths/get/" + name)
+        note["configuration_http_status"] = status
+        saved = config["paths"][name]
+        note["source_matches_saved"] = running.get("source") == saved.get("source")
+        note["source_on_demand_matches"] = running.get("sourceOnDemand") == saved.get(
+            "sourceOnDemand"
+        )
+        note["tcp_matches"] = running.get("rtspTransport") == saved.get("rtspTransport") == "tcp"
+        note["absolute_timestamp_matches"] = running.get("useAbsoluteTimestamp") == saved.get(
+            "useAbsoluteTimestamp"
+        )
+    except BaseException as error:
+        note["media_probe_failure_kind"] = type(error).__name__
+    try:
+        uri = urlsplit(source_uri)
+        if (
+            uri.scheme != "rtsp"
+            or uri.hostname not in {"127.0.0.1", "127.0.0.2"}
+            or uri.username
+            or uri.password
+        ):
+            raise RuntimeError("Diagnostic upstream is not a generated loopback source")
+        with socket.create_connection((uri.hostname, uri.port or 554), timeout=1) as peer:
+            peer.sendall(
+                (
+                    f"DESCRIBE {source_uri} RTSP/1.0\r\nCSeq: 1\r\nAccept: application/sdp\r\n\r\n"
+                ).encode()
+            )
+            deadline, response = time.monotonic() + 1, bytearray()
+            while b"\r\n\r\n" not in response and len(response) < 8192:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError
+                peer.settimeout(remaining)
+                data = peer.recv(min(1024, 8192 - len(response)))
+                if not data:
+                    break
+                response.extend(data)
+            header = bytes(response).split(b"\r\n", 1)[0].split()
+            note["upstream_describe_status"] = int(header[1]) if header[0] == b"RTSP/1.0" else None
+    except BaseException as error:
+        note["upstream_probe_failure_kind"] = type(error).__name__
+    return note
+
+
 def _clock_holds(
-    client, camera, *, desktop, publisher, app, parent, other_path, profile, diagnostic=None
+    client,
+    camera,
+    *,
+    desktop,
+    publisher,
+    app,
+    parent,
+    other_path,
+    profile,
+    diagnostic=None,
+    target_path=None,
+    source_uri=None,
+    cohort=None,
 ):
     guard = _helpers("windows_vm_clock").WindowsVmClockGuard(
         parent / "motion-clock-guard.json", watchdog_seconds=90
@@ -347,6 +480,10 @@ def _clock_holds(
                 }
                 clock_note["phases"].append(note)
                 try:
+                    if target_path is not None:
+                        note["native_before"] = _installed_path_snapshot(
+                            profile, target_path, source_uri, cohort, desktop
+                        )
                     publisher.movement("included")
                     _policy_state(
                         client, camera, {"recording"}, desktop, app=app, timeout=15, diagnostic=note
@@ -384,6 +521,10 @@ def _clock_holds(
                     )
                     elapsed = time.monotonic() - began
                     _require(0.5 <= elapsed <= 8, "Motion post-capture did not use elapsed time")
+                    if target_path is not None:
+                        note["native_after_step"] = _installed_path_snapshot(
+                            profile, target_path, source_uri, cohort, desktop
+                        )
                     note["step"] = "restoring_utc"
                     restored = guard.restore()
                     note["restoration"] = restored
@@ -402,6 +543,10 @@ def _clock_holds(
                     )
                     note["step"] = "complete"
                 finally:
+                    if target_path is not None and "native_after_step" not in note:
+                        note["native_after_step"] = _installed_path_snapshot(
+                            profile, target_path, source_uri, cohort, desktop
+                        )
                     note["publisher_frames_after"] = publisher.frames_written
                     note["publisher_process_alive"] = publisher.process.poll() is None
                     note["publisher_writer_alive"] = publisher._writer.is_alive()
@@ -985,6 +1130,9 @@ def test_native_windows_motion_recording_and_zones(record_testsuite_property):
             other_path=paths[1],
             profile=profile,
             diagnostic=diagnostic,
+            target_path=paths[0],
+            source_uri=sources[0],
+            cohort=cohort,
         )
         context = browser.new_context(
             viewport={"width": 1440, "height": 1000}, accept_downloads=True

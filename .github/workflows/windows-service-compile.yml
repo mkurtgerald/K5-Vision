@@ -191,7 +191,7 @@ jobs:
               $package.payload_manifest_sha256 -ne 'd3d90edde5b69ba52a124ec34d176ef4fc0efe5e79e48f530a716451b52bdb8c' -or
               $package.launcher_sha256 -ne '7f0a48885feb936dffb14fe59d3f4efff1217e32dde98ab4068ab50241253317' -or
               $manifest.files.path -notcontains 'K5VisionRecorder.exe' -or $manifest.files.path -notcontains 'K5VisionRecorder.xml' -or
-              $overlaySha -ne '690f3e00542dbd189cbd5f075f2c2d84b711a79706a3914c419fc27ed5d899c7' -or
+              $overlaySha -ne 'cd47a8d3bc910eb06408b437b6713cdf394fa37de9da786a8f2918d2151961ed' -or
               $env:K5_MOTION_DIAGNOSTIC_HARNESS_SHA -eq $env:K5_DESKTOP_HEAD_SHA) {
             throw 'Diagnostic motion replay source or installer byte identity mismatch'
           }
