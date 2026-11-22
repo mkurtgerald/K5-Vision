@@ -25,7 +25,7 @@ $receipt=[ordered]@{
     status='diagnostic_complete'; outcome='unavailable'; transfer_id=$transfer;
     product_head=$ProductHead; installer_sha256=$SetupSha256; image_sha256=$imageSha;
     actual_guest_boot=$false; recording_after_reboot_before_login=$false;
-    recording_after_actual_signout=$false; retained_media_decoded=$false;
+    recording_after_actual_signout=$false; retained_media_decoded=$false; postboot_prelogin_media_decoded=$false;
     github_credentials_entered_guest=$false; cleanup_complete=$true; stage='host_guard';
     bootstrap_observation_only=$BootstrapObservation.IsPresent
 }
@@ -168,12 +168,21 @@ function Assert-Publisher {
 function Kvp-Seal([string]$Phase,[int]$Seconds){
     $watch=[Diagnostics.Stopwatch]::StartNew()
     do{
-        $vm=Owned-VM; Assert-Publisher
+        if($watch.Elapsed.TotalSeconds -ge $Seconds){throw [TimeoutException]::new('Sealed guest witness unavailable')}
+        $vm=Owned-VM
+        if($watch.Elapsed.TotalSeconds -ge $Seconds){throw [TimeoutException]::new('Owned VM query exceeded witness budget')}
+        Assert-Publisher
+        if($watch.Elapsed.TotalSeconds -ge $Seconds){throw [TimeoutException]::new('Source query exceeded witness budget')}
         if([string]$vm.State -ne 'Running'){throw 'Owned VM stopped before witness'}
-        $computer=Get-CimInstance -Namespace root/virtualization/v2 -ClassName Msvm_ComputerSystem -Filter ("Name='"+$vmId.ToString()+"'")
-        $components=@(Get-CimAssociatedInstance -InputObject $computer -ResultClassName Msvm_KvpExchangeComponent)
+        $remaining=[int][Math]::Max(1,[Math]::Ceiling($Seconds-$watch.Elapsed.TotalSeconds))
+        $computer=Get-CimInstance -Namespace root/virtualization/v2 -ClassName Msvm_ComputerSystem -Filter ("Name='"+$vmId.ToString()+"'") -OperationTimeoutSec $remaining
+        if($watch.Elapsed.TotalSeconds -ge $Seconds){throw [TimeoutException]::new('Guest system query exceeded witness budget')}
+        $remaining=[int][Math]::Max(1,[Math]::Ceiling($Seconds-$watch.Elapsed.TotalSeconds))
+        $components=@(Get-CimAssociatedInstance -InputObject $computer -ResultClassName Msvm_KvpExchangeComponent -OperationTimeoutSec $remaining)
+        if($watch.Elapsed.TotalSeconds -ge $Seconds){throw [TimeoutException]::new('Guest exchange query exceeded witness budget')}
         if($components.Count -ne 1){throw 'Owned KVP component unavailable'}
         foreach($raw in @($components[0].GuestExchangeItems)){
+            if($watch.Elapsed.TotalSeconds -ge $Seconds){throw [TimeoutException]::new('Guest exchange parsing exceeded witness budget')}
             if($null -eq $raw -or $raw.Length -gt 8192){continue}
             [xml]$item=$raw
             $name=$item.SelectSingleNode('/INSTANCE/PROPERTY[@NAME="Name"]/VALUE')
@@ -182,11 +191,13 @@ function Kvp-Seal([string]$Phase,[int]$Seconds){
             if($null -eq $value){continue}
             $parts=$value.InnerText.Split('|')
             if($parts.Count -eq 3 -and $parts[0] -ceq $Phase -and $parts[1] -match '^[a-f0-9-]{36}$' -and $parts[2] -match '^[a-f0-9]{64}$'){
+                if($watch.Elapsed.TotalSeconds -ge $Seconds){throw [TimeoutException]::new('Guest witness arrived after budget')}
                 return @{phase=$parts[0];boot_id=$parts[1];sha256=$parts[2]}
             }
             if($parts.Count -eq 3 -and $parts[0] -ceq 'failed'){throw 'Guest setup witness failed'}
         }
-        Start-Sleep -Seconds 1
+        $sleep=[int][Math]::Min(1000,[Math]::Max(0,[Math]::Floor(($Seconds-$watch.Elapsed.TotalSeconds)*1000)))
+        if($sleep -gt 0){Start-Sleep -Milliseconds $sleep}
     }while($watch.Elapsed.TotalSeconds -lt $Seconds)
     throw [TimeoutException]::new('Sealed guest witness unavailable')
 }
@@ -759,6 +770,7 @@ try{
     $direct=Open-Direct
     $reboot=Read-GuestReceipt 'reboot' $rebootSeal;$receipt.reboot_witness=$reboot
     if($reboot.status -cne 'reboot_sealed' -or -not $reboot.startup_before_interactive_login -or -not $reboot.recording_after_reboot -or -not $reboot.retained_closed_hashes_unchanged -or $reboot.boot_id -ceq $initial.boot_id){throw 'Reboot recording witness failed'}
+    if(-not $reboot.security_policy_coverage_verified -or -not $reboot.security_tail_stable -or -not $reboot.startup_audit_enabled -or -not $reboot.startup_audit_4608_verified -or -not $reboot.security_audit_checkpoint_retained -or -not $reboot.security_no_clear_reset_wrap -or -not $reboot.postboot_clip_created_after_system_inventory -or $null -eq $reboot.postboot_closed_recording){throw 'Reboot audit or new closed recording witness unavailable'}
     $receipt.recording_after_reboot_before_login=$true
     $receipt.stage='actual_console_logon'
     # After the pre-login receipt has been sealed and verified, simulate an
@@ -794,13 +806,17 @@ try{
     if($signout.status -cne 'signout_sealed' -or -not $signout.recording_after_signout -or $signout.boot_id -cne $reboot.boot_id){throw 'Signout recording witness failed'}
     $receipt.recording_after_actual_signout=$true
     $receipt.stage='retained_media_decode'
-    $relative=Invoke-Command -Session $direct -ScriptBlock {
+    $preboot=Invoke-Command -Session $direct -ScriptBlock {
         $baseline=Get-Content -LiteralPath 'C:\K5GuestWitness\baseline.json' -Raw|ConvertFrom-Json
-        [string]$baseline.files[0].path
+        $saved=$baseline.files[0]
+        @{path=[string]$saved.path;bytes=[long]$saved.bytes;sha256=[string]$saved.sha256}
     } -ErrorAction Stop
+    foreach($clip in @(@{role='retained_preboot';facts=$preboot},@{role='new_postboot_prelogin';facts=$reboot.postboot_closed_recording})){
+        $relative=[string]$clip.facts.path
     if($relative.Length -gt 512 -or $relative -notmatch '^[A-Za-z0-9_./\\+\-]+\.mp4$' -or $relative.Contains('..') -or [IO.Path]::IsPathRooted($relative)){throw 'Retained path refused'}
-    $retained=Join-Path $root 'retained.mp4'
+    $retained=Join-Path $root ($clip.role+'.mp4')
     Copy-Item -FromSession $direct -LiteralPath ('C:\ProgramData\K5Vision\recordings\'+$relative) -Destination $retained -ErrorAction Stop
+    if($clip.facts.bytes -lt 16 -or $clip.facts.bytes -gt 536870912 -or [string]$clip.facts.sha256 -cnotmatch '^[a-f0-9]{64}$' -or (Get-Item -LiteralPath $retained).Length -ne [long]$clip.facts.bytes -or (Get-FileHash -LiteralPath $retained -Algorithm SHA256).Hash.ToLowerInvariant() -cne [string]$clip.facts.sha256){throw 'Copied closed recording differs from sealed witness'}
     $probeInfo=[Diagnostics.ProcessStartInfo]::new($FFprobe,('-v error -select_streams v:0 -count_frames -show_entries stream=codec_name,nb_read_frames -of json '+$retained))
     $probeInfo.UseShellExecute=$false;$probeInfo.CreateNoWindow=$true;$probeInfo.RedirectStandardOutput=$true;$probeInfo.RedirectStandardError=$true
     $probe=[Diagnostics.Process]::Start($probeInfo);$probe.BeginErrorReadLine();$probeOutput=$probe.StandardOutput.ReadToEndAsync()
@@ -810,11 +826,12 @@ try{
         if($probeJson.Length -gt 65536){throw 'Retained inspection output too large'}
         $inspected=$probeJson|ConvertFrom-Json
         if(@($inspected.streams).Count -ne 1 -or [string]$inspected.streams[0].nb_read_frames -notmatch '^\d+$' -or [long]$inspected.streams[0].nb_read_frames -lt 10){throw 'Retained clip has insufficient decoded frames'}
-        $receipt.retained_frames_inspected=[long]$inspected.streams[0].nb_read_frames
+        $receipt[($clip.role+'_frames_inspected')]=[long]$inspected.streams[0].nb_read_frames
     }finally{if(-not $probe.HasExited){$probe.Kill();$probe.WaitForExit(2000)|Out-Null};$probe.Dispose()}
     $decode=Start-OwnedProcess $FFmpeg ('-nostdin -v error -i '+$retained+' -frames:v 10 -f null -')
     try{if(-not $decode.WaitForExit(30000) -or $decode.ExitCode -ne 0){throw 'Retained media decode failed'}}finally{if(-not $decode.HasExited){$decode.Kill();$decode.WaitForExit(2000)|Out-Null};$decode.Dispose()}
-    $receipt.retained_media_decoded=$true;$receipt.retained_decoded_frames=10
+    if($clip.role -ceq 'retained_preboot'){$receipt.retained_media_decoded=$true;$receipt.retained_decoded_frames=10}else{$receipt.postboot_prelogin_media_decoded=$true;$receipt.postboot_decoded_frames=10}
+    }
     $receipt.outcome='installer_guest_recording_observed';$receipt.stage='complete'
     }
 }catch{

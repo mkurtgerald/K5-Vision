@@ -17,7 +17,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: windows-guest-image-${{ github.sha }}
+  group: windows-guest-image-${{ github.sha }}-${{ github.event_name == 'push' && 'bootstrap-observation' || inputs.scope }}
   cancel-in-progress: false
 jobs:
   image-discovery:
@@ -99,7 +99,7 @@ jobs:
               if (@($errors).Count) { throw 'Guest controller source did not parse' }
             }
           }
-          if ($sourceHashes['windows_guest_witness.ps1'] -ne '2ef318631d95dcb5197c38021172b49a730dc3877bfd4375ab2b647dbe69ff36') { throw 'Native guest witness Git blob differs' }
+          if ($sourceHashes['windows_guest_witness.ps1'] -ne 'dffba91c556d80c8444e4a7ad3aa1a0b27fdec62d33e9e25a251024e004f3e0e') { throw 'Native guest witness Git blob differs' }
           $compiler=Join-Path $env:SYSTEMROOT 'Microsoft.NET/Framework64/v4.0.30319/csc.exe'
           $buildRoot=(Resolve-Path -LiteralPath guest-native-build).Path
           $helperSource=(Get-Item -LiteralPath (Join-Path $buildRoot 'windows_guest_bootstrap.cs')).FullName
@@ -209,6 +209,7 @@ jobs:
                 $evidence.stage -ne 'bootstrap_observation' -or $evidence.bootstrap_observation_limit_seconds -ne 240 -or
                 $evidence.actual_guest_boot -ne $false -or $evidence.recording_after_reboot_before_login -ne $false -or
                 $evidence.recording_after_actual_signout -ne $false -or $evidence.retained_media_decoded -ne $false -or
+                $evidence.postboot_prelogin_media_decoded -ne $false -or
                 $null -eq $evidence.original_image_setup_state -or $null -eq $evidence.bootstrap_observation_live -or
                 $evidence.bootstrap_observation_offline.read_only_mount -ne $true -or
                 $evidence.bootstrap_observation_offline.setup_state.hives_unloaded -ne $true) {
@@ -219,7 +220,13 @@ jobs:
               $evidence.actual_guest_boot -ne $true -or
               $evidence.recording_after_reboot_before_login -ne $true -or
               $evidence.recording_after_actual_signout -ne $true -or
-              $evidence.retained_media_decoded -ne $true) { throw 'Actual guest recording criteria remain unobserved' }
+              $evidence.retained_media_decoded -ne $true -or $evidence.postboot_prelogin_media_decoded -ne $true -or
+              $evidence.reboot_witness.startup_audit_4608_verified -ne $true -or
+              $evidence.reboot_witness.security_audit_checkpoint_retained -ne $true -or
+              $evidence.reboot_witness.security_no_clear_reset_wrap -ne $true -or
+              $evidence.reboot_witness.security_policy_coverage_verified -ne $true -or
+              $evidence.reboot_witness.security_tail_stable -ne $true -or
+              $evidence.reboot_witness.postboot_clip_created_after_system_inventory -ne $true) { throw 'Actual guest recording criteria remain unobserved' }
       - name: Retain diagnostic guest witnesses and exact byte provenance only
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6

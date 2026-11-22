@@ -42,7 +42,9 @@ public static class K5GuestNative {
   [DllImport("advapi32.dll",SetLastError=true)] [return:MarshalAs(UnmanagedType.U1)] static extern bool AuditQuerySystemPolicy(ref Guid subcategory,uint count,out IntPtr policy);
   [DllImport("advapi32.dll")] static extern void AuditFree(IntPtr buffer);
   public static string BootId() { var b=new Boot(); int n; if(NtQuerySystemInformation(90,ref b,Marshal.SizeOf(b),out n)<0 || b.Id==Guid.Empty) throw new InvalidOperationException(); return b.Id.ToString(); }
-  public static bool LogonAuditEnabled() { var g=new Guid("0cce9215-69ae-11d9-bed3-505054503030"); IntPtr p; if(!AuditQuerySystemPolicy(ref g,1,out p)) throw new Win32Exception(); try{return (((Audit)Marshal.PtrToStructure(p,typeof(Audit))).Flags&1)!=0;} finally{AuditFree(p);} }
+  static bool AuditSuccess(string category) { var g=new Guid(category); IntPtr p; if(!AuditQuerySystemPolicy(ref g,1,out p)) throw new Win32Exception(); try{return (((Audit)Marshal.PtrToStructure(p,typeof(Audit))).Flags&1)!=0;} finally{AuditFree(p);} }
+  public static bool LogonAuditEnabled() { return AuditSuccess("0cce9215-69ae-11d9-bed3-505054503030"); }
+  public static bool StartupAuditEnabled() { return AuditSuccess("0cce9210-69ae-11d9-bed3-505054503030"); }
   public static int[] InteractiveSessions() {
     IntPtr p; int count; if(!WTSEnumerateSessionsW(IntPtr.Zero,0,1,out p,out count)) throw new Win32Exception();
     try { if(count<0 || count>64) throw new InvalidOperationException(); var found=new List<int>();
@@ -132,18 +134,81 @@ function Recorder-Facts {
     try{$response=$request.GetResponse();if([int]$response.StatusCode -ne 200){throw 'Recorder HTTP readiness unavailable'}}finally{if($null -ne $response){$response.Dispose()}}
     return @{ state='running'; sid_role='exact_recorder_virtual_account'; token_user_verified=$true; session_id=$session; process_id=[int]$service.ProcessId; health_http_status=200 }
 }
-function Interactive-LogonsSince([datetime]$Since) {
-    $events = @()
-    try { $events = @(Get-WinEvent -FilterHashtable @{LogName='Security'; Id=4624; StartTime=$Since} -ErrorAction Stop) }
-    catch { if ($_.FullyQualifiedErrorId -notlike 'NoMatchingEventsFound*') { throw } }
-    if ($events.Count -gt 4096) { throw 'Logon audit bound exceeded' }
-    $count = 0
-    foreach ($event in $events) {
-        [xml]$xml = $event.ToXml()
-        $kind = $xml.Event.EventData.Data | Where-Object { $_.Name -ceq 'LogonType' }
-        if ([string]$kind.'#text' -in @('2','7','10','11')) { $count++ }
+function Security-EventHash($Event) {
+    $bytes=[Text.Encoding]::UTF8.GetBytes($Event.ToXml())
+    $hash=[Security.Cryptography.SHA256]::Create()
+    try{return [BitConverter]::ToString($hash.ComputeHash($bytes)).Replace('-','').ToLowerInvariant()}finally{$hash.Dispose()}
+}
+function Security-Checkpoint([string]$Boot) {
+    $newest=@();$oldest=@()
+    try{
+        $newest=@(Get-WinEvent -LogName Security -MaxEvents 1 -ErrorAction Stop)
+        $oldest=@(Get-WinEvent -LogName Security -MaxEvents 1 -Oldest -ErrorAction Stop)
+        if($newest.Count -ne 1 -or $oldest.Count -ne 1 -or $newest[0].RecordId -lt $oldest[0].RecordId -or $oldest[0].RecordId -lt 1){throw 'Security checkpoint unavailable'}
+        return @{boot_id=$Boot;record_id=[long]$newest[0].RecordId;oldest_record_id=[long]$oldest[0].RecordId;xml_sha256=(Security-EventHash $newest[0])}
+    }finally{foreach($event in (@($newest)+@($oldest))){if($event -is [IDisposable]){$event.Dispose()}}}
+}
+function Assert-SecurityAuditContext {
+    if(-not [K5GuestNative]::LogonAuditEnabled() -or -not [K5GuestNative]::StartupAuditEnabled()){throw 'Native audit policy coverage unavailable'}
+    if(@([K5GuestNative]::InteractiveSessions()).Count -ne 0){throw 'Interactive session during audit boundary'}
+}
+function Security-RebootAudit($Checkpoint,[string]$PreviousBoot,[string]$CurrentBoot) {
+    $stability=[Diagnostics.Stopwatch]::StartNew()
+    for($attempt=0;$attempt -lt 8;$attempt++){
+        $oldest=@();$newest=@();$anchor=@();$events=@();$oldestAfter=@();$anchorAfter=@();$tailAfter=@();$boundaryOldest=@();$boundaryAnchor=@();$boundaryTail=@()
+        try{
+            if($Checkpoint.boot_id -cne $PreviousBoot -or $CurrentBoot -ceq $PreviousBoot -or $Checkpoint.record_id -lt 1 -or $Checkpoint.oldest_record_id -lt 1 -or $Checkpoint.xml_sha256 -cnotmatch '^[a-f0-9]{64}$'){throw 'Security reboot checkpoint differs'}
+            $oldest=@(Get-WinEvent -LogName Security -MaxEvents 1 -Oldest -ErrorAction Stop)
+            $newest=@(Get-WinEvent -LogName Security -MaxEvents 1 -ErrorAction Stop)
+            if($oldest.Count -ne 1 -or $newest.Count -ne 1 -or $oldest[0].RecordId -ne $Checkpoint.oldest_record_id -or $newest[0].RecordId -le $Checkpoint.record_id){throw 'Security log cleared reset or wrapped'}
+            $anchor=@(Get-WinEvent -LogName Security -FilterXPath ('*[System[EventRecordID={0}]]' -f [long]$Checkpoint.record_id) -MaxEvents 2 -ErrorAction Stop)
+            if($anchor.Count -ne 1 -or (Security-EventHash $anchor[0]) -cne $Checkpoint.xml_sha256){throw 'Security checkpoint was not retained'}
+            $through=[long]$newest[0].RecordId;$count=$through-[long]$Checkpoint.record_id
+            if($count -lt 1 -or $count -gt 4096){throw 'Security event range bound exceeded'}
+            $xpath='*[System[EventRecordID>{0} and EventRecordID<={1}]]' -f [long]$Checkpoint.record_id,$through
+            $events=@(Get-WinEvent -LogName Security -FilterXPath $xpath -Oldest -MaxEvents 4097 -ErrorAction Stop)
+            if($events.Count -ne $count){throw 'Security event record range has a gap'}
+            $expected=[long]$Checkpoint.record_id+1;$startup=@()
+            foreach($event in $events){
+                if([long]$event.RecordId -ne $expected){throw 'Security event record range changed'};$expected++
+                if($event.Id -in @(1101,1102,1104,1105,4612,4719,4912)){throw 'Security log or audit policy continuity changed'}
+                if($event.Id -eq 4608){$startup+=@($event)}
+            }
+            if($startup.Count -ne 1){throw 'Exact new startup audit event unavailable'}
+            [long]$startupId=$startup[0].RecordId;$interactive=0
+            foreach($event in $events){
+                if($event.Id -eq 1100 -and [long]$event.RecordId -gt $startupId){throw 'Event logging stopped after startup'}
+                if($event.Id -ne 4624 -or [long]$event.RecordId -le $startupId){continue}
+                [xml]$xml=$event.ToXml();$types=@($xml.Event.EventData.Data|Where-Object{$_.Name -ceq 'LogonType'})
+                if($types.Count -ne 1 -or [string]$types[0].'#text' -notmatch '^\d{1,2}$'){throw 'Logon audit type unavailable'}
+                if([string]$types[0].'#text' -in @('2','7','10','11','12','13')){$interactive++}
+            }
+            if($interactive -ne 0){throw 'Interactive logon preceded boot witness'}
+            $oldestAfter=@(Get-WinEvent -LogName Security -MaxEvents 1 -Oldest -ErrorAction Stop)
+            $anchorAfter=@(Get-WinEvent -LogName Security -FilterXPath ('*[System[EventRecordID={0}]]' -f [long]$Checkpoint.record_id) -MaxEvents 2 -ErrorAction Stop)
+            if($oldestAfter.Count -ne 1 -or $oldestAfter[0].RecordId -ne $Checkpoint.oldest_record_id -or $anchorAfter.Count -ne 1 -or (Security-EventHash $anchorAfter[0]) -cne $Checkpoint.xml_sha256){throw 'Security log changed during observation'}
+            # Policy and WTS checks are native in production. Then extend the
+            # record range if anything arrived while that boundary was sampled.
+            Assert-SecurityAuditContext
+            $tailAfter=@(Get-WinEvent -LogName Security -MaxEvents 1 -ErrorAction Stop)
+            if($stability.Elapsed.TotalSeconds -ge 5){throw [TimeoutException]::new('Security audit stability budget expired')}
+            if($tailAfter.Count -ne 1 -or $tailAfter[0].RecordId -lt $through){throw 'Security tail reset during observation'}
+            if($tailAfter[0].RecordId -gt $through){continue}
+            $tailHash=Security-EventHash $newest[0]
+            if((Security-EventHash $tailAfter[0]) -cne $tailHash){throw 'Security tail record ID was reused'}
+            $boundaryOldest=@(Get-WinEvent -LogName Security -MaxEvents 1 -Oldest -ErrorAction Stop)
+            $boundaryAnchor=@(Get-WinEvent -LogName Security -FilterXPath ('*[System[EventRecordID={0}]]' -f [long]$Checkpoint.record_id) -MaxEvents 2 -ErrorAction Stop)
+            if($boundaryOldest.Count -ne 1 -or $boundaryOldest[0].RecordId -ne $Checkpoint.oldest_record_id -or $boundaryAnchor.Count -ne 1 -or (Security-EventHash $boundaryAnchor[0]) -cne $Checkpoint.xml_sha256){throw 'Security log reset during native context'}
+            $boundaryTail=@(Get-WinEvent -LogName Security -MaxEvents 1 -ErrorAction Stop)
+            if($boundaryTail.Count -ne 1 -or $boundaryTail[0].RecordId -lt $through){throw 'Security final tail reset'}
+            if($stability.Elapsed.TotalSeconds -ge 5){throw [TimeoutException]::new('Security audit final boundary expired')}
+            if($boundaryTail[0].RecordId -gt $through){continue}
+            if((Security-EventHash $boundaryTail[0]) -cne $tailHash){throw 'Security final tail ID was reused'}
+            if($stability.Elapsed.TotalSeconds -ge 5){throw [TimeoutException]::new('Security audit final hash exceeded budget')}
+            return @{checkpoint_retained=$true;no_clear_reset_wrap=$true;policy_coverage_verified=$true;tail_stable=$true;startup_event_id=4608;startup_record_id=$startupId;through_record_id=$through;interactive_logons=0;stability_attempts=($attempt+1)}
+        }finally{foreach($event in (@($oldest)+@($newest)+@($anchor)+@($events)+@($oldestAfter)+@($anchorAfter)+@($tailAfter)+@($boundaryOldest)+@($boundaryAnchor)+@($boundaryTail))){if($event -is [IDisposable]){$event.Dispose()}}}
     }
-    return $count
+    throw [TimeoutException]::new('Security audit tail did not stabilize')
 }
 
 if ($Mode -eq 'Setup') {
@@ -156,6 +221,9 @@ if ($Mode -eq 'Setup') {
         $setupStage='logon_audit'
         & (Join-Path $env:SystemRoot 'System32\auditpol.exe') /set '/subcategory:{0CCE9215-69AE-11D9-BED3-505054503030}' /success:enable /failure:enable | Out-Null
         if ($LASTEXITCODE -ne 0 -or -not [K5GuestNative]::LogonAuditEnabled()) { throw 'Logon audit unavailable' }
+        $setupStage='startup_audit'
+        & (Join-Path $env:SystemRoot 'System32\auditpol.exe') /set '/subcategory:{0CCE9210-69AE-11D9-BED3-505054503030}' /success:enable | Out-Null
+        if ($LASTEXITCODE -ne 0 -or -not [K5GuestNative]::StartupAuditEnabled()) { throw 'Startup audit unavailable' }
         $setupStage='kvp_service'
         Set-Service -Name vmickvpexchange -StartupType Automatic
         Start-Service -Name vmickvpexchange
@@ -221,7 +289,10 @@ try {
             if ($watch.Elapsed.TotalSeconds -gt 90) { throw 'No closed recording before reboot' }
             Start-Sleep -Seconds 1
         } while ($true)
-        $baseline = @{schema_version=1; boot_id=$boot; transfer_id=$transfer; files=$closed}
+        if(-not [K5GuestNative]::LogonAuditEnabled() -or -not [K5GuestNative]::StartupAuditEnabled()){throw 'Audit coverage disabled before reboot'}
+        $checkpoint=Security-Checkpoint $boot
+        $baseline = @{schema_version=1; boot_id=$boot; transfer_id=$transfer; files=$closed; security_checkpoint=$checkpoint}
+        $receipt.startup_audit_enabled=$true
         $receipt.baseline_sha256 = Write-PrivateJson 'baseline.json' $baseline
         $receipt.service = Recorder-Facts
         $receipt.recording_bytes = Recording-Bytes
@@ -229,18 +300,23 @@ try {
         $receipt.status = 'bootstrap_sealed'
     } elseif ($phase -eq 'reboot') {
         $observationStage='reboot_identity'
+        $rebootWatch=[Diagnostics.Stopwatch]::StartNew()
+        $recordingRoot=Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) 'K5Vision\recordings'
+        $startupPaths=@(Recording-Files|ForEach-Object{$_.FullName})
+        $receipt.startup_recording_inventory_count=$startupPaths.Count
         Disable-TemporaryAutoLogon
         $receipt.cleanup_credentials_removed = $true
         $receipt.logon_audit_enabled = [K5GuestNative]::LogonAuditEnabled()
         if (-not $receipt.logon_audit_enabled) { throw 'Logon audit disabled' }
         $baseline = Get-Content -LiteralPath (Join-Path $root 'baseline.json') -Raw | ConvertFrom-Json
         if ($baseline.transfer_id -cne $transfer -or $baseline.boot_id -cne $config.previous_boot_id -or $boot -ceq $baseline.boot_id) { throw 'Actual reboot not established' }
-        $bootTime = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
+        $receipt.startup_audit_enabled=[K5GuestNative]::StartupAuditEnabled()
+        if(-not $receipt.startup_audit_enabled){throw 'Startup audit disabled'}
         $observationStage='service_before_login'
         $watch = [Diagnostics.Stopwatch]::StartNew()
         while ($true) {
             if (@([K5GuestNative]::InteractiveSessions()).Count -ne 0) { throw 'Interactive session preceded boot witness' }
-            try { $service = Recorder-Facts; break } catch { if ($watch.Elapsed.TotalSeconds -gt 90) { throw }; Start-Sleep -Milliseconds 250 }
+            try { $observationStage='boot_security_audit';$audit=Security-RebootAudit $baseline.security_checkpoint $baseline.boot_id $boot;$observationStage='service_before_login';$service = Recorder-Facts; break } catch { if ($watch.Elapsed.TotalSeconds -gt 90) { throw }; Start-Sleep -Milliseconds 250 }
         }
         $before = Recording-Bytes
         $observationStage='prelogin_recording_growth'
@@ -251,13 +327,36 @@ try {
             Start-Sleep -Milliseconds 250
         } while ($watch.Elapsed.TotalSeconds -lt 20)
         $after = Recording-Bytes
-        if ($after -le $before -or (Interactive-LogonsSince $bootTime) -ne 0) { throw 'Pre-login recording or logon audit failed' }
+        if ($after -le $before) { throw 'Pre-login recording growth failed' }
         $closed = @(Closed-Recordings)
         $observationStage='retained_closed_recordings'
         foreach ($saved in @($baseline.files)) {
             $matches = @($closed | Where-Object { $_.path -ceq $saved.path -and $_.bytes -eq $saved.bytes -and $_.sha256 -ceq $saved.sha256 })
             if ($matches.Count -ne 1) { throw 'Retained closed recording differs' }
         }
+        $observationStage='new_closed_postboot_recording'
+        $auditWatch=[Diagnostics.Stopwatch]::StartNew();$postboot=@()
+        do{
+            if(@([K5GuestNative]::InteractiveSessions()).Count -ne 0){throw 'Interactive session before new recording closed'}
+            $service=Recorder-Facts
+            $postboot=@(Closed-Recordings|Where-Object{(Join-Path $recordingRoot $_.path) -notin $startupPaths})
+            if($postboot.Count -gt 0){break}
+            if($rebootWatch.Elapsed.TotalSeconds -ge 200){throw 'New closed postboot recording unavailable'}
+            if($auditWatch.Elapsed.TotalSeconds -ge 1){$audit=Security-RebootAudit $baseline.security_checkpoint $baseline.boot_id $boot;$auditWatch.Restart()}
+            Start-Sleep -Milliseconds 250
+        }while($true)
+        $receipt.postboot_closed_recording=$postboot[0]
+        $receipt.postboot_clip_created_after_system_inventory=$true
+        $receipt.reboot_observation_total_seconds=[Math]::Round($rebootWatch.Elapsed.TotalSeconds,3)
+        $observationStage='final_boot_security_audit'
+        $audit=Security-RebootAudit $baseline.security_checkpoint $baseline.boot_id $boot
+        $receipt.security_audit_checkpoint_retained=$audit.checkpoint_retained
+        $receipt.security_no_clear_reset_wrap=$audit.no_clear_reset_wrap
+        $receipt.security_policy_coverage_verified=$audit.policy_coverage_verified
+        $receipt.security_tail_stable=$audit.tail_stable
+        $receipt.startup_audit_4608_verified=($audit.startup_event_id -eq 4608)
+        $receipt.startup_audit_record_id=$audit.startup_record_id
+        $receipt.security_observed_through_record_id=$audit.through_record_id
         $receipt.previous_boot_id = $baseline.boot_id
         $receipt.startup_before_interactive_login = $true
         $receipt.recording_after_reboot = $true
