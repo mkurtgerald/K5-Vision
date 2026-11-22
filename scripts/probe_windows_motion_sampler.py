@@ -8,6 +8,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import secrets
 import socket
 import subprocess
@@ -15,10 +16,16 @@ import sys
 import tempfile
 import threading
 import time
+from importlib.metadata import distribution
 from pathlib import Path
 from urllib.request import ProxyHandler, Request, build_opener
 
 _MARKER = "K5_MOTION_CHILD_DIAGNOSTIC "
+_CAPTURE_OPTIONS = {
+    "default": "",
+    "tcp": "rtsp_transport;tcp",
+    "tcp-nobuffer": "rtsp_transport;tcp|fflags;nobuffer",
+}
 
 
 def _child():
@@ -131,15 +138,44 @@ def main():
     parser.add_argument("--candidate-module-sha256")
     parser.add_argument("--baseline-source-head")
     parser.add_argument("--candidate-source-head")
+    parser.add_argument("--untraced-only", action="store_true")
+    parser.add_argument("--opencv-version")
+    parser.add_argument("--capture-options", choices=tuple(_CAPTURE_OPTIONS), default="default")
     args = parser.parse_args()
     if args.candidate_module and not all(
         (args.candidate_module_sha256, args.baseline_source_head, args.candidate_source_head)
     ):
         parser.error("Candidate A/B requires pinned module bytes and both source heads")
+    if args.untraced_only and (
+        args.candidate_module or not args.opencv_version or not args.baseline_source_head
+    ):
+        parser.error(
+            "Untraced matrix requires a version and source head without a candidate overlay"
+        )
+    options = _CAPTURE_OPTIONS[args.capture_options]
+    original_options = os.environ.get("OPENCV_FFMPEG_CAPTURE_OPTIONS")
+    if options:
+        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = options
+    else:
+        os.environ.pop("OPENCV_FFMPEG_CAPTURE_OPTIONS", None)
     import cv2
     import numpy
 
     import k5vision.operator_motion_process as motion
+
+    package = distribution("opencv-python-headless")
+    if args.opencv_version and (
+        package.version != args.opencv_version
+        or cv2.__version__ != args.opencv_version.rsplit(".", 1)[0]
+    ):
+        raise RuntimeError("Native OpenCV version does not match the requested matrix arm")
+    wheel_metadata = package.read_text("WHEEL") or ""
+    wheel_record = package.read_text("RECORD") or ""
+    native_versions = {}
+    for line in cv2.getBuildInformation().splitlines():
+        match = re.match(r"\s*(avcodec|avformat|avutil|swscale):\s+(?:YES\s*)?\(?([0-9.]+)", line)
+        if match:
+            native_versions[match[1]] = match[2]
 
     fixture = _load_fixture()
     donor = Path(os.environ["K5_MEDIAMTX_DONOR_EXE"]).resolve(strict=True)
@@ -152,7 +188,20 @@ def main():
         "runtime_module_sha256": hashlib.sha256(Path(motion.__file__).read_bytes()).hexdigest(),
         "opencv": cv2.__version__,
         "numpy": numpy.__version__,
+        "opencv_distribution_version": package.version,
+        "requested_opencv_distribution_version": args.opencv_version,
+        "wheel_record_sha256": hashlib.sha256(wheel_record.encode()).hexdigest(),
+        "wheel_tags": [
+            line[5:] for line in wheel_metadata.splitlines() if line.startswith("Tag: ")
+        ],
+        "ffmpeg_library_versions": native_versions,
+        "capture_options_label": args.capture_options,
+        "capture_options": options,
+        "capture_options_applied": os.environ.get("OPENCV_FFMPEG_CAPTURE_OPTIONS", ""),
+        "capture_options_child_env_match": True,
+        "baseline_source_head": args.baseline_source_head,
         "observations": [],
+        "source_observations": [],
         "child_diagnostics": [],
         "native_stderr": [],
         "cleanup_complete": False,
@@ -260,7 +309,7 @@ def main():
                 return value
 
             motion._document = document
-            if args.candidate_module:
+            if args.candidate_module or args.untraced_only:
                 receipt["child_entrypoint_unchanged"] = True
                 receipt["motion_child_launches"] = 0
 
@@ -275,6 +324,10 @@ def main():
                             "k5vision.operator_motion_process",
                             "--child",
                         ]
+                        environment = kwargs.get("env") or os.environ
+                        receipt["capture_options_child_env_match"] &= (
+                            environment.get("OPENCV_FFMPEG_CAPTURE_OPTIONS", "") == options
+                        )
                     return original_popen(arguments, **kwargs)
 
                 subprocess.Popen = observe_popen
@@ -288,6 +341,29 @@ def main():
                 try:
                     with build_opener(ProxyHandler({})).open(request, timeout=1) as response:
                         value = json.loads(response.read(65536))
+                    detail = {
+                        "sample_number": len(receipt["observations"]),
+                        "ready": value.get("ready") is True,
+                        "inbound_bytes": value.get("inboundBytes", value.get("bytesReceived")),
+                        "outbound_bytes": value.get("outboundBytes", value.get("bytesSent")),
+                    }
+                    sessions_request = Request(
+                        f"http://127.0.0.1:{api}/v3/rtspsessions/list",
+                        headers={"Authorization": "Basic " + token},
+                    )
+                    with build_opener(ProxyHandler({})).open(
+                        sessions_request, timeout=1
+                    ) as response:
+                        sessions = json.loads(response.read(65536)).get("items", [])
+                    readers = [item for item in sessions if item.get("state") == "read"]
+                    detail["reader_transports"] = {
+                        transport: sum(item.get("transport") == transport for item in readers)
+                        for transport in ("TCP", "UDP")
+                    }
+                    detail["reader_outbound_bytes"] = sum(
+                        item.get("outboundBytes", item.get("bytesSent", 0)) for item in readers
+                    )
+                    receipt["source_observations"].append(detail)
                     return "ready" if value.get("ready") is True else "not_ready"
                 except (OSError, ValueError):
                     return "request_failed"
@@ -334,8 +410,9 @@ def main():
                 source_state=source_state,
                 publisher=generated,
             )
-            worker.close()
-            worker = None
+            if not args.untraced_only:
+                worker.close()
+                worker = None
 
             def traced_popen(arguments, **kwargs):
                 if arguments[1:] == [
@@ -357,7 +434,9 @@ def main():
                     ]
                 return original_popen(arguments, **kwargs)
 
-            if args.candidate_module:
+            if args.untraced_only:
+                receipt["scope"] = "original_worker_dependency_transport_matrix"
+            elif args.candidate_module:
                 if (
                     module_path
                     != (Path.cwd() / "src/k5vision/operator_motion_process.py").resolve()
@@ -453,6 +532,10 @@ def main():
                     cleanup = False
             subprocess.Popen = original_popen
             motion._document = original_document
+            if original_options is None:
+                os.environ.pop("OPENCV_FFMPEG_CAPTURE_OPTIONS", None)
+            else:
+                os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = original_options
             if source_swapped:
                 try:
                     receipt["candidate_source_unchanged_before_restore"] = (
@@ -497,6 +580,27 @@ def main():
                     if line.startswith(_MARKER):
                         receipt["child_diagnostics"].append(json.loads(line[len(_MARKER) :]))
             receipt["cleanup_complete"] = cleanup
+            receipt["runtime_module_sha256_after"] = hashlib.sha256(
+                module_path.read_bytes()
+            ).hexdigest()
+            receipt["runtime_module_unchanged"] = (
+                receipt["runtime_module_sha256_after"] == receipt["runtime_module_sha256"]
+            )
+            receipt["cleanup_complete"] &= receipt["runtime_module_unchanged"]
+            receipt["phase_summaries"] = {}
+            for name in dict.fromkeys(item["phase"] for item in receipt["observations"]):
+                rows = [item for item in receipt["observations"] if item["phase"] == name]
+                seen_ready, post_ready_refusals = False, 0
+                for item in rows:
+                    if item["outcome"] == "ready":
+                        seen_ready = True
+                    elif seen_ready:
+                        post_ready_refusals += 1
+                receipt["phase_summaries"][name] = {
+                    "samples": len(rows),
+                    "ready": sum(item["outcome"] == "ready" for item in rows),
+                    "post_ready_refusals": post_ready_refusals,
+                }
             args.output.parent.mkdir(parents=True, exist_ok=True)
             args.output.write_text(json.dumps(receipt, sort_keys=True) + "\n", encoding="utf-8")
     return 0 if receipt["status"] == "diagnostic_complete" and receipt["cleanup_complete"] else 1

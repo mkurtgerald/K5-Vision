@@ -169,94 +169,115 @@ jobs:
             nested-vm-provenance.json
           if-no-files-found: warn
           retention-days: 14
-  motion-worker-ab-diagnostic:
-    name: DIAGNOSTIC ONLY - original 333 versus pinned candidate child A/B
+  motion-capture-matrix:
+    name: DIAGNOSTIC ONLY - original 333 CV${{ matrix.opencv }} ${{ matrix.transport }}
     runs-on: windows-2025
-    timeout-minutes: 7
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        opencv: ["5.0.0.93", "4.12.0.88"]
+        transport: [default, tcp, tcp-nobuffer]
     env:
       K5_DESKTOP_HEAD_SHA: 333685876d8f5dfd65cc4dcafeb2b4a694393283
       K5_DIAGNOSTIC_HARNESS_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      K5_DIAGNOSTIC_OPENCV_VERSION: ${{ matrix.opencv }}
+      K5_DIAGNOSTIC_CAPTURE_OPTIONS: ${{ matrix.transport }}
     steps:
       - name: Checkout original immutable motion runtime and generated camera fixtures
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: 333685876d8f5dfd65cc4dcafeb2b4a694393283
           persist-credentials: false
-      - name: Checkout separately identified diagnostic worker probe
+      - name: Checkout separately identified dependency and transport diagnostic controller
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           path: diagnostic-source
           persist-credentials: false
-      - name: Admit exact diagnostic and candidate child Git blobs without checkout conversion
+      - name: Admit exact controller Git blob while preserving original worker source
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $harnessHead = (& git -C diagnostic-source rev-parse HEAD).Trim()
           & (Join-Path $env:SYSTEMROOT 'System32/cmd.exe') /d /c 'git -C diagnostic-source cat-file blob HEAD:scripts/probe_windows_motion_sampler.py > scripts/probe_windows_motion_sampler.py'
           $scriptSha = (Get-FileHash -LiteralPath scripts/probe_windows_motion_sampler.py -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($LASTEXITCODE -ne 0 -or $scriptSha -ne '36cf64b6d0b8240f8bc1b64ad56d1f489b4766d42e5b26e8c0177266a5b75ca0' -or
+          if ($LASTEXITCODE -ne 0 -or $scriptSha -ne 'aa995681ceca4fa28219213290e4063d9cb088cb498e9ab74b18bb962872f520' -or
               $harnessHead -ne $env:K5_DIAGNOSTIC_HARNESS_SHA -or $harnessHead -eq $env:K5_DESKTOP_HEAD_SHA) {
-            throw 'Diagnostic motion sampler source identity mismatch'
+            throw 'Dependency/transport diagnostic controller identity mismatch'
           }
-          # Keep the candidate outside the original source tree until the
-          # experiment closes its baseline worker and applies the overlay.
-          & (Join-Path $env:SYSTEMROOT 'System32/cmd.exe') /d /c 'git -C diagnostic-source cat-file blob HEAD:src/k5vision/operator_motion_process.py > motion-candidate-child-admitted.py'
-          $candidateSha = (Get-FileHash -LiteralPath motion-candidate-child-admitted.py -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($LASTEXITCODE -ne 0 -or $candidateSha -ne '4fbd5c75385e11b3545b7bbf5a0b309430353fa5ffb911902b2d1a647ccbc1ee') {
-            throw 'Diagnostic candidate child source identity mismatch'
-          }
+          git diff --exit-code -- src/k5vision/operator_motion_process.py
+          if ($LASTEXITCODE -ne 0) { throw 'Original motion worker source was modified' }
+          $workerSha = (Get-FileHash -LiteralPath src/k5vision/operator_motion_process.py -Algorithm SHA256).Hash.ToLowerInvariant()
+          $workerBlob = (& git rev-parse HEAD:src/k5vision/operator_motion_process.py).Trim()
+          "K5_DIAGNOSTIC_ORIGINAL_WORKER_SHA256=$workerSha" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
           @{ schema_version=1; diagnostic_only=$true; product_qualification=$false;
-             mixed_runtime_overlay=$true; baseline_runtime_head=$env:K5_DESKTOP_HEAD_SHA;
-             candidate_source_head=$harnessHead; candidate_module_sha256=$candidateSha;
-             harness_head=$harnessHead; script_sha256=$scriptSha } |
-            ConvertTo-Json | Set-Content -LiteralPath motion-sampler-provenance.json -Encoding utf8
-      - name: Set up native development Python for the diagnostic probe
+             source_head=$env:K5_DESKTOP_HEAD_SHA; harness_head=$harnessHead; script_sha256=$scriptSha;
+             original_worker_sha256=$workerSha; original_worker_git_blob=$workerBlob;
+             selected_opencv_distribution=$env:K5_DIAGNOSTIC_OPENCV_VERSION;
+             current_product_opencv_requirement='opencv-python-headless==5.0.0.93';
+             matches_current_product_cv_requirement=($env:K5_DIAGNOSTIC_OPENCV_VERSION -eq '5.0.0.93');
+             dependency_override=($env:K5_DIAGNOSTIC_OPENCV_VERSION -ne '5.0.0.93');
+             transport_profile=$env:K5_DIAGNOSTIC_CAPTURE_OPTIONS;
+             transport_override=($env:K5_DIAGNOSTIC_CAPTURE_OPTIONS -ne 'default') } |
+            ConvertTo-Json | Set-Content -LiteralPath motion-capture-provenance.json -Encoding utf8
+      - name: Set up native development Python for this isolated diagnostic variant
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: "3.12"
           cache: pip
-      - name: Install original development dependencies and the declared native CV5 stack
+      - name: Install the explicitly selected diagnostic CV dependency without changing product requirements
         shell: pwsh
         run: |
-          python -m pip install -e ".[dev]" "numpy==2.2.6" "opencv-python-headless==5.0.0.93"
-          if ($LASTEXITCODE -ne 0) { throw 'Diagnostic motion sampler dependencies unavailable' }
+          $ErrorActionPreference = 'Stop'
+          python -m pip install -e ".[dev]" "numpy==2.2.6" "opencv-python-headless==$env:K5_DIAGNOSTIC_OPENCV_VERSION"
+          if ($LASTEXITCODE -ne 0) { throw 'Diagnostic matrix dependency installation failed' }
+          python -c "import importlib.metadata as m, os, tomllib; d=tomllib.load(open('pyproject.toml','rb')); assert 'opencv-python-headless==5.0.0.93' in d['project']['optional-dependencies']['operator-analytics']; assert m.version('opencv-python-headless')==os.environ['K5_DIAGNOSTIC_OPENCV_VERSION']; assert m.version('numpy')=='2.2.6'"
+          if ($LASTEXITCODE -ne 0) { throw 'Selected diagnostic dependency or unchanged product requirement mismatch' }
       - name: Provision original pinned native RTSP and generated-video tools
         uses: ./.github/actions/provision-operator-tools
-      - name: Compare two real 120-sample workers with source-stop and restoration observations
-        # Prior 120-sample diagnostic took 117.8 seconds. This is twice the
-        # experiment; product request, capture and freshness budgets stay fixed.
-        timeout-minutes: 5
+      - name: Observe 120 original untraced worker samples and genuine source stop
+        timeout-minutes: 3
         shell: pwsh
         run: |
-          python scripts/probe_windows_motion_sampler.py --output native-motion-sampler.json --candidate-module motion-candidate-child-admitted.py --candidate-module-sha256 4fbd5c75385e11b3545b7bbf5a0b309430353fa5ffb911902b2d1a647ccbc1ee --baseline-source-head $env:K5_DESKTOP_HEAD_SHA --candidate-source-head $env:K5_DIAGNOSTIC_HARNESS_SHA
-          if ($LASTEXITCODE -ne 0) { throw 'Diagnostic motion sampler infrastructure or owned cleanup failed' }
+          $ErrorActionPreference = 'Stop'
+          python scripts/probe_windows_motion_sampler.py --untraced-only --opencv-version $env:K5_DIAGNOSTIC_OPENCV_VERSION --capture-options $env:K5_DIAGNOSTIC_CAPTURE_OPTIONS --baseline-source-head $env:K5_DESKTOP_HEAD_SHA --output native-motion-sampler.json
+          if ($LASTEXITCODE -ne 0) { throw 'Diagnostic capture matrix infrastructure or cleanup failed' }
           $evidence = Get-Content -LiteralPath native-motion-sampler.json -Raw | ConvertFrom-Json
+          $workerSha = (Get-FileHash -LiteralPath src/k5vision/operator_motion_process.py -Algorithm SHA256).Hash.ToLowerInvariant()
+          $optionProfiles = @{ 'default'=''; 'tcp'='rtsp_transport;tcp'; 'tcp-nobuffer'='rtsp_transport;tcp|fflags;nobuffer' }
+          $expectedOptions = $optionProfiles[$env:K5_DIAGNOSTIC_CAPTURE_OPTIONS]
           if ($evidence.schema_version -ne 1 -or $evidence.status -ne 'diagnostic_complete' -or
-              $evidence.diagnostic_only -ne $true -or $evidence.cleanup_complete -ne $true) {
-            throw 'Diagnostic motion sampler did not complete its observation'
-          }
-          if ($evidence.scope -ne 'diagnostic_mixed_candidate_child_with_unchanged_baseline_parent' -or
+              $evidence.diagnostic_only -ne $true -or $evidence.cleanup_complete -ne $true -or
+              $evidence.scope -ne 'original_worker_dependency_transport_matrix' -or
               $evidence.baseline_source_head -ne $env:K5_DESKTOP_HEAD_SHA -or
-              $evidence.candidate_source_head -ne $env:K5_DIAGNOSTIC_HARNESS_SHA -or
-              $evidence.candidate_module_sha256 -ne '4fbd5c75385e11b3545b7bbf5a0b309430353fa5ffb911902b2d1a647ccbc1ee' -or
-              $evidence.child_entrypoint_unchanged -ne $true -or $evidence.motion_child_launches -lt 2 -or
-              $evidence.candidate_source_unchanged_before_restore -ne $true -or
-              $evidence.original_module_restored -ne $true -or
+              $evidence.requested_opencv_distribution_version -ne $env:K5_DIAGNOSTIC_OPENCV_VERSION -or
+              $evidence.opencv_distribution_version -ne $env:K5_DIAGNOSTIC_OPENCV_VERSION -or
+              $evidence.capture_options_label -ne $env:K5_DIAGNOSTIC_CAPTURE_OPTIONS -or
+              $evidence.capture_options -ne $expectedOptions -or $evidence.capture_options_applied -ne $expectedOptions -or
+              $evidence.capture_options_child_env_match -ne $true -or
+              $evidence.wheel_record_sha256 -notmatch '^[a-f0-9]{64}$' -or
+              $evidence.runtime_module_sha256 -ne $env:K5_DIAGNOSTIC_ORIGINAL_WORKER_SHA256 -or
+              $evidence.runtime_module_sha256_after -ne $env:K5_DIAGNOSTIC_ORIGINAL_WORKER_SHA256 -or
+              $evidence.runtime_module_unchanged -ne $true -or
+              $workerSha -ne $env:K5_DIAGNOSTIC_ORIGINAL_WORKER_SHA256 -or
+              $evidence.child_entrypoint_unchanged -ne $true -or $evidence.motion_child_launches -lt 1 -or
               @($evidence.observations | Where-Object { $_.phase -eq 'quiet_live' }).Count -ne 120 -or
-              @($evidence.observations | Where-Object { $_.phase -eq 'candidate_quiet_live' }).Count -ne 120 -or
               @($evidence.observations | Where-Object { $_.phase -eq 'source_stopped' }).Count -ne 3 -or
-              @($evidence.observations | Where-Object { $_.phase -eq 'traced_quiet_live' }).Count -ne 0) {
-            throw 'Diagnostic A/B source, entrypoint, observations or restoration scope mismatch'
+              @($evidence.observations | Where-Object { $_.phase -in @('candidate_quiet_live', 'traced_quiet_live') }).Count -ne 0) {
+            throw 'Diagnostic dependency/transport matrix scope or original worker identity mismatch'
           }
-      - name: Retain diagnostic-only motion samples without qualification or promotion
+          git diff --exit-code -- src/k5vision/operator_motion_process.py
+          if ($LASTEXITCODE -ne 0) { throw 'Diagnostic matrix changed original product worker source' }
+      - name: Retain only explicitly scoped dependency and transport diagnostic observations
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
-          name: diagnostic-only-motion-worker-ab-${{ github.run_id }}-${{ github.run_attempt }}
+          name: diagnostic-only-motion-cv-${{ matrix.opencv }}-${{ matrix.transport }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             native-motion-sampler.json
-            motion-sampler-provenance.json
+            motion-capture-provenance.json
           if-no-files-found: warn
           retention-days: 14
   installed-diagnostic:
