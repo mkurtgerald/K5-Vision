@@ -10,13 +10,14 @@ if ($config.schema_version -ne 1 -or [guid]::Parse($config.transfer_id).ToString
 $transfer = [string]$config.transfer_id
 $systemSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 $guestWitnessSession=[Diagnostics.Process]::GetCurrentProcess().SessionId
-if($Mode -ceq 'Setup'){
+$guestWitnessAdmitted=($systemSid -ceq 'S-1-5-18' -and (($Mode -eq 'Setup' -and $guestWitnessSession -in @(0,1)) -or ($Mode -eq 'Observe' -and $guestWitnessSession -eq 0)))
+if($Mode -eq 'Setup'){
     # Diagnostic context only, before admission/native compilation. Windows
     # Setup may use a different session; observer proof remains SYSTEM/session0.
-    $entry=@{schema_version=1;phase='setup_entry';stage='setup_admission';status='context_captured';configuration_valid=$true;system_account_verified=($systemSid -ceq 'S-1-5-18');observer_session=$guestWitnessSession;setup_session_admitted=($systemSid -ceq 'S-1-5-18' -and $guestWitnessSession -eq 0)}
+    $entry=@{schema_version=1;phase='setup_entry';stage='setup_admission';status='context_captured';configuration_valid=$true;system_account_verified=($systemSid -ceq 'S-1-5-18');observer_session=$guestWitnessSession;setup_session_admitted=$guestWitnessAdmitted}
     [IO.File]::WriteAllText((Join-Path $root 'setup-entry.json'),($entry|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))
 }
-if ($systemSid -ne 'S-1-5-18' -or $guestWitnessSession -ne 0) { exit 2 }
+if (-not $guestWitnessAdmitted) { exit 2 }
 
 Add-Type -TypeDefinition @'
 using System;
@@ -146,29 +147,40 @@ function Interactive-LogonsSince([datetime]$Since) {
 }
 
 if ($Mode -eq 'Setup') {
+    $setupStage='installer'
     try {
         $setup = Join-Path $root 'K5VisionSetup.exe'
         if ((Get-FileHash -LiteralPath $setup -Algorithm SHA256).Hash.ToLowerInvariant() -cne $config.setup_sha256) { throw 'Setup identity differs' }
         $installed = Start-Process -FilePath $setup -ArgumentList @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/SP-') -PassThru
         if (-not $installed.WaitForExit(180000) -or $installed.ExitCode -ne 0) { throw 'Setup did not finish' }
+        $setupStage='logon_audit'
         & (Join-Path $env:SystemRoot 'System32\auditpol.exe') /set '/subcategory:{0CCE9215-69AE-11D9-BED3-505054503030}' /success:enable /failure:enable | Out-Null
         if ($LASTEXITCODE -ne 0 -or -not [K5GuestNative]::LogonAuditEnabled()) { throw 'Logon audit unavailable' }
+        $setupStage='kvp_service'
         Set-Service -Name vmickvpexchange -StartupType Automatic
         Start-Service -Name vmickvpexchange
+        $setupStage='guest_network'
         $adapter = @(Get-NetAdapter | Where-Object { $_.MacAddress.Replace('-','') -ceq $config.guest_mac })
         if ($adapter.Count -ne 1) { throw 'Owned guest adapter unavailable' }
         New-NetIPAddress -InterfaceIndex $adapter[0].ifIndex -IPAddress $config.guest_ip -PrefixLength 30 -AddressFamily IPv4 | Out-Null
+        $setupStage='register_observer'
         $observerAction = New-ScheduledTaskAction -Execute (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') -Argument '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File C:\K5GuestWitness\windows_guest_witness.ps1 -Mode Observe'
         $system = New-ScheduledTaskPrincipal -UserId SYSTEM -LogonType ServiceAccount -RunLevel Highest
         $observerName = 'K5GuestWitness-' + $transfer
         Register-ScheduledTask -TaskName $observerName -Action $observerAction -Trigger (New-ScheduledTaskTrigger -AtStartup) -Principal $system -Force | Out-Null
+        $setupStage='register_bootstrap'
         $bootstrap = New-ScheduledTaskAction -Execute (Join-Path $root 'windows_guest_bootstrap.exe') -WorkingDirectory $root
         $admin = New-ScheduledTaskPrincipal -UserId Administrator -LogonType Interactive -RunLevel Highest
         Register-ScheduledTask -TaskName ('K5GuestBootstrap-' + $transfer) -Action $bootstrap -Trigger (New-ScheduledTaskTrigger -AtLogOn -User Administrator) -Principal $admin -Force | Out-Null
+        $setupStage='start_observer'
         Start-ScheduledTask -TaskName $observerName
         exit 0
     } catch {
-        $failure = @{schema_version=1; phase='setup'; transfer_id=$transfer; status='failed'; error_kind=$_.Exception.GetType().Name; hresult=$_.Exception.HResult}
+        $failure = @{schema_version=1; phase='setup'; transfer_id=$transfer; status='failed';failure_stage=$setupStage; error_kind=$_.Exception.GetType().Name; hresult=$_.Exception.HResult}
+        $setupError=$_.Exception
+        for($depth=0;$null -ne $setupError -and $depth -lt 8;$depth++){
+            if($setupError -is [ComponentModel.Win32Exception]){$failure.native_code=$setupError.NativeErrorCode;break};$setupError=$setupError.InnerException
+        }
         $hash = Write-PrivateJson 'setup-failure.json' $failure
         Publish-Seal 'failed' ([K5GuestNative]::BootId()) $hash
         exit 1

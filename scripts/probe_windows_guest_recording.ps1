@@ -433,7 +433,7 @@ function Read-BootFailureOffline {
             if($info.Length -gt 65536 -or ($info.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0){continue}
             try{
                 $parsed=Get-Content -LiteralPath $path -Raw|ConvertFrom-Json;$safe=@{}
-                foreach($field in @('status','phase','stage','failure_stage','error_kind','failure_type','hresult','failure_hresult','http_status','mfa_enabled_before_reboot','mfa_confirmed_via_normal_api','gui_admin_setup','camera_source_enrolled','service_running','gui_client_closed','cleanup_credentials_removed','configuration_valid','system_account_verified','observer_session','setup_session_admitted')){
+                foreach($field in @('status','phase','stage','failure_stage','error_kind','failure_type','hresult','failure_hresult','native_code','http_status','mfa_enabled_before_reboot','mfa_confirmed_via_normal_api','gui_admin_setup','camera_source_enrolled','service_running','gui_client_closed','cleanup_credentials_removed','configuration_valid','system_account_verified','observer_session','setup_session_admitted')){
                     $property=$parsed.PSObject.Properties[$field]
                     if($null -eq $property){continue};$value=$property.Value
                     if($value -is [bool] -or $value -is [int] -or $value -is [long]){$safe[$field]=$value}
