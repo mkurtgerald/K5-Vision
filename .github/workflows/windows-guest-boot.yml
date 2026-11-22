@@ -67,15 +67,15 @@ jobs:
     if: github.event_name == 'push' || inputs.scope == 'recording' || inputs.scope == 'planned-restart-recording' || inputs.scope == 'bootstrap-observation'
     # Branch pushes diagnose initialization for four minutes. A manual recording
     # dispatch retains the original complete qualification criteria and budgets.
-    name: ${{ (github.event_name == 'push' || inputs.scope == 'bootstrap-observation') && 'DIAGNOSTIC ONLY - 4-minute Windows initialization observation (no qualification)' || (inputs.scope == 'planned-restart-recording' && 'DIAGNOSTIC ONLY - actual 3a38437b planned guest shutdown/start and sign-out recording' || 'DIAGNOSTIC ONLY - actual 3a38437b hard-reset guest reboot and sign-out recording') }}
+    name: ${{ (github.event_name == 'push' || inputs.scope == 'bootstrap-observation') && 'DIAGNOSTIC ONLY - 4-minute Windows initialization observation (no qualification)' || (inputs.scope == 'planned-restart-recording' && 'DIAGNOSTIC ONLY - actual 68d009d7 planned guest shutdown/start and sign-out recording' || 'DIAGNOSTIC ONLY - actual 68d009d7 hard-reset guest reboot and sign-out recording') }}
     runs-on: windows-2025
     timeout-minutes: 38
     permissions:
       contents: read
       actions: read
     env:
-      K5_GUEST_PRODUCT_HEAD: 3a38437be705d53f42a98586c559c3b972390688
-      K5_GUEST_SETUP_SHA256: bfa041494d0ae8ad1cbc9c2ea76c4ad0ec480f121bd98f0647f439589e2c4a82
+      K5_GUEST_PRODUCT_HEAD: 68d009d7be8e94611da3c27d9e81bc79a8c98724
+      K5_GUEST_SETUP_SHA256: b2dcf13e6d358f3f5fc70671a806f97404431b4591643f49cec438d79a54a126
       K5_GUEST_REBOOT_OPERATION: ${{ inputs.scope == 'planned-restart-recording' && 'planned-shutdown-start' || 'hard-reset' }}
       K5_GUEST_BOOTSTRAP_OBSERVATION: ${{ (github.event_name == 'push' || inputs.scope == 'bootstrap-observation') && 'true' || 'false' }}
     steps:
@@ -102,7 +102,7 @@ jobs:
               if (@($errors).Count) { throw 'Guest controller source did not parse' }
             }
           }
-          if ($sourceHashes['windows_guest_witness.ps1'] -ne '387f5ef4300a1726d0a1d2a623cd4f326fbb6d3c562f715965532be112ab4d22') { throw 'Native guest witness Git blob differs' }
+          if ($sourceHashes['windows_guest_witness.ps1'] -ne 'a01e1fdbaf35d0483fa8134cb2a6082797b2e43421e3e9f6b5cf42ff39babf93') { throw 'Native guest witness Git blob differs' }
           if ($sourceHashes['windows_guest_bootstrap.cs'] -ne 'b8ef1a885d876d0a66833b3350221bd66794f972843e418815628278b9163909' -or
               $sourceHashes['windows_guest_bootstrap_controls.cs'] -ne '4757e92ab04d387d9d04f0572949c1224dbfa2f25222cb5680290577ec30c837') { throw 'Guest GUI bootstrap controls source differs' }
           if ($sourceHashes['windows_guest_boot_sequence_controls.ps1'] -ne '84204b182165214c3cf46558ff812c87892b6213a0529d7641a2ea3606cb48c0') { throw 'Native boot sequence controls source differs' }
@@ -164,7 +164,7 @@ jobs:
             image_sha256='2d175924c8e647969a82e36f931b22397108bd94a030e0e947b7e66e47e0be9a';
             source_hashes=$sourceHashes; native_boot_sequence_read=$counter; reboot_operation=$env:K5_GUEST_REBOOT_OPERATION; run_id=$env:GITHUB_RUN_ID; run_attempt=$env:GITHUB_RUN_ATTEMPT} |
             ConvertTo-Json -Depth 5 | Set-Content -LiteralPath windows-guest-recording-provenance.json -Encoding utf8
-      - name: Admit the exact 3a38437b GUI producer and its unqualified candidate
+      - name: Admit the exact 68d009d7 GUI producer and its unqualified candidate
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -172,13 +172,13 @@ jobs:
           $ErrorActionPreference='Stop'
           $headers=@{Authorization="Bearer $env:GH_TOKEN";Accept='application/vnd.github+json';'X-GitHub-Api-Version'='2022-11-28'}
           $api="https://api.github.com/repos/$env:GITHUB_REPOSITORY/actions"
-          $meta=Invoke-RestMethod -Uri "$api/artifacts/14747880070" -Headers $headers
-          $attempt=Invoke-RestMethod -Uri "$api/runs/45004355109/attempts/1" -Headers $headers
-          $jobs=Invoke-RestMethod -Uri "$api/runs/45004355109/attempts/1/jobs?per_page=100" -Headers $headers
-          $producer=@($jobs.jobs | Where-Object { $_.id -eq 137152513237 })
-          if ($meta.id -ne 14747880070 -or $meta.expired -ne $false -or
-              $meta.digest -ne 'sha256:814e889c44ea2a60251e823604b2b8c901e72ab374f0d23a1d926c7a9df4ba30' -or
-              $meta.size_in_bytes -ne 285148944 -or $meta.workflow_run.id -ne 45004355109 -or
+          $meta=Invoke-RestMethod -Uri "$api/artifacts/14748028663" -Headers $headers
+          $attempt=Invoke-RestMethod -Uri "$api/runs/45006604063/attempts/1" -Headers $headers
+          $jobs=Invoke-RestMethod -Uri "$api/runs/45006604063/attempts/1/jobs?per_page=100" -Headers $headers
+          $producer=@($jobs.jobs | Where-Object { $_.id -eq 137159494480 })
+          if ($meta.id -ne 14748028663 -or $meta.expired -ne $false -or
+              $meta.digest -ne 'sha256:9fd44e087ed4aa63bb39b5930c63cdc59ba23636121003e917fae1dba48bf9f3' -or
+              $meta.size_in_bytes -ne 285149185 -or $meta.workflow_run.id -ne 45006604063 -or
               $meta.workflow_run.head_sha -ne $env:K5_GUEST_PRODUCT_HEAD -or
               $attempt.run_attempt -ne 1 -or $attempt.head_sha -ne $env:K5_GUEST_PRODUCT_HEAD -or
               $producer.Count -ne 1 -or $producer[0].conclusion -ne 'success') {
@@ -187,9 +187,9 @@ jobs:
       - name: Download the fixed original installer artifact without rebuilding it
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:
-          artifact-ids: 14747880070
+          artifact-ids: 14748028663
           github-token: ${{ github.token }}
-          run-id: 45004355109
+          run-id: 45006604063
           path: guest-product-input
           merge-multiple: true
       - name: Bind original installer, package and manifest bytes
@@ -200,13 +200,13 @@ jobs:
           $manifest=Get-Content -LiteralPath guest-product-input/payload-manifest.json -Raw | ConvertFrom-Json
           $setup=Get-Item -LiteralPath guest-product-input/K5VisionSetup.exe
           $sha=(Get-FileHash -LiteralPath $setup.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($sha -ne $env:K5_GUEST_SETUP_SHA256 -or $setup.Length -ne 286587062 -or
+          if ($sha -ne $env:K5_GUEST_SETUP_SHA256 -or $setup.Length -ne 286587345 -or
               $package.setup_sha256 -ne $sha -or $package.setup_bytes -ne $setup.Length -or
-              $package.qualification_status -ne 'unqualified' -or $package.run_id -ne 45004355109 -or
+              $package.qualification_status -ne 'unqualified' -or $package.run_id -ne 45006604063 -or
               $package.run_attempt -ne 1 -or $package.head_sha -ne $env:K5_GUEST_PRODUCT_HEAD -or
               $manifest.head_sha -ne $env:K5_GUEST_PRODUCT_HEAD -or
-              (Get-FileHash -LiteralPath guest-product-input/desktop-package.json -Algorithm SHA256).Hash.ToLowerInvariant() -ne '3a02b62f725cad888e62ddc3f8ea24091fd8d9ef0cdd36760d970d7d8f692ec3' -or
-              (Get-FileHash -LiteralPath guest-product-input/payload-manifest.json -Algorithm SHA256).Hash.ToLowerInvariant() -ne '92a05ba05fa988a0a662f3d9a56ebc4586f877ce61fa253450c0022ac3681e3f' -or
+              (Get-FileHash -LiteralPath guest-product-input/desktop-package.json -Algorithm SHA256).Hash.ToLowerInvariant() -ne 'c5592ac84463a201facfd52af9d357bc33e98deca0266f5e7f791a36b6bdc93d' -or
+              (Get-FileHash -LiteralPath guest-product-input/payload-manifest.json -Algorithm SHA256).Hash.ToLowerInvariant() -ne 'b33cce05f10d418c79f3da8b9f63a6cc63b9714d68f8829a5ba641b39729b47b' -or
               $package.payload_manifest_sha256 -ne (Get-FileHash -LiteralPath guest-product-input/payload-manifest.json -Algorithm SHA256).Hash.ToLowerInvariant() -or
               $manifest.files.path -notcontains 'K5VisionRecorder.exe' -or
               $manifest.files.path -notcontains 'K5VisionRecorder.xml') { throw 'Original guest candidate bytes differ' }

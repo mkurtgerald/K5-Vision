@@ -403,6 +403,10 @@ function Set-PlannedFinalOffBoundary($Initial){
             if($count -gt 0){$range=@(Get-WinEvent -Path $log -FilterXPath ('*[System[EventRecordID>{0} and EventRecordID<={1}]]' -f [long]$original.record_id,[long]$tail[0].RecordId) -Oldest -MaxEvents 4097 -ErrorAction Stop)}
             if($range.Count -ne $count){throw 'Planned pre-Off range gap'}
             [long]$expected=[long]$original.record_id+1
+            # These events were present while the exact owned VM was Off.
+            # Record old-boot auth honestly; the strict new-boot window begins
+            # after the separately retained final-Off tail, never at4608/UTC.
+            [int]$preOffInteractive=0
             foreach($event in $range){
                 Planned-BoundaryGuard
                 if([long]$event.RecordId -ne $expected){throw 'Planned pre-Off record order changed'};$expected++
@@ -410,10 +414,10 @@ function Set-PlannedFinalOffBoundary($Initial){
                 if($event.Id -eq 4624){
                     [xml]$xml=$event.ToXml();$types=@($xml.Event.EventData.Data|Where-Object{$_.Name -ceq 'LogonType'})
                     if($types.Count -ne 1 -or [string]$types[0].'#text' -notmatch '^\d{1,2}$'){throw 'Planned pre-Off logon type unavailable'}
-                    if([string]$types[0].'#text' -in @('2','7','10','11','12','13')){throw 'Planned pre-Off interactive logon observed'}
+                    if([string]$types[0].'#text' -in @('2','7','10','11','12','13')){$preOffInteractive++}
                 }
             }
-            $checkpoint=@{schema_version=1;phase='reboot';reboot_operation='planned-shutdown-start';harness_head=$configuration.harness_head;witness_sha256=$configuration.witness_sha256;image_sha256=$imageSha;owned_vm_id=$vmId.ToString();transfer_id=$transfer;head_sha=$ProductHead;setup_sha256=$SetupSha256;boot_id=$Initial.boot_id;boot_sequence=[long]$Initial.boot_sequence;baseline_sha256=$Initial.baseline_sha256;record_id=[long]$tail[0].RecordId;oldest_record_id=[long]$oldest[0].RecordId;xml_sha256=(Text-Digest $tail[0].ToXml());original_record_id=[long]$original.record_id;original_oldest_record_id=[long]$original.oldest_record_id;original_xml_sha256=$original.xml_sha256;pre_off_original_checkpoint_retained=$true;pre_off_range_contiguous=$true;pre_off_interactive_logons=0;pre_off_loss_or_policy_events=0}
+            $checkpoint=@{schema_version=1;phase='reboot';reboot_operation='planned-shutdown-start';harness_head=$configuration.harness_head;witness_sha256=$configuration.witness_sha256;image_sha256=$imageSha;owned_vm_id=$vmId.ToString();transfer_id=$transfer;head_sha=$ProductHead;setup_sha256=$SetupSha256;boot_id=$Initial.boot_id;boot_sequence=[long]$Initial.boot_sequence;baseline_sha256=$Initial.baseline_sha256;record_id=[long]$tail[0].RecordId;oldest_record_id=[long]$oldest[0].RecordId;xml_sha256=(Text-Digest $tail[0].ToXml());original_record_id=[long]$original.record_id;original_oldest_record_id=[long]$original.oldest_record_id;original_xml_sha256=$original.xml_sha256;pre_off_original_checkpoint_retained=$true;pre_off_range_contiguous=$true;pre_off_interactive_logons=$preOffInteractive;pre_off_loss_or_policy_events=0}
             if([K5GuestFileIdentity]::Read($log) -cne $logIdentity -or (File-Digest $log) -cne $logHash){throw 'Planned read-only Security log changed'}
             return @{custody=$custody;checkpoint=$checkpoint;log_identity=$logIdentity;log_sha256=$logHash}
         }finally{foreach($event in (@($oldest)+@($tail)+@($anchor)+@($range))){if($event -is [IDisposable]){$event.Dispose()}}}
@@ -1335,7 +1339,6 @@ try{
         'Planned original baseline scope differs'='planned_original_baseline_scope_differs'
         'Planned original checkpoint not retained'='planned_original_checkpoint_not_retained'
         'Planned pre-Off audit continuity lost'='planned_pre_off_audit_continuity_lost'
-        'Planned pre-Off interactive logon observed'='planned_pre_off_interactive_logon_observed'
         'Planned pre-Off log reset or wrap'='planned_pre_off_log_reset_or_wrap'
         'Planned pre-Off logon type unavailable'='planned_pre_off_logon_type_unavailable'
         'Planned pre-Off range bound exceeded'='planned_pre_off_range_bound_exceeded'
