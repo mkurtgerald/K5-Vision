@@ -42,7 +42,7 @@ concurrency:
 
 jobs:
   legacy-profiles:
-    name: Verify actual native legacy marker arrays and strict validation
+    name: Verify native legacy markers and service readiness protocol
     runs-on: windows-2025
     timeout-minutes: 5
     steps:
@@ -51,12 +51,18 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
+      - name: Checkout exact historical bridge for causal runtime refusal
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: 0bc10f5aacaa45903b33d9f2dfb23c9d8d197868
+          path: native-bridge-baseline
+          persist-credentials: false
       - name: Use the exact packaged Python version
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: "3.12.10"
           architecture: x64
-      - name: Compile and exercise actual Framework marker validation
+      - name: Compile actual constructor context and Receive baseline and candidate
         shell: pwsh
         timeout-minutes: 2
         env:

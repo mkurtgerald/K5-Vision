@@ -987,6 +987,7 @@ namespace K5VisionDesktop
         private int lines;
         private int progressLines;
         private readonly bool persistent;
+        private readonly bool serviceStatus;
         internal volatile bool PreparingRecordings;
         internal volatile int RecordingsProgress;
 
@@ -994,6 +995,10 @@ namespace K5VisionDesktop
             bool serviceWorker = false)
         {
             this.persistent = persistent;
+            serviceStatus = serviceWorker && !persistent && request != null && request.Count == 2 &&
+                request.ContainsKey("schema_version") && request["schema_version"] is int &&
+                (int)request["schema_version"] == 1 && request.ContainsKey("operation") &&
+                Object.Equals(request["operation"], "status");
             ProcessStartInfo start = new ProcessStartInfo(Path.Combine(root, "runtime", "python.exe"),
                 serviceWorker ? "-I -B -m k5vision.service_setup" : "-I -B -m k5vision.desktop_setup");
             start.WorkingDirectory = root;
@@ -1052,8 +1057,14 @@ namespace K5VisionDesktop
                         return;
                     }
                     if (++lines > 2) throw new InvalidOperationException();
+                    bool migrationRequired = serviceStatus && response.Count == 3 &&
+                        response.ContainsKey("schema_version") && response["schema_version"] is int &&
+                        (int)response["schema_version"] == 1 && response.ContainsKey("status") &&
+                        Object.Equals(response["status"], "migration_required") &&
+                        response.ContainsKey("reason") && Object.Equals(response["reason"], "legacy_upgrade_required");
                     if (Convert.ToInt32(response["schema_version"]) != 1 ||
-                        !new[] { "ready", "new", "refused", "running", "stopped" }.Contains((string)response["status"]))
+                        !(new[] { "ready", "new", "refused", "running", "stopped" }.Contains((string)response["status"]) ||
+                          migrationRequired))
                         throw new InvalidOperationException();
                     outcome = response;
                     if ((string)response["status"] == "running") Running.Set();

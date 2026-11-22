@@ -34,6 +34,9 @@ def test_native_regression_binds_each_actual_source_and_preserves_validation(sou
     assert "Custody.AdmitMigrationData" not in generated
     assert not binding["filesystem_and_acl_admission_exercised"]
     assert not binding["product_modified"] and not binding["profile_or_service_written"]
+    assert not binding["bridge_process_launch_exercised"]
+    assert "ProcessStartInfo start =" not in generated
+    assert "serviceStatus = serviceWorker && !persistent" in generated
 
 
 def test_native_extractor_ignores_braces_inside_strings_characters_and_comments():
@@ -82,5 +85,25 @@ def test_native_probe_refuses_linked_source_files(source_checkout):
     alternate = path.with_name("linked-source.cs")
     path.rename(alternate)
     path.symlink_to(alternate)
+    with pytest.raises(ValueError):
+        PROBE["materialize"](source_checkout)
+
+
+@pytest.mark.parametrize("failure", ["duplicate_receive", "ambiguous_constructor"])
+def test_bridge_regression_requires_actual_unambiguous_context_and_receive(
+    source_checkout, failure
+):
+    path = source_checkout / "windows/desktop/K5Vision.cs"
+    text = path.read_text()
+    if failure == "duplicate_receive":
+        receive = PROBE["_extract"](
+            text, "private void Receive(object sender, DataReceivedEventArgs args)"
+        )
+        text = text.replace(receive, receive + "\n" + receive)
+    else:
+        text = text.replace(
+            "ProcessStartInfo start =", "ProcessStartInfo start = ProcessStartInfo start ="
+        )
+    path.write_text(text)
     with pytest.raises(ValueError):
         PROBE["materialize"](source_checkout)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 from hashlib import sha256
 from pathlib import Path
 from zipfile import ZipFile
@@ -89,3 +90,43 @@ def test_installed_fixture_refuses_changed_retained_notice_archive(tmp_path, mon
     retained.write_bytes(b"Changed provenance")
     with pytest.raises(pytest.fail.Exception, match="notice archive identity was refused"):
         HELPERS._verify_installed_workers(runtime, wheel)
+
+
+INSTALL_SOURCE = SOURCE.with_name("test_windows_operator_install.py")
+INSTALL_SPEC = importlib.util.spec_from_file_location("installed_notice_fixture", INSTALL_SOURCE)
+assert INSTALL_SPEC and INSTALL_SPEC.loader
+INSTALL_HELPERS = importlib.util.module_from_spec(INSTALL_SPEC)
+INSTALL_SPEC.loader.exec_module(INSTALL_HELPERS)
+
+
+def installed_seed(tmp_path, monkeypatch, *, changed=False, missing=False):
+    runtime, tools, wheel, workers = inputs(tmp_path, monkeypatch)
+    # The installed lifecycle helper creates this directory itself.
+    (runtime / "tools").rmdir()
+    for name, supplied in workers.items():
+        monkeypatch.setenv("K5_" + name.upper() + "_DONOR_EXE", str(supplied))
+    if changed:
+        (tools / "mediamtx.zip").write_bytes(b"Changed provenance")
+    if missing:
+        (tools / "mediamtx.zip").unlink()
+    # Windows private ACLs are exercised by the native journey; use equivalent
+    # owner-only creation in this portable, actual fixture-function control.
+    previous_umask = os.umask(0o077)
+    try:
+        INSTALL_HELPERS._cache_workers(runtime, wheel)
+    finally:
+        os.umask(previous_umask)
+    return runtime, tools, wheel
+
+
+def test_installed_lifecycle_seed_retains_complete_notice_archive(tmp_path, monkeypatch):
+    runtime, tools, wheel = installed_seed(tmp_path, monkeypatch)
+    retained = runtime / "tools/MediaMTX/v1.21.2-k5-monotonic1/upstream-notices-and-provenance.zip"
+    assert retained.read_bytes() == (tools / "mediamtx.zip").read_bytes()
+    HELPERS._verify_installed_workers(runtime, wheel)
+
+
+@pytest.mark.parametrize("case", ["changed", "missing"])
+def test_installed_lifecycle_seed_refuses_unadmitted_notice_archive(tmp_path, monkeypatch, case):
+    with pytest.raises(pytest.fail.Exception, match="notice archive identity was refused"):
+        installed_seed(tmp_path, monkeypatch, **{case: True})

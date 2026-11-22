@@ -47,7 +47,7 @@ def _extract(text, anchor):
     raise ValueError("Native source block is incomplete")
 
 
-def materialize(root):
+def materialize(root, *, bridge_source=None):
     """Compile current source bodies; never reproduce their admission policy."""
     sources = {}
     for name in _SOURCE_FILES:
@@ -60,6 +60,21 @@ def materialize(root):
         sources[_SOURCE_FILES[1]], "private static HashSet<string> Owners(string data)"
     )
     mark = _extract(sources[_SOURCE_FILES[2]], "private static void MarkLegacyProfiles()")
+    bridge_source = sources[_SOURCE_FILES[0]] if bridge_source is None else bridge_source
+    bridge = _extract(bridge_source, "internal sealed class Bridge : IDisposable")
+    constructor = _extract(bridge, "internal Bridge(")
+    if constructor.count("ProcessStartInfo start =") != 1:
+        raise ValueError("Native bridge constructor context is ambiguous")
+    fields = bridge[bridge.index("{") + 1 : bridge.index("internal Bridge(")].strip()
+    context = constructor[
+        constructor.index("{") + 1 : constructor.index("ProcessStartInfo start =")
+    ].strip()
+    receive = _extract(bridge, "private void Receive(object sender, DataReceivedEventArgs args)")
+    fixture = (
+        _BRIDGE.replace("@@FIELDS@@", fields)
+        .replace("@@CONTEXT@@", context)
+        .replace("@@RECEIVE@@", receive)
+    )
     anchor = (
         "Dictionary<string, object> value = Json.Parse(File.ReadAllText(marker, Encoding.UTF8));"
     )
@@ -78,6 +93,7 @@ def materialize(root):
         raise ValueError("Native existing-marker traversal is ambiguous")
     generated = (
         _CS.replace("@@JSON@@", parser)
+        .replace("@@BRIDGE@@", fixture)
         .replace("@@VALIDATION@@", validation)
         .replace("@@TRAVERSAL@@", traversal[0])
     )
@@ -91,20 +107,164 @@ def materialize(root):
         "validation_sha256": _digest(validation),
         "traversal_sha256": _digest(traversal[0]),
         "compiled_probe_sha256": _digest(generated),
+        "bridge_source_sha256": _digest(bridge_source),
+        "bridge_fields_sha256": _digest(fields),
+        "bridge_context_sha256": _digest(context),
+        "bridge_receive_sha256": _digest(receive),
+        "bridge_process_launch_exercised": False,
         "filesystem_and_acl_admission_exercised": False,
         "product_modified": False,
         "profile_or_service_written": False,
     }
 
 
+_BRIDGE = r"""
+internal sealed class BridgeFixture {
+    @@FIELDS@@
+    internal BridgeFixture(string root, Dictionary<string, object> request, object job,
+        bool persistent, bool serviceWorker = false) {
+        @@CONTEXT@@
+        Process = null; // The fixture never launches or owns a product process.
+    }
+    @@RECEIVE@@
+    internal void Feed(string text) {
+        ConstructorInfo constructor = typeof(DataReceivedEventArgs).GetConstructor(
+            BindingFlags.Instance | BindingFlags.NonPublic, null, new[] { typeof(string) }, null);
+        if (constructor == null) throw new InvalidOperationException();
+        Receive(null, (DataReceivedEventArgs)constructor.Invoke(new object[] { text }));
+    }
+    internal bool Admitted { get { return !InvalidOutput && outcome != null; } }
+}
+internal static class BridgeCases {
+    private const string Migration = "{\"schema_version\":1,\"status\":\"migration_required\"," +
+        "\"reason\":\"legacy_upgrade_required\"}";
+    private static Dictionary<string, object> Request(string operation) {
+        return new Dictionary<string, object> { {"schema_version", 1}, {"operation", operation} };
+    }
+    private static string Response(string status) {
+        return Json.Serializer.Serialize(new Dictionary<string, object> {
+            {"schema_version", 1}, {"status", status} });
+    }
+    private static string Progress(int value) {
+        return "{\"schema_version\":1,\"status\":\"preparing_recordings\",\"progress\":" +
+            value + "}";
+    }
+    private static bool Admits(bool service, bool persistent, string operation, string frame,
+        bool running = false, Dictionary<string, object> request = null) {
+        BridgeFixture bridge = new BridgeFixture("", request ?? Request(operation), null,
+            persistent, service);
+        try {
+            bridge.Feed(frame);
+            return bridge.Admitted && bridge.Running.WaitOne(0) == running;
+        } finally { bridge.Running.Dispose(); }
+    }
+    private static bool InvalidSequence(string[] frames, bool persistent = true) {
+        BridgeFixture bridge = new BridgeFixture("", Request("serve"), null, persistent, true);
+        try {
+            foreach (string frame in frames) bridge.Feed(frame);
+            return bridge.InvalidOutput;
+        } finally { bridge.Running.Dispose(); }
+    }
+    private static bool ProgressPreserved() {
+        BridgeFixture bridge = new BridgeFixture("", Request("serve"), null, true, true);
+        try {
+            bridge.Feed(Progress(0)); bridge.Feed(Progress(10)); bridge.Feed(Progress(100));
+            bridge.Feed(Response("running"));
+            return bridge.Admitted && bridge.PreparingRecordings &&
+                bridge.RecordingsProgress == 100 && bridge.Running.WaitOne(0);
+        } finally { bridge.Running.Dispose(); }
+    }
+    private static bool TwoRepliesPreserved() {
+        BridgeFixture bridge = new BridgeFixture("", Request("serve"), null, true, true);
+        try {
+            bridge.Feed(Response("running")); bridge.Feed(Response("stopped"));
+            return bridge.Admitted && bridge.Running.WaitOne(0);
+        } finally { bridge.Running.Dispose(); }
+    }
+    internal static void Exercise(Dictionary<string, object> proof) {
+        proof["service_bridge_stage"] = "status_reply";
+        bool valid = Admits(true, false, "status", Migration);
+        proof["service_migration_reply_admitted"] = valid;
+        if (!valid) throw new InvalidOperationException();
+        proof["service_bridge_stage"] = "context_controls";
+        bool contexts = !Admits(false, false, "status", Migration) &&
+            !Admits(true, true, "status", Migration);
+        foreach (string operation in new[] { "initialize", "serve", "stop", "other" })
+            contexts &= !Admits(true, false, operation, Migration);
+        Dictionary<string, object> wrongSchema = Request("status");
+        wrongSchema["schema_version"] = true;
+        contexts &= !Admits(true, false, "status", Migration, false, wrongSchema);
+        Dictionary<string, object> extraRequest = Request("status");
+        extraRequest["extra"] = true;
+        contexts &= !Admits(true, false, "status", Migration, false, extraRequest);
+        Dictionary<string, object> wrongOperation = Request("status");
+        wrongOperation["operation"] = 1;
+        contexts &= !Admits(true, false, "status", Migration, false, wrongOperation);
+        proof["service_wrong_context_cases"] = 9;
+        proof["service_wrong_contexts_refused"] = contexts;
+        if (!contexts) throw new InvalidOperationException();
+        proof["service_bridge_stage"] = "frame_controls";
+        string[] malformed = new[] {
+            Migration.Replace("legacy_upgrade_required", "other"),
+            "{\"schema_version\":1,\"status\":\"migration_required\"}",
+            Migration.Replace("}", ",\"extra\":true}"),
+            Migration.Replace("\"schema_version\":1", "\"schema_version\":true"),
+            Migration.Replace("\"schema_version\":1", "\"schema_version\":\"1\""),
+            Migration.Replace("\"schema_version\":1", "\"schema_version\":1.0"),
+            Migration.Replace("\"schema_version\":1", "\"schema_version\":2"),
+            Migration.Replace("\"schema_version\":1,", ""),
+            Migration.Replace("\"status\":\"migration_required\",", ""),
+            Migration.Replace("\"migration_required\"", "[]"),
+            Migration.Replace("\"legacy_upgrade_required\"", "[]"),
+            Migration.Replace("migration_required", "other"),
+            "null", "{", new string('x', 1025)
+        };
+        bool frames = true;
+        foreach (string frame in malformed) frames &= !Admits(true, false, "status", frame);
+        proof["service_malformed_frame_cases"] = malformed.Length;
+        proof["service_malformed_frames_refused"] = frames;
+        if (!frames) throw new InvalidOperationException();
+        proof["service_bridge_stage"] = "legacy_controls";
+        bool legacy = true;
+        foreach (string status in new[] { "ready", "new", "refused", "stopped" })
+            legacy &= Admits(false, false, "status", Response(status));
+        foreach (string status in new[] { "ready", "new", "refused" })
+            legacy &= Admits(true, false, "status", Response(status));
+        legacy &= Admits(false, true, "serve", Response("running"), true) &&
+            Admits(true, true, "serve", Response("running"), true);
+        proof["unrelated_status_cases"] = 9;
+        proof["unrelated_statuses_preserved"] = legacy;
+        if (!legacy) throw new InvalidOperationException();
+        string[] manyProgress = Enumerable.Repeat(Progress(0), 102).ToArray();
+        bool limits = ProgressPreserved() && TwoRepliesPreserved() &&
+            InvalidSequence(new[] { Progress(1) }, false) &&
+            InvalidSequence(new[] { Progress(10), Progress(9) }) &&
+            InvalidSequence(new[] { Progress(-1) }) &&
+            InvalidSequence(new[] { Progress(101) }) && InvalidSequence(manyProgress) &&
+            InvalidSequence(new[] { Response("running"), Progress(1) }) &&
+            InvalidSequence(new[] { Response("ready"), Response("ready"), Response("ready") });
+        proof["legacy_progress_and_line_limit_cases"] = 9;
+        proof["legacy_progress_and_line_limits_preserved"] = limits;
+        if (!limits) throw new InvalidOperationException();
+        proof["service_bridge_stage"] = "complete";
+    }
+}
+"""
+
+
 _CS = r"""
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.Diagnostics;
+using System.Linq;
+using System.Reflection;
 using System.Security.Principal;
+using System.Threading;
 using System.Web.Script.Serialization;
 namespace K5VisionDesktop {
 @@JSON@@
+@@BRIDGE@@
 internal static class LegacyProfilesProbe {
     private static HashSet<string> Current(string text) { @@VALIDATION@@ }
     private static int Existing(string text) {
@@ -163,6 +323,7 @@ internal static class LegacyProfilesProbe {
             proof["current_negative_case_count"] = negatives.Count;
             proof["current_all_negatives_refused"] = refused;
             if (!(single && cap && mark && refused)) throw new InvalidOperationException();
+            BridgeCases.Exercise(proof);
             proof["status"] = "observed";
             exit = 0;
         } catch (Exception) { proof["status"] = "refused"; }
@@ -172,6 +333,57 @@ internal static class LegacyProfilesProbe {
 }
 }
 """
+
+
+def _head(root):
+    return (
+        subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, timeout=10, check=True
+        )
+        .stdout.decode("ascii")
+        .strip()
+    )
+
+
+def _native_variant(compiler, directory, name, generated, proof):
+    source, output = directory / (name + ".cs"), directory / (name + ".exe")
+    source.write_text(generated, encoding="utf-8", newline="\n")
+    proof["phase"] = name + "_compile"
+    result = subprocess.run(
+        [
+            str(compiler),
+            "/nologo",
+            "/target:exe",
+            "/platform:x64",
+            "/optimize+",
+            "/warn:4",
+            "/warnaserror+",
+            "/codepage:65001",
+            "/reference:System.dll",
+            "/reference:System.Core.dll",
+            "/reference:System.Web.Extensions.dll",
+            "/out:" + str(output),
+            str(source),
+        ],
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    if result.returncode:
+        raise ValueError("Native source probe compilation failed")
+    proof["phase"] = name + "_execution"
+    result = subprocess.run([str(output)], capture_output=True, timeout=15, check=False)
+    if len(result.stdout) > 65536 or result.stderr:
+        raise ValueError("Native source receipt is unavailable")
+    actual = json.loads(
+        result.stdout.decode("utf-8"),
+        parse_constant=lambda _: (_ for _ in ()).throw(ValueError()),
+    )
+    if type(actual) is not dict or any(
+        type(value) not in (bool, int, str) for value in actual.values()
+    ):
+        raise ValueError("Native source receipt is invalid")
+    return result.returncode, actual
 
 
 def main():
@@ -188,65 +400,48 @@ def main():
         head = os.environ["K5_NATIVE_PROBE_HEAD_SHA"]
         if re.fullmatch("[a-f0-9]{40}", head) is None:
             raise ValueError("Missing exact native source head")
-        observed = (
-            subprocess.run(
-                ["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, timeout=10, check=True
-            )
-            .stdout.decode("ascii")
-            .strip()
-        )
-        if observed != head:
+        if _head(ROOT) != head:
             raise ValueError("Native checkout and required source head differ")
         proof["head_sha"] = head
         proof["phase"] = "source_binding"
         generated, binding = materialize(ROOT)
         proof.update(binding)
+        baseline = ROOT / "native-bridge-baseline"
+        baseline_head = "0bc10f5aacaa45903b33d9f2dfb23c9d8d197868"
+        old_path = baseline / _SOURCE_FILES[0]
+        if old_path.is_symlink() or not old_path.is_file() or _head(baseline) != baseline_head:
+            raise ValueError("Missing exact historical bridge source")
+        old = old_path.read_text(encoding="utf-8")
+        if _digest(old) != "a4d81d0094eeccdd05df705c450ab6842f3729df063407b4e1037446975e3a7a":
+            raise ValueError("Historical bridge source changed")
+        baseline_generated, baseline_binding = materialize(ROOT, bridge_source=old)
+        proof["baseline_head_sha"] = baseline_head
+        proof["baseline_bridge_source_sha256"] = baseline_binding["bridge_source_sha256"]
+        proof["baseline_bridge_receive_sha256"] = baseline_binding["bridge_receive_sha256"]
+        proof["baseline_bridge_context_sha256"] = baseline_binding["bridge_context_sha256"]
+        proof["baseline_compiled_probe_sha256"] = baseline_binding["compiled_probe_sha256"]
         compiler = Path(os.environ["WINDIR"]) / "Microsoft.NET/Framework64/v4.0.30319/csc.exe"
         with tempfile.TemporaryDirectory(
             prefix="k5-legacy-profiles-", dir=os.environ["RUNNER_TEMP"]
         ) as temporary:
             directory = Path(temporary)
             temporary_path = directory
-            source, output = directory / "probe.cs", directory / "probe.exe"
-            source.write_text(generated, encoding="utf-8", newline="\n")
-            proof["phase"] = "native_compile"
-            result = subprocess.run(
-                [
-                    str(compiler),
-                    "/nologo",
-                    "/target:exe",
-                    "/platform:x64",
-                    "/optimize+",
-                    "/warn:4",
-                    "/warnaserror+",
-                    "/codepage:65001",
-                    "/reference:System.dll",
-                    "/reference:System.Core.dll",
-                    "/reference:System.Web.Extensions.dll",
-                    "/out:" + str(output),
-                    str(source),
-                ],
-                capture_output=True,
-                timeout=60,
-                check=False,
+            before_code, before = _native_variant(
+                compiler, directory, "baseline", baseline_generated, proof
             )
-            if result.returncode:
-                raise ValueError("Native marker probe compilation failed")
-            proof["phase"] = "native_execution"
-            result = subprocess.run([str(output)], capture_output=True, timeout=15, check=False)
-            if len(result.stdout) > 65536 or result.stderr:
-                raise ValueError("Native marker receipt is unavailable")
-            actual = json.loads(
-                result.stdout.decode("utf-8"),
-                parse_constant=lambda _: (_ for _ in ()).throw(ValueError()),
-            )
-            if type(actual) is not dict or any(
-                type(value) not in (bool, int, str) for value in actual.values()
+            if (
+                before_code != 1
+                or before.get("status") != "refused"
+                or before.get("service_bridge_stage") != "status_reply"
+                or before.get("service_migration_reply_admitted") is not False
+                or before.get("current_all_negatives_refused") is not True
             ):
-                raise ValueError("Native marker receipt is invalid")
+                raise ValueError("Historical bridge did not reproduce its named runtime refusal")
+            proof["old_bridge_named_runtime_refusal_reproduced"] = True
+            after_code, actual = _native_variant(compiler, directory, "candidate", generated, proof)
             proof.update(actual)
-            if result.returncode or proof.get("status") != "observed":
-                raise ValueError("Actual native marker validation failed")
+            if after_code or proof.get("status") != "observed":
+                raise ValueError("Actual native marker or service protocol validation failed")
         proof["phase"] = "complete"
         status = 0
     except Exception as error:

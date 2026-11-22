@@ -122,6 +122,18 @@ def _cache_workers(runtime: Path, wheel: Path) -> None:
             _private_directory(cache)
             _copy(source, cache / artifact["executable"])
             _copy(license_path, cache / "LICENSE")
+            if name == "mediamtx" and manifest["version"] == "v1.21.2-k5-monotonic1":
+                tool_root = os.environ.get("K5_DONOR_TOOL_ROOT")
+                _require(bool(tool_root), "Admitted derivative notice archive root is missing")
+                notice_archive = Path(tool_root) / "mediamtx.zip"
+                _require(
+                    notice_archive.is_file()
+                    and not notice_archive.is_symlink()
+                    and notice_archive.stat().st_size == artifact["archive_bytes"]
+                    and _digest(notice_archive) == artifact["sha256"],
+                    "Supplied derivative notice archive identity was refused",
+                )
+                _copy(notice_archive, cache / "upstream-notices-and-provenance.zip")
 
 
 def _upgrade_same_version_wheel(wheel: Path) -> str:
