@@ -1270,6 +1270,18 @@ try{
     }
 }catch{
     $receipt.failure_kind=$_.Exception.GetType().Name;$receipt.failure_hresult=$_.Exception.HResult
+    # Optional failure-only metadata: never export a path, message or stack.
+    $failureRecord=$_
+    try{
+        $info=$failureRecord.InvocationInfo
+        $ownScript=[IO.Path]::GetFullPath($PSCommandPath)
+        if($null -ne $info -and -not [string]::IsNullOrEmpty([string]$info.ScriptName) -and
+           [IO.Path]::GetFileName($ownScript) -ceq 'probe_windows_guest_recording.ps1' -and
+           [string]::Equals([IO.Path]::GetFullPath([string]$info.ScriptName),$ownScript,[StringComparison]::OrdinalIgnoreCase)){
+            $line=[long]$info.ScriptLineNumber
+            if($line -ge 1 -and $line -le [IO.File]::ReadAllLines($ownScript).Length){$receipt.failure_owned_source_line=[int]$line}
+        }
+    }catch{}
     $receipt.failure_exception_chain=@()
     $inner=$_.Exception
     for($depth=0;$null -ne $inner -and $depth -lt 8;$depth++){
@@ -1282,8 +1294,63 @@ try{
         $inner=$inner.InnerException
     }
     $knownReasons=@{'Isolated fixture subnet unavailable'='fixture_subnet_unavailable';'Owned internal adapter unavailable'='owned_internal_adapter_unavailable';'Owned generated source ended'='owned_generated_source_ended';'IPv4 required'='invalid_route_address_family';'Owned address did not become preferred'='owned_address_not_preferred'}
+    $plannedReasons=@{
+        'Native content control fixture did not change'='native_content_control_fixture_did_not_change'
+        'Native planned custody smoke differs'='native_planned_custody_smoke_differs'
+        'Native planned custody smoke remains'='native_planned_custody_smoke_remains'
+        'Native planned hardlink smoke was accepted'='native_planned_hardlink_smoke_was_accepted'
+        'Native planned identity changed after alias removal'='native_planned_identity_changed_after_alias_removal'
+        'Native planned no-mutation control failed'='native_planned_no_mutation_control_failed'
+        'Native replacement control fixture differs'='native_replacement_control_fixture_differs'
+        'Native replacement wrote another object'='native_replacement_wrote_another_object'
+        'Native same-object changed content was overwritten'='native_same_object_changed_content_was_overwritten'
+        'Offline path refused'='offline_path_refused'
+        'Offline path reparse point refused'='offline_path_reparse_point_refused'
+        'Planned Security boundary changed before publication'='planned_security_boundary_changed_before_publication'
+        'Planned Security boundary changed during publication'='planned_security_boundary_changed_during_publication'
+        'Planned Security log bound exceeded'='planned_security_log_bound_exceeded'
+        'Planned Windows partition differs'='planned_windows_partition_differs'
+        'Planned access path remains'='planned_access_path_remains'
+        'Planned boundary requires exact owned Off'='planned_boundary_requires_exact_owned_off'
+        'Planned boundary was not admitted within its bound'='planned_boundary_was_not_admitted_within_its_bound'
+        'Planned cleanup access path differs'='planned_cleanup_access_path_differs'
+        'Planned cleanup foreign disk refused'='planned_cleanup_foreign_disk_refused'
+        'Planned cleanup requires exact owned Off'='planned_cleanup_requires_exact_owned_off'
+        'Planned config ACL cardinality refused'='planned_config_acl_cardinality_refused'
+        'Planned config changed before write'='planned_config_changed_before_write'
+        'Planned config custody changed between mounts'='planned_config_custody_changed_between_mounts'
+        'Planned config durable publication differs'='planned_config_durable_publication_differs'
+        'Planned config file identity, DACL or durable text changed'='planned_config_file_identity_dacl_or_durable_text_changed'
+        'Planned config foreign or nonprivate ACL refused'='planned_config_foreign_or_nonprivate_acl_refused'
+        'Planned config private owner or DACL refused'='planned_config_private_owner_or_dacl_refused'
+        'Planned config scope differs'='planned_config_scope_differs'
+        'Planned disk already attached'='planned_disk_already_attached'
+        'Planned disk identity or access differs'='planned_disk_identity_or_access_differs'
+        'Planned disk remains attached'='planned_disk_remains_attached'
+        'Planned disk still mounted before Start'='planned_disk_still_mounted_before_start'
+        'Planned offline boundary exceeded its bound'='planned_offline_boundary_exceeded_its_bound'
+        'Planned offline mount path remains'='planned_offline_mount_path_remains'
+        'Planned offline ownership query exceeded its bound'='planned_offline_ownership_query_exceeded_its_bound'
+        'Planned original baseline digest differs'='planned_original_baseline_digest_differs'
+        'Planned original baseline scope differs'='planned_original_baseline_scope_differs'
+        'Planned original checkpoint not retained'='planned_original_checkpoint_not_retained'
+        'Planned pre-Off audit continuity lost'='planned_pre_off_audit_continuity_lost'
+        'Planned pre-Off interactive logon observed'='planned_pre_off_interactive_logon_observed'
+        'Planned pre-Off log reset or wrap'='planned_pre_off_log_reset_or_wrap'
+        'Planned pre-Off logon type unavailable'='planned_pre_off_logon_type_unavailable'
+        'Planned pre-Off range bound exceeded'='planned_pre_off_range_bound_exceeded'
+        'Planned pre-Off range gap'='planned_pre_off_range_gap'
+        'Planned pre-Off record order changed'='planned_pre_off_record_order_changed'
+        'Planned read-only Security log changed'='planned_read_only_security_log_changed'
+        'Planned shutdown did not reach owned Off'='planned_shutdown_did_not_reach_owned_off'
+        'Planned shutdown exceeded its bound'='planned_shutdown_exceeded_its_bound'
+        'Planned start did not reach owned Running'='planned_start_did_not_reach_owned_running'
+        'Planned start exceeded its bound'='planned_start_exceeded_its_bound'
+        'Unknown owned reboot operation'='unknown_owned_reboot_operation'
+    }
+    foreach($message in $plannedReasons.Keys){$knownReasons[$message]=$plannedReasons[$message]}
     $receipt.failure_reason='other'
-    if($knownReasons.ContainsKey($_.Exception.Message)){$receipt.failure_reason=$knownReasons[$_.Exception.Message]}
+    if($knownReasons.ContainsKey($failureRecord.Exception.Message)){$receipt.failure_reason=$knownReasons[$failureRecord.Exception.Message]}
     foreach($entry in @(@{name='relay';process=$mediaProcess},@{name='publisher';process=$publisherProcess})){
         if($null -ne $entry.process){
             $exited=$entry.process.HasExited;$receipt[($entry.name+'_exited_at_failure')]=$exited
