@@ -42,7 +42,7 @@ jobs:
 
           proof = {"schema_version": 1, "status": "refused", "native_windows_execution": False,
                    "product_installation_used": False, "service_registration_used": False,
-                   "existing_profile_used": False, "mocked_native_api": False}
+                   "existing_profile_used": False, "mocked_native_api": False, "phase": "environment"}
           root = identity = None
           root_id = identity_id = None
           root_created = identity_created = False
@@ -75,6 +75,7 @@ jobs:
                   "copy_policy_sha256": hashlib.sha256(copy_path.read_bytes()).hexdigest(),
                   "workflow_sha256": hashlib.sha256(workflow.read_bytes()).hexdigest(),
               }
+              proof["phase"] = "policy_load"
               # Load only the stdlib-only Windows policy. No application imports,
               # package dependencies, service registration or profile setup run.
               spec = importlib.util.spec_from_file_location("owner_facts_policy", policy_path)
@@ -82,6 +83,7 @@ jobs:
               sys.modules[spec.name] = module
               spec.loader.exec_module(module)
               native = module._NativeSecurity()
+              proof["phase"] = "token_query"
               user = native.current_user()
               token = ctypes.c_void_p()
               if not native.security.OpenProcessToken(native.kernel.GetCurrentProcess(), 8,
@@ -109,6 +111,7 @@ jobs:
               proof["token_owner"] = roles(owner, user)
               proof["elevated"] = bool(elevated.value)
               proof["administrator"] = bool(shell.IsUserAnAdmin())
+              proof["phase"] = "constructor_predicate"
 
               # Bind the diagnostic predicate to the unchanged literal stage
               # owner precondition without importing or constructing that stage.
@@ -129,7 +132,7 @@ jobs:
               control.restype = ctypes.c_int32
 
               def describe(path):
-                  actual_owner, entries = native.descriptor(path)
+                  actual_owner, entries = native.descriptor(os.fspath(path))
                   descriptor, dacl = ctypes.c_void_p(), ctypes.c_void_p()
                   flags, revision = ctypes.c_uint16(), ctypes.c_uint32()
                   try:
@@ -166,6 +169,7 @@ jobs:
               # Only these random, newly created, empty directories are touched.
               # Existing legacy/service roots and their ACLs are never opened.
               root = Path(os.environ["RUNNER_TEMP"]) / ("k5-owner-facts-" + uuid4().hex)
+              proof["phase"] = "create_directories"
               root.mkdir(mode=0o700)
               root_created = True
               root_id = file_id(root)
@@ -173,14 +177,18 @@ jobs:
               identity.mkdir(mode=0o700)
               identity_created = True
               identity_id = file_id(identity)
+              proof["phase"] = "describe_root"
               proof["root"] = describe(root)
+              proof["phase"] = "describe_identity"
               proof["identity"] = describe(identity)
+              proof["phase"] = "complete"
               proof["status"] = "observed"
           except Exception as error:
               name = type(error).__name__
               proof["failure_type"] = name if name in {
                   "ValueError", "OSError", "RuntimeError", "WindowsIdentitySecurityError",
-                  "FileNotFoundError", "PermissionError", "StopIteration", "SyntaxError"
+                  "FileNotFoundError", "PermissionError", "StopIteration", "SyntaxError",
+                  "ArgumentError", "AttributeError", "TypeError", "NameError"
               } else "Other"
               proof["status"] = "refused"
           finally:
