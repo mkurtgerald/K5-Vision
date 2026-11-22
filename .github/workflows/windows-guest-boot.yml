@@ -1,0 +1,54 @@
+name: Disposable Windows guest qualification infrastructure
+on:
+  workflow_dispatch:
+  push:
+    branches: [codex/windows-guest-20261122]
+    paths:
+      - .github/workflows/windows-guest-boot.yml
+      - scripts/probe_windows_guest_image.ps1
+permissions:
+  contents: read
+concurrency:
+  group: windows-guest-image-${{ github.sha }}
+  cancel-in-progress: false
+jobs:
+  image-discovery:
+    name: DIAGNOSTIC ONLY - inspect official Windows evaluation guest image
+    runs-on: windows-2025
+    timeout-minutes: 18
+    steps:
+      - name: Checkout exact image discovery source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Inspect resources, official image bytes and offline Windows edition
+        timeout-minutes: 16
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & (Join-Path $env:SYSTEMROOT 'System32/cmd.exe') /d /c 'git cat-file blob HEAD:scripts/probe_windows_guest_image.ps1 > guest-image-admitted.ps1'
+          if ($LASTEXITCODE -ne 0) { throw 'Image discovery Git blob unavailable' }
+          $scriptSha = (Get-FileHash -LiteralPath guest-image-admitted.ps1 -Algorithm SHA256).Hash.ToLowerInvariant()
+          $tokens=$null; $parseErrors=$null
+          [Management.Automation.Language.Parser]::ParseFile((Resolve-Path guest-image-admitted.ps1),[ref]$tokens,[ref]$parseErrors) | Out-Null
+          if (@($parseErrors).Count -ne 0) { throw 'Image discovery source did not parse' }
+          pwsh -NoProfile -NonInteractive -File guest-image-admitted.ps1 | Tee-Object -FilePath windows-guest-image.json
+          if ($LASTEXITCODE -ne 0) { throw 'Image discovery could not clean up its exact resources' }
+          $evidence=Get-Content -LiteralPath windows-guest-image.json -Raw | ConvertFrom-Json
+          if ($evidence.schema_version -ne 1 -or $evidence.diagnostic_only -ne $true -or
+              $evidence.product_qualification -ne $false -or $evidence.windows_boot_qualified -ne $false -or
+              $evidence.cleanup_complete -ne $true) { throw 'Image discovery scope differs' }
+          @{schema_version=1; diagnostic_only=$true; head_sha=$env:GITHUB_SHA; script_sha256=$scriptSha;
+            run_id=$env:GITHUB_RUN_ID; run_attempt=$env:GITHUB_RUN_ATTEMPT; product_qualification=$false} |
+            ConvertTo-Json | Set-Content -LiteralPath windows-guest-image-provenance.json -Encoding utf8
+      - name: Retain only finite image identity and capacity observations
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: diagnostic-windows-guest-image-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            windows-guest-image.json
+            windows-guest-image-provenance.json
+          if-no-files-found: warn
+          retention-days: 14
