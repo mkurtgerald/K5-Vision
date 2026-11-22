@@ -210,8 +210,19 @@ try{
     $configPath=Join-Path $root 'generated-camera.json'
     $mediaConfig=@{logLevel='warn';rtspAddress=($hostIPAddress+':18554');rtspTransports=@('tcp');api=$false;rtmp=$false;hls=$false;webrtc=$false;srt=$false;paths=@{generated=@{source='publisher'}}}
     [IO.File]::WriteAllText($configPath,($mediaConfig|ConvertTo-Json -Depth 8),[Text.UTF8Encoding]::new($false))
+    $receipt.network_subphase='await_owned_address_preferred'
+    $addressWatch=[Diagnostics.Stopwatch]::StartNew()
+    $receipt.owned_address_state_edges=@()
+    do{
+        $addressState=Owned-AddressState
+        if($receipt.owned_address_state_edges.Count -eq 0 -or $receipt.owned_address_state_edges[-1] -cne $addressState){$receipt.owned_address_state_edges+=$addressState}
+        if($addressState -ceq 'Preferred'){break}
+        if($addressState -cne 'Tentative' -or $addressWatch.Elapsed.TotalSeconds -ge 5){throw [TimeoutException]::new('Owned address did not become preferred')}
+        Start-Sleep -Milliseconds 100
+    }while($true)
+    $receipt.owned_address_observation_seconds=[Math]::Round($addressWatch.Elapsed.TotalSeconds,3)
     $receipt.network_subphase='start_generated_relay'
-    $receipt.host_address_state_before_relay=Owned-AddressState
+    $receipt.host_address_state_before_relay=$addressState
     $mediaProcess=Start-OwnedProcess $MediaMTX $configPath
     Start-Sleep -Seconds 1
     $source='rtsp://'+$hostIPAddress+':18554/generated'
@@ -405,7 +416,7 @@ try{
     $receipt.outcome='installer_guest_recording_observed';$receipt.stage='complete'
 }catch{
     $receipt.failure_kind=$_.Exception.GetType().Name;$receipt.failure_hresult=$_.Exception.HResult
-    $knownReasons=@{'Isolated fixture subnet unavailable'='fixture_subnet_unavailable';'Owned internal adapter unavailable'='owned_internal_adapter_unavailable';'Owned generated source ended'='owned_generated_source_ended';'IPv4 required'='invalid_route_address_family'}
+    $knownReasons=@{'Isolated fixture subnet unavailable'='fixture_subnet_unavailable';'Owned internal adapter unavailable'='owned_internal_adapter_unavailable';'Owned generated source ended'='owned_generated_source_ended';'IPv4 required'='invalid_route_address_family';'Owned address did not become preferred'='owned_address_not_preferred'}
     $receipt.failure_reason='other'
     if($knownReasons.ContainsKey($_.Exception.Message)){$receipt.failure_reason=$knownReasons[$_.Exception.Message]}
     foreach($entry in @(@{name='relay';process=$mediaProcess},@{name='publisher';process=$publisherProcess})){
