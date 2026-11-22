@@ -403,15 +403,21 @@ function Read-SetupState([string]$WindowsVolume) {
 }
 function Read-BootFailureOffline {
     Assert-Root
-    $facts=@{read_only_mount=$false;known_files=@{};own_receipts=@{};setup_logs=@{}}
+    $facts=@{read_only_mount=$false;known_files=@{};own_receipts=@{};setup_logs=@{};subphase='create_access_path';inspection_complete=$false}
     $attached=$null;$diagnosticPartition=$null;$diagnosticMount=(Join-Path $root 'failure-offline')+'\'
     try{
         New-Item -ItemType Directory -Path $diagnosticMount|Out-Null
+        $facts.subphase='mount_readonly'
         $attached=Mount-VHD -Path $image -ReadOnly -NoDriveLetter -PassThru
         $diagnosticDisk=[int]$attached.DiskNumber
+        $facts.subphase='verify_disk'
         $disk=Get-Disk -Number $diagnosticDisk
+        $facts.disk_is_readonly=[bool]$disk.IsReadOnly;$facts.disk_unique_id_matches=([string]$disk.UniqueId -ceq $diskId)
+        $observedId=[string]$disk.UniqueId
+        if($observedId -match '^[A-Za-z0-9_-]{1,128}$'){$facts.observed_disk_unique_id=$observedId}
         if(-not $disk.IsReadOnly -or [string]$disk.UniqueId -cne $diskId){throw 'Owned read-only diagnostic disk differs'}
         $facts.read_only_mount=$true
+        $facts.subphase='find_windows_volume'
         foreach($partition in @(Get-Partition -DiskNumber $diagnosticDisk|Where-Object{$_.Size -gt 1GB})){
             $diagnosticPartition=[int]$partition.PartitionNumber
             Add-PartitionAccessPath -DiskNumber $diagnosticDisk -PartitionNumber $diagnosticPartition -AccessPath $diagnosticMount
@@ -419,13 +425,16 @@ function Read-BootFailureOffline {
             Remove-PartitionAccessPath -DiskNumber $diagnosticDisk -PartitionNumber $diagnosticPartition -AccessPath $diagnosticMount;$diagnosticPartition=$null
         }
         if($null -eq $diagnosticPartition){throw 'Diagnostic Windows volume unavailable'}
+        $facts.subphase='setup_state'
         $facts.setup_state=Read-SetupState $diagnosticMount
+        $facts.subphase='known_payload_files'
         $known=@{
           installed_launcher='Program Files\K5 Vision\K5Vision.exe';identity='ProgramData\K5Vision\identity\identity.json';
           answer_file='Windows\Panther\Unattend.xml';setup_complete='Windows\Setup\Scripts\SetupComplete.cmd';
           setup_task=('Windows\System32\Tasks\K5GuestWitness-'+$transfer);bootstrap_task=('Windows\System32\Tasks\K5GuestBootstrap-'+$transfer)
         }
         foreach($entry in $known.GetEnumerator()){$facts.known_files[$entry.Key]=[bool](Test-Path -LiteralPath (Join-Path $diagnosticMount $entry.Value) -PathType Leaf)}
+        $facts.subphase='own_receipts'
         foreach($name in @('setup-entry.json','setup-failure.json','bootstrap-receipt.json','bootstrap-witness.json')){
             $path=Join-Path $diagnosticMount ('K5GuestWitness\'+$name)
             if(-not(Test-Path -LiteralPath $path -PathType Leaf)){continue}
@@ -442,6 +451,7 @@ function Read-BootFailureOffline {
                 $facts.own_receipts[$name]=$safe
             }catch{$facts.own_receipts[$name]=@{parse_failed=$true}}
         }
+        $facts.subphase='setup_logs'
         foreach($relative in @('Windows\Panther\setupact.log','Windows\Panther\setuperr.log','Windows\Panther\UnattendGC\setupact.log','Windows\Panther\UnattendGC\setuperr.log')){
             $path=Join-Path $diagnosticMount $relative
             if(-not(Test-Path -LiteralPath $path -PathType Leaf)){continue}
@@ -455,6 +465,16 @@ function Read-BootFailureOffline {
             $flags.our_hook_referenced=($text -match '(?i)windows_guest_witness\.ps1')
             $flags.near_hook_return_codes=@([regex]::Matches($text,'(?is)windows_guest_witness\.ps1.{0,2048}?\b(?:exit(?:\s+code)?|returned(?:\s+code)?|result(?:\s+code)?)\s*(?:=|:|is|with)?\s*(0x[0-9a-f]{1,8}|\d{1,10})')|ForEach-Object{$_.Groups[1].Value.ToLowerInvariant()}|Select-Object -Unique -First 16)
             $flags.error_codes=$codes;$facts.setup_logs[$relative]=$flags;$text=$null
+        }
+        $facts.inspection_complete=$true;$facts.subphase='complete'
+    }catch{
+        $facts.failure_subphase=$facts.subphase;$facts.failure_kind=$_.Exception.GetType().Name;$facts.failure_hresult=$_.Exception.HResult
+        $facts.failure_reason='other'
+        if($_.Exception.Message -ceq 'Owned read-only diagnostic disk differs'){$facts.failure_reason='owned_readonly_disk_refused'}
+        elseif($_.Exception.Message -ceq 'Diagnostic Windows volume unavailable'){$facts.failure_reason='windows_volume_unavailable'}
+        $inner=$_.Exception
+        for($depth=0;$null -ne $inner -and $depth -lt 8;$depth++){
+            if($inner -is [ComponentModel.Win32Exception]){$facts.failure_native_code=$inner.NativeErrorCode;break};$inner=$inner.InnerException
         }
     }finally{
         if($null -ne $attached){
