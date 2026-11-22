@@ -368,19 +368,41 @@ def main():
             receipt["builds"] = list(pool.map(build, trees))
         if receipt["builds"][0]["sha256"] != receipt["builds"][1]["sha256"]:
             raise ValueError("Independent derivative builds differ")
+        shutil.copyfile(output / "mediamtx-first.exe", output / "mediamtx.exe")
+        receipt.update(
+            reproducible_binary=True,
+            executable_sha256=receipt["builds"][0]["sha256"],
+            executable_bytes=receipt["builds"][0]["bytes"],
+        )
+        stage = "linux_cross_build"
+        linux_environment = dict(
+            trees[0][3], GOOS="linux", GOARCH="amd64", GOCACHE=str(output / "linux-go-cache")
+        )
+        linux_executable = output / "mediamtx"
+        run(
+            [go, "build", *manifest["build"]["flags"], "-o", linux_executable, "."],
+            cwd=trees[0][1],
+            env=linux_environment,
+        )
+        (output / "build-info-linux-amd64.txt").write_bytes(
+            run([go, "version", "-m", linux_executable], env=linux_environment)
+        )
+        receipt["linux_cross_build"] = {
+            "sha256": digest(linux_executable),
+            "bytes": linux_executable.stat().st_size,
+            "goos": "linux",
+            "goarch": "amd64",
+            "version": manifest["derivative_version"],
+            "native_execution_observed": False,
+            "reproducibility_claimed": False,
+        }
         stage = "notices"
         retain_notices(go, trees[0][1], trees[0][3], output, manifest)
         shutil.copyfile(patch, output / patch.name)
         shutil.copyfile(patch_manifest, output / patch_manifest.name)
         shutil.copyfile(BUILD_MANIFEST, output / BUILD_MANIFEST.name)
         shutil.copyfile(ROOT / "THIRD_PARTY_NOTICES.md", output / "THIRD_PARTY_NOTICES.md")
-        shutil.copyfile(output / "mediamtx-first.exe", output / "mediamtx.exe")
-        receipt.update(
-            status="passed",
-            reproducible_binary=True,
-            executable_sha256=receipt["builds"][0]["sha256"],
-            executable_bytes=receipt["builds"][0]["bytes"],
-        )
+        receipt["status"] = "passed"
     except BaseException as error:
         receipt.update(status="failed", failure_stage=stage, failure_kind=type(error).__name__)
         raise

@@ -8,6 +8,7 @@ on:
       - .gitattributes
       - .github/workflows/mediamtx-clock-derivative.yml
       - scripts/build_mediamtx_clock_derivative.py
+      - scripts/probe_mediamtx_derivative.py
       - third_party/builds/mediamtx-clock-derivative.json
       - third_party/patches/gortsplib-5.6.7-monotonic-tcp-watchdog.*
       - third_party/licenses/gortsplib-MIT.txt
@@ -27,6 +28,8 @@ jobs:
     name: Experimental derivative - native regression and reproducible Windows builds
     runs-on: windows-2025
     timeout-minutes: 20
+    outputs:
+      artifact_id: ${{ steps.retain.outputs.artifact-id }}
     steps:
       - name: Checkout exact K5 patch and build specification
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -77,13 +80,15 @@ jobs:
               $proof.builds[0].sha256 -ne $proof.builds[1].sha256) {
             throw 'Experimental donor provenance does not admit the exact derivative'
           }
-      - name: Retain experimental binary, original notices and native regression provenance
+      - name: Retain experimental binaries, original notices and native regression provenance
+        id: retain
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: experimental-mediamtx-monotonic-${{ github.sha }}-${{ github.run_id }}-attempt-${{ github.run_attempt }}
           path: |
             derivative-proof/mediamtx.exe
+            derivative-proof/mediamtx
             derivative-proof/build-provenance.json
             derivative-proof/build-info-*.txt
             derivative-proof/*native-regression.*
@@ -94,5 +99,59 @@ jobs:
             derivative-proof/gortsplib-5.6.7-monotonic-tcp-watchdog.json
             derivative-proof/mediamtx-clock-derivative.json
             derivative-proof/THIRD_PARTY_NOTICES.md
+          if-no-files-found: warn
+          retention-days: 30
+
+  linux-native-smoke:
+    name: Experimental derivative - native Linux hash admission and loopback smoke
+    needs: native-build-and-regression
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Checkout exact smoke controller source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Admit exact current producer artifact identity
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          K5_DERIVATIVE_ARTIFACT_ID: ${{ needs.native-build-and-regression.outputs.artifact_id }}
+        run: |
+          python - <<'PYTHON'
+          import json, os, urllib.request
+          artifact = os.environ['K5_DERIVATIVE_ARTIFACT_ID']
+          assert artifact.isdigit() and int(artifact) > 0
+          request = urllib.request.Request(
+              'https://api.github.com/repos/' + os.environ['GITHUB_REPOSITORY'] + '/actions/artifacts/' + artifact,
+              headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'})
+          with urllib.request.urlopen(request, timeout=30) as response:
+              meta = json.load(response)
+          expected = 'experimental-mediamtx-monotonic-' + os.environ['GITHUB_SHA'] + '-' + os.environ['GITHUB_RUN_ID'] + '-attempt-' + os.environ['GITHUB_RUN_ATTEMPT']
+          assert meta['name'] == expected and meta['expired'] is False
+          assert meta['workflow_run']['head_sha'] == os.environ['GITHUB_SHA']
+          assert meta['workflow_run']['id'] == int(os.environ['GITHUB_RUN_ID'])
+          PYTHON
+      - name: Download exact current experimental binary and provenance artifact
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          artifact-ids: ${{ needs.native-build-and-regression.outputs.artifact_id }}
+          github-token: ${{ github.token }}
+          run-id: ${{ github.run_id }}
+          path: derivative-proof
+          merge-multiple: true
+      - name: Execute hash-admitted Linux version and private loopback API smoke
+        shell: bash
+        run: |
+          python scripts/probe_mediamtx_derivative.py --directory derivative-proof --output linux-native-smoke.json
+      - name: Retain native Linux observations separately from Windows reproducibility
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: experimental-mediamtx-linux-smoke-${{ github.sha }}-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: linux-native-smoke.json
           if-no-files-found: warn
           retention-days: 30

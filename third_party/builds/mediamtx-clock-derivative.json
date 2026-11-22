@@ -49,6 +49,14 @@
       "-buildvcs=false",
       "-mod=readonly",
       "-ldflags=-s -w -buildid="
+    ],
+    "additional_targets": [
+      {
+        "goos": "linux",
+        "goarch": "amd64",
+        "scope": "cross_build_with_separate_native_ubuntu_smoke",
+        "reproducibility_claimed": false
+      }
     ]
   },
   "regression": {
