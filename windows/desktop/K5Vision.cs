@@ -225,6 +225,20 @@ namespace K5VisionDesktop
             AdmitPath(path, privateRoot, true, null, false, true);
         }
 
+        internal static void AdmitMigrationData(string path)
+        {
+            // Only this fixed service tree admits the recorder principal when
+            // inspected by the elevated legacy owner or installer. Generic
+            // old-user identity admission retains its original token policy.
+            string root = MachineDataRoot;
+            RequireMachineBoundary(root);
+            path = OrdinaryAbsolute(path);
+            if (!String.Equals(path, root, StringComparison.OrdinalIgnoreCase) &&
+                !path.StartsWith(root + "\\", StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException();
+            AdmitPath(path, root, true, RecorderPaths.ServiceSid, false, true);
+        }
+
         private static void RequireMachineBoundary(string boundary)
         {
             string root = MachineDataRoot;

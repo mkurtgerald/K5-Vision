@@ -3,7 +3,7 @@ name: Windows recorder source compilation
 on:
   workflow_dispatch:
   push:
-    branches: [codex/unattended-windows-20261121]
+    branches: [codex/unattended-windows-20261121, codex/legacy-compile-20261122]
     paths:
       - .github/workflows/windows-service-compile.yml
       - .github/actions/prepare-windows-browser/**
