@@ -54,6 +54,9 @@ internal static class WindowsGuestBootstrap
     [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern IntPtr SendMessageTimeoutW(IntPtr window, uint message, IntPtr word,
         string value, uint flags, uint milliseconds, out IntPtr result);
+    [DllImport("user32.dll", EntryPoint = "SendMessageTimeoutW", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr ReadTextTimeoutW(IntPtr window, uint message, IntPtr word,
+        StringBuilder value, uint flags, uint milliseconds, out IntPtr result);
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool PostMessageW(IntPtr window, uint message, IntPtr word, IntPtr value);
 
@@ -114,11 +117,69 @@ internal static class WindowsGuestBootstrap
         EnumWindows(delegate(IntPtr window, IntPtr unused)
         {
             uint pid; GetWindowThreadProcessId(window, out pid);
-            if (pid == processId && IsWindowVisible(window) && Control(window, 1008) != IntPtr.Zero)
+            if (pid != processId || !IsWindowVisible(window)) return true;
+            IntPtr quit = Control(window, 1005), status = Control(window, 1006);
+            if (quit != IntPtr.Zero && status != IntPtr.Zero &&
+                IsWindowVisible(quit) && IsWindowVisible(status))
             { result = window; return false; }
             return true;
         }, IntPtr.Zero);
         return result;
+    }
+
+    private static bool AdministratorControlsReady(IntPtr form)
+    {
+        foreach (int id in new[] { 1008, 1001, 1002, 1003 })
+        {
+            IntPtr control = Control(form, id);
+            if (control == IntPtr.Zero || !IsWindowVisible(control) || !IsWindowEnabled(control)) return false;
+        }
+        return true;
+    }
+
+    private static void CaptureGuiStatus(string value)
+    {
+        if (String.IsNullOrEmpty(value) || value.Length > 8192) return;
+        Dictionary<string, object> data = Json.DeserializeObject(value) as Dictionary<string, object>;
+        object version;
+        if (data == null || !data.TryGetValue("schema_version", out version) || !(version is int) || (int)version != 1) return;
+        object phase;
+        if (data.TryGetValue("phase", out phase) && phase is string)
+        {
+            HashSet<string> allowed = new HashSet<string>(new[] { "preparing", "account_required", "running",
+                "starting", "initializing", "stopping", "unavailable", "failed", "migration_required", "preparing_recordings" });
+            Receipt["gui_status_phase"] = allowed.Contains((string)phase) ? (string)phase : "other";
+        }
+        foreach (string key in new[] { "ready", "exiting", "service_client", "backend_present", "backend_exited", "setup_administrator" })
+        {
+            object field;
+            if (data.TryGetValue(key, out field) && field is bool) Receipt["gui_status_" + key] = (bool)field;
+        }
+    }
+
+    private static void CaptureGuiFailure(Process client)
+    {
+        try
+        {
+            if (client == null) return;
+            Receipt["gui_process_alive"] = !client.HasExited;
+            if (client.HasExited) return;
+            IntPtr form = Form(client.Id); Receipt["gui_main_window_observed"] = form != IntPtr.Zero;
+            if (form == IntPtr.Zero) return;
+            foreach (int id in new[] { 1008, 1001, 1002, 1003 })
+            {
+                IntPtr control = Control(form, id); string prefix = "gui_control_" + id;
+                Receipt[prefix + "_present"] = control != IntPtr.Zero;
+                Receipt[prefix + "_visible"] = control != IntPtr.Zero && IsWindowVisible(control);
+                Receipt[prefix + "_enabled"] = control != IntPtr.Zero && IsWindowEnabled(control);
+            }
+            IntPtr diagnostic = Control(form, 1010), count;
+            if (diagnostic == IntPtr.Zero) return;
+            StringBuilder buffer = new StringBuilder(8192);
+            if (ReadTextTimeoutW(diagnostic, 0x000D, new IntPtr(buffer.Capacity), buffer, 2, 1000, out count) != IntPtr.Zero &&
+                count.ToInt64() >= 0 && count.ToInt64() < buffer.Capacity) CaptureGuiStatus(buffer.ToString());
+        }
+        catch { Receipt["gui_diagnostic_capture_failed"] = true; }
     }
 
     private static IntPtr Control(IntPtr form, int id)
@@ -368,7 +429,7 @@ internal static class WindowsGuestBootstrap
             IntPtr form = IntPtr.Zero;
             Wait(delegate { Require(!client.HasExited); form = Form(client.Id); return form != IntPtr.Zero; }, 30000);
             Stage = "gui_setup";
-            Wait(delegate { return IsWindowEnabled(Control(form, 1003)); }, 60000);
+            Wait(delegate { Require(!client.HasExited); return AdministratorControlsReady(form); }, 60000);
             SetText(form, 1008, username); SetText(form, 1001, password); SetText(form, 1002, password); Click(form, 1003);
             Stage = "health"; Wait(Healthy, 60000);
             Wait(delegate { return GetWindowTextLengthW(Control(form, 1001)) == 0 && GetWindowTextLengthW(Control(form, 1002)) == 0; }, 10000);
@@ -409,6 +470,7 @@ internal static class WindowsGuestBootstrap
         catch (Exception error)
         {
             WritingFailure = true;
+            CaptureGuiFailure(client);
             Receipt["status"] = "bootstrap_failed"; Receipt["stage"] = Stage;
             string type = error.GetType().Name;
             HashSet<string> allowed = new HashSet<string>(new[] { "InvalidOperationException", "TimeoutException",
