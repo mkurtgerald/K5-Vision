@@ -31,6 +31,34 @@ $root=$null; $rootIdentity=$null; $image=$null; $mounted=$false; $diskNumber=$nu
 $partitionNumber=$null; $accessPath=$null; $vmId=$null; $vmName=$null; $switchId=$null; $switchName=$null
 $hostInterface=$null; $hostIPAddress=$null; $firewallName=$null; $direct=$null; $password=$null; $credential=$null
 $mediaProcess=$null; $publisherProcess=$null
+$processNotes=@{}
+Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Text;
+public sealed class K5GuestProcessNotes {
+  readonly object gate=new object(); readonly StringBuilder text=new StringBuilder();
+  public K5GuestProcessNotes(Process process){process.OutputDataReceived+=Receive;process.ErrorDataReceived+=Receive;}
+  void Receive(object sender,DataReceivedEventArgs data){
+    if(data.Data==null)return;
+    lock(gate){int count=Math.Min(data.Data.Length,65536-text.Length);if(count>0)text.Append(data.Data,0,count);if(text.Length<65536)text.Append('\n');}
+  }
+  public int CapturedCharacters {get{lock(gate){return text.Length;}}}
+  public string[] Flags(){
+    string value;lock(gate){value=text.ToString().ToLowerInvariant();}
+    var flags=new List<string>();
+    if(value.Contains("bind:")||value.Contains("listen tcp"))flags.Add("socket_bind_error");
+    if(value.Contains("cannot assign requested address")||value.Contains("address is not valid in its context"))flags.Add("bind_address_unavailable");
+    if(value.Contains("address already in use")||value.Contains("only one usage of each socket address"))flags.Add("bind_address_in_use");
+    if(value.Contains("forbidden by its access permissions")||value.Contains("permission denied")||value.Contains("access is denied"))flags.Add("access_refused");
+    if(value.Contains("unknown field"))flags.Add("unknown_configuration_field");
+    if(value.Contains("unmarshal")||value.Contains("yaml:")||value.Contains("invalid configuration"))flags.Add("configuration_parse_refused");
+    if(value.Contains("no such file")||value.Contains("cannot find the file")||value.Contains("cannot find the path"))flags.Add("configuration_file_missing");
+    return flags.ToArray();
+  }
+}
+'@
 function Private-Directory([string]$Path,[bool]$Guest=$false) {
     $directory=New-Item -ItemType Directory -Path $Path
     $security=[Security.AccessControl.DirectorySecurity]::new()
@@ -69,8 +97,16 @@ function Start-OwnedProcess([string]$Executable,[string]$Arguments){
     $info.UseShellExecute=$false; $info.CreateNoWindow=$true
     $info.RedirectStandardOutput=$true; $info.RedirectStandardError=$true
     $process=[Diagnostics.Process]::Start($info)
+    $processNotes[$process]=[K5GuestProcessNotes]::new($process)
     $process.BeginOutputReadLine(); $process.BeginErrorReadLine()
     return $process
+}
+function Owned-AddressState {
+    $addresses=@(Get-NetIPAddress -InterfaceIndex $hostInterface -IPAddress $hostIPAddress -AddressFamily IPv4 -ErrorAction Stop)
+    if($addresses.Count -ne 1){return 'missing'}
+    $state=[string]$addresses[0].AddressState
+    if($state -in @('Invalid','Tentative','Duplicate','Deprecated','Preferred')){return $state}
+    return 'other'
 }
 function Assert-Publisher {
     if($null -eq $mediaProcess -or $null -eq $publisherProcess -or $mediaProcess.HasExited -or $publisherProcess.HasExited){throw 'Owned generated source ended'}
@@ -175,6 +211,7 @@ try{
     $mediaConfig=@{logLevel='warn';rtspAddress=($hostIPAddress+':18554');rtspTransports=@('tcp');api=$false;rtmp=$false;hls=$false;webrtc=$false;srt=$false;paths=@{generated=@{source='publisher'}}}
     [IO.File]::WriteAllText($configPath,($mediaConfig|ConvertTo-Json -Depth 8),[Text.UTF8Encoding]::new($false))
     $receipt.network_subphase='start_generated_relay'
+    $receipt.host_address_state_before_relay=Owned-AddressState
     $mediaProcess=Start-OwnedProcess $MediaMTX $configPath
     Start-Sleep -Seconds 1
     $source='rtsp://'+$hostIPAddress+':18554/generated'
@@ -375,7 +412,15 @@ try{
         if($null -ne $entry.process){
             $exited=$entry.process.HasExited;$receipt[($entry.name+'_exited_at_failure')]=$exited
             if($exited){$receipt[($entry.name+'_exit_code_at_failure')]=$entry.process.ExitCode}
+            if($processNotes.ContainsKey($entry.process)){
+                $notes=$processNotes[$entry.process]
+                $receipt[($entry.name+'_output_flags')]=@($notes.Flags())
+                $receipt[($entry.name+'_captured_characters')]=$notes.CapturedCharacters
+            }
         }
+    }
+    if($null -ne $hostInterface -and $null -ne $hostIPAddress){
+        try{$receipt.host_address_state_at_failure=Owned-AddressState}catch{$receipt.host_address_observation_failed=$true}
     }
     if($_.Exception -is [ComponentModel.Win32Exception]){$receipt.failure_native_code=$_.Exception.NativeErrorCode}
 }finally{
