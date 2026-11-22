@@ -1,0 +1,88 @@
+name: Stage verified MediaMTX dependency assets
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [codex/mediamtx-clock-20261122]
+    paths: [.github/workflows/mediamtx-clock-package.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  stage-dependency:
+    name: Stage fixed engineering dependency bytes in the existing draft
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Admit exact source artifacts and the existing unpublished draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python - <<'PY'
+          import hashlib, json, os, urllib.request
+          from pathlib import Path
+          assert hashlib.sha256(Path('scripts/package_mediamtx_derivative.py').read_bytes()).hexdigest() == '4859af48b54043589a3e6097dfcf0571d9acc7cb81116d03f7755d80f881344f'
+          def api(path):
+              request = urllib.request.Request('https://api.github.com/repos/' + os.environ['GITHUB_REPOSITORY'] + path,
+                  headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'})
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  return json.load(response)
+          for artifact_id, prefix, digest in (
+              (14735519377, 'experimental-mediamtx-monotonic-', 'a329c01797d059476b6e47e15ba6e7d458f2b54294a49d7615d59baee9dad165'),
+              (14735908196, 'experimental-mediamtx-linux-smoke-', '6f48c0f9b0018afc53bf59e0cb1b7bf84aca8295d3ee1107790d77f7cbf658b7')):
+              meta = api('/actions/artifacts/' + str(artifact_id))
+              assert meta['id'] == artifact_id and meta['expired'] is False
+              assert meta['name'] == prefix + 'bdc40ef129b7341dcfb7d11293feaef43d07ef79-44976375935-attempt-1'
+              assert meta['digest'] == 'sha256:' + digest
+              assert meta['workflow_run']['id'] == 44976375935
+              assert meta['workflow_run']['head_sha'] == 'bdc40ef129b7341dcfb7d11293feaef43d07ef79'
+          draft = api('/releases/454147461')
+          assert draft['draft'] is True and draft['prerelease'] is True
+          assert draft['tag_name'] == 'v1.21.2-k5-monotonic1'
+          assert draft['target_commitish'] == 'ebb48df5010ec4b5c31597ced060162e66d30a4c'
+          assert draft['assets'] == []
+          PY
+      - name: Download admitted native producer bytes
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          artifact-ids: '14735519377'
+          github-token: ${{ github.token }}
+          run-id: '44976375935'
+          path: dependency-proof
+          merge-multiple: true
+      - name: Download admitted native Linux smoke
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          artifact-ids: '14735908196'
+          github-token: ${{ github.token }}
+          run-id: '44976375935'
+          path: dependency-proof
+          merge-multiple: true
+      - name: Reproduce and admit the fixed static archives
+        run: |
+          python scripts/package_mediamtx_derivative.py --directory dependency-proof --linux-smoke dependency-proof/linux-native-smoke.json --output dependency-assets
+          python - <<'PY'
+          import hashlib
+          from pathlib import Path
+          root = Path('dependency-assets')
+          pins = {
+              'mediamtx_v1.21.2-k5-monotonic1_windows_amd64.zip': '17031b0a8caaa71b10213c2729809cc322604791d1b3de3d4e0725ad40ca70c1',
+              'mediamtx_v1.21.2-k5-monotonic1_linux_amd64.tar.gz': '68798adf83b2b78902bc60b448b2f885f96bc459865f6cb434f1e54e5f700d9b',
+              'package-manifest.json': 'eac4f4a668bd44487188ae85e076db981b13a780c22556ac24a06e2dee8b4339'}
+          for name, expected in pins.items():
+              assert hashlib.sha256((root / name).read_bytes()).hexdigest() == expected, name
+          (root / 'SHA256SUMS').write_text(''.join(value + '  ' + name + '\n' for name, value in pins.items()))
+          PY
+      - name: Upload fixed dependency assets without publishing the draft
+        working-directory: dependency-assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload v1.21.2-k5-monotonic1 mediamtx_v1.21.2-k5-monotonic1_windows_amd64.zip mediamtx_v1.21.2-k5-monotonic1_linux_amd64.tar.gz package-manifest.json SHA256SUMS --repo "$GITHUB_REPOSITORY"
