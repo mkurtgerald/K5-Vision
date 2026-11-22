@@ -26,8 +26,52 @@ OS_IMAGES = {
     "consent.exe": "consent",
     "crashpad_handler.exe": "crashpad",
     "pythonw.exe": "pythonw",
+    "cmd.exe": "cmd",
+    "powershell.exe": "powershell",
+    "powershell_ise.exe": "powershell_ise",
+    "pwsh.exe": "pwsh",
+    "w32tm.exe": "w32tm",
+    "sc.exe": "sc",
+    "wmic.exe": "wmic",
+    "reg.exe": "reg",
+    "whoami.exe": "whoami",
+    "hostname.exe": "hostname",
+    "ipconfig.exe": "ipconfig",
+    "taskkill.exe": "taskkill",
+    "tasklist.exe": "tasklist",
+    "where.exe": "where",
+    "find.exe": "find",
+    "findstr.exe": "findstr",
+    "python.exe": "python",
+    "ffmpeg.exe": "ffmpeg",
+    "ffprobe.exe": "ffprobe",
+    "mediamtx.exe": "mediamtx",
+    "caddy.exe": "caddy",
+    "k5vision.exe": "k5vision",
+    "k5visionrecorder.exe": "k5visionrecorder",
 }
-OS_CANDIDATES = set(OS_IMAGES) - {"crashpad_handler.exe", "pythonw.exe"}
+PAYLOAD_FILES = {
+    "python.exe": "runtime/python.exe",
+    "pythonw.exe": "runtime/pythonw.exe",
+    "ffmpeg.exe": "workers/ffmpeg.exe",
+    "ffprobe.exe": "workers/ffprobe.exe",
+    "mediamtx.exe": "workers/mediamtx.exe",
+    "caddy.exe": "workers/caddy.exe",
+    "k5vision.exe": "K5Vision.exe",
+    "k5visionrecorder.exe": "K5VisionRecorder.exe",
+}
+OS_FILES = {
+    name: name
+    for name in OS_IMAGES
+    if name not in {*PAYLOAD_FILES, "crashpad_handler.exe", "pwsh.exe"}
+}
+OS_FILES.update(
+    {
+        "powershell.exe": "WindowsPowerShell/v1.0/powershell.exe",
+        "powershell_ise.exe": "WindowsPowerShell/v1.0/powershell_ise.exe",
+        "wmic.exe": "wbem/wmic.exe",
+    }
+)
 
 
 def finite_error(error):
@@ -114,35 +158,50 @@ def offline_signature(path):
         verify(ctypes.c_void_p(-1), ctypes.byref(action), ctypes.byref(trust))
 
 
-def fixed_os_file_facts(image, system_directory):
-    """Read only a recognized fixed System32 file; never return a path."""
+def fixed_os_file_facts(image, system_directory, installed=None):
+    """Read only fixed known OS/payload code; never emit paths or grant admission."""
     import windows_process_identity as helpers
 
-    from k5vision.installed_code_security import _code_policy, _native_security
+    from k5vision.installed_code_security import _code_policy, _installed_root, _native_security
     from k5vision.windows_identity_security import check_windows_volume
 
     basename = PureWindowsPath(image).name.casefold()
     result = {"category": OS_IMAGES.get(basename, "other"), "fixed_system32_candidate": False}
-    if basename not in OS_CANDIDATES:
+    if basename in OS_FILES:
+        code_root = PureWindowsPath(system_directory)
+        expected = code_root / OS_FILES[basename]
+        scope = "fixed_system32"
+        result["fixed_system32_candidate"] = True
+    elif basename in PAYLOAD_FILES and installed is not None:
+        code_root = PureWindowsPath(installed)
+        expected = code_root / PAYLOAD_FILES[basename]
+        scope = "fixed_installed_payload"
+    elif basename == "pwsh.exe":
+        code_root = _installed_root().parent / "PowerShell" / "7"
+        expected = code_root / "pwsh.exe"
+        scope = "fixed_programfiles_powershell7"
+    else:
         return result
+    result["fixed_known_file_scope"] = scope
     form, actual = helpers._local_image_path(image)
-    expected = PureWindowsPath(system_directory) / basename
     if actual is None or form not in {"normal_drive", "extended_drive"}:
         return result
-    result["fixed_system32_candidate"] = True
     check_windows_volume(str(expected))
-    if not helpers._same_local_file(str(actual), str(expected)):
-        result["system32_same_file_id"] = False
+    same = helpers._same_local_file(str(actual), str(expected))
+    result["fixed_known_file_identity_verified"] = same
+    if scope == "fixed_system32":
+        result["system32_same_file_id"] = same
+    if not same:
         return result
     native = _native_security()
     for component in reversed((expected, *expected.parents)):
         info = Path(component).lstat()
         if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
             raise ValueError("OS observation refuses reparse code")
-        _code_policy(native, component, within=component.is_relative_to(expected.parent))
+        _code_policy(native, component, within=component.is_relative_to(code_root))
     with Path(expected).open("rb") as stream:
         before = os.fstat(stream.fileno())
-        if not stat.S_ISREG(before.st_mode) or not 0 < before.st_size <= 32 * 1024**2:
+        if not stat.S_ISREG(before.st_mode) or not 0 < before.st_size <= 256 * 1024**2:
             raise ValueError("OS observation file size/type differs")
         sha = hashlib.file_digest(stream, "sha256").hexdigest()
         after = os.fstat(stream.fileno())
@@ -154,7 +213,6 @@ def fixed_os_file_facts(image, system_directory):
     ) or not helpers._same_local_file(str(actual), str(expected)):
         raise ValueError("OS observation file identity changed")
     result.update(
-        system32_same_file_id=True,
         trusted_code_custody_verified=True,
         file_identity={"volume": before.st_dev, "file_id": before.st_ino, "links": before.st_nlink},
         file_bytes=before.st_size,
@@ -304,7 +362,12 @@ class ProcessObserver:
         # OS trust work is observational and runs outside the admission/cleanup path.
         def file_observation():
             try:
-                facts = fixed_os_file_facts(private["image"], self.native.system_directory())
+                service = getattr(self.cohort, "service", None)
+                facts = fixed_os_file_facts(
+                    private["image"],
+                    self.native.system_directory(),
+                    getattr(service, "installed", None),
+                )
                 with self.lock:
                     note["os_file"] = facts
                     note["os_file_observation"] = "completed"

@@ -1015,7 +1015,9 @@ def test_native_windows_motion_recording_and_zones(record_testsuite_property):
         browser.close()
         browser = None
         diagnostic["stage"] = "owned_stop_and_uninstall"
+        image_observer.safe_checkpoint("before_explicit_service_stop")
         desktop._stop_app(app, form, api, cohort, diagnostic=diagnostic)
+        image_observer.safe_checkpoint("after_explicit_service_stop")
         _require(
             not cohort.console_seen and not cohort.failed, "Motion worker opened a console window"
         )
