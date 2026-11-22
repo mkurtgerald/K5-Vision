@@ -322,9 +322,9 @@ function Read-SetupState([string]$WindowsVolume) {
                 try{
                     $candidate=$source+$suffix
                     if(-not(Test-Path -LiteralPath $candidate -PathType Leaf)){continue}
-                    $info=Get-Item -LiteralPath $candidate
+                    $info=Get-Item -LiteralPath $candidate -Force
                     if($info.Length -gt 268435456 -or ($info.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0){throw 'Setup hive copy bound refused'}
-                    $note.subphase='snapshot_copy';Copy-Item -LiteralPath $candidate -Destination ($copy+$suffix)
+                    $note.subphase='snapshot_copy';Copy-Item -LiteralPath $candidate -Destination ($copy+$suffix) -Force
                 }catch{
                     if($suffix -ceq ''){throw}
                     if(-not $note.ContainsKey('sidecar_errors')){$note.sidecar_errors=@()}
@@ -426,14 +426,14 @@ function Read-BootFailureOffline {
           setup_task=('Windows\System32\Tasks\K5GuestWitness-'+$transfer);bootstrap_task=('Windows\System32\Tasks\K5GuestBootstrap-'+$transfer)
         }
         foreach($entry in $known.GetEnumerator()){$facts.known_files[$entry.Key]=[bool](Test-Path -LiteralPath (Join-Path $diagnosticMount $entry.Value) -PathType Leaf)}
-        foreach($name in @('setup-failure.json','bootstrap-receipt.json','bootstrap-witness.json')){
+        foreach($name in @('setup-entry.json','setup-failure.json','bootstrap-receipt.json','bootstrap-witness.json')){
             $path=Join-Path $diagnosticMount ('K5GuestWitness\'+$name)
             if(-not(Test-Path -LiteralPath $path -PathType Leaf)){continue}
             $info=Get-Item -LiteralPath $path
             if($info.Length -gt 65536 -or ($info.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0){continue}
             try{
                 $parsed=Get-Content -LiteralPath $path -Raw|ConvertFrom-Json;$safe=@{}
-                foreach($field in @('status','phase','stage','failure_stage','error_kind','failure_type','hresult','failure_hresult','http_status','mfa_enabled_before_reboot','mfa_confirmed_via_normal_api','gui_admin_setup','camera_source_enrolled','service_running','gui_client_closed','cleanup_credentials_removed')){
+                foreach($field in @('status','phase','stage','failure_stage','error_kind','failure_type','hresult','failure_hresult','http_status','mfa_enabled_before_reboot','mfa_confirmed_via_normal_api','gui_admin_setup','camera_source_enrolled','service_running','gui_client_closed','cleanup_credentials_removed','configuration_valid','system_account_verified','observer_session','setup_session_admitted')){
                     $property=$parsed.PSObject.Properties[$field]
                     if($null -eq $property){continue};$value=$property.Value
                     if($value -is [bool] -or $value -is [int] -or $value -is [long]){$safe[$field]=$value}
@@ -452,6 +452,8 @@ function Read-BootFailureOffline {
             $codes=@([regex]::Matches($text,'(?i)(?:HRESULT|\bhr|error(?:\s+code)?)\s*[:= ]\s*(0x[0-9a-f]{8})')|ForEach-Object{$_.Groups[1].Value.ToLowerInvariant()}|Select-Object -Unique -First 16)
             $flags.specialize_seen=($text -match '(?i)\bspecialize\b');$flags.oobe_system_seen=($text -match '(?i)\boobeSystem\b')
             $flags.our_computer_name_seen=($text -match '(?i)\bK5GUEST\b');$flags.our_cached_answer_path_seen=($text -match '(?i)\\Panther\\Unattend\.xml\b')
+            $flags.our_hook_referenced=($text -match '(?i)windows_guest_witness\.ps1')
+            $flags.near_hook_return_codes=@([regex]::Matches($text,'(?is)windows_guest_witness\.ps1.{0,2048}?\b(?:exit(?:\s+code)?|returned(?:\s+code)?|result(?:\s+code)?)\s*(?:=|:|is|with)?\s*(0x[0-9a-f]{1,8}|\d{1,10})')|ForEach-Object{$_.Groups[1].Value.ToLowerInvariant()}|Select-Object -Unique -First 16)
             $flags.error_codes=$codes;$facts.setup_logs[$relative]=$flags;$text=$null
         }
     }finally{
@@ -666,7 +668,8 @@ try{
  <OOBE><HideEULAPage>true</HideEULAPage><HideOnlineAccountScreens>true</HideOnlineAccountScreens><HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE><ProtectYourPC>3</ProtectYourPC></OOBE>
  <UserAccounts><AdministratorPassword><Value>$escaped</Value><PlainText>true</PlainText></AdministratorPassword></UserAccounts>
  <AutoLogon><Password><Value>$escaped</Value><PlainText>true</PlainText></Password><Enabled>true</Enabled><LogonCount>1</LogonCount><Username>Administrator</Username><Domain>.</Domain></AutoLogon>
- </component></settings>
+ </component>
+ <component name="Microsoft-Windows-International-Core" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS"><InputLocale>0409:00000409</InputLocale><SystemLocale>en-US</SystemLocale><UILanguage>en-US</UILanguage><UserLocale>en-US</UserLocale></component></settings>
 </unattend>
 "@
     $panther=Join-Path $windows 'Windows\Panther';if(-not(Test-Path -LiteralPath $panther)){New-Item -ItemType Directory -Path $panther|Out-Null}

@@ -99,7 +99,7 @@ jobs:
               if (@($errors).Count) { throw 'Guest controller source did not parse' }
             }
           }
-          if ($sourceHashes['windows_guest_witness.ps1'] -ne '03ca31f5acff5bd8eaef17ff333b5bbfc274955d7fc969f7f3493dce391506e7') { throw 'Native guest witness Git blob differs' }
+          if ($sourceHashes['windows_guest_witness.ps1'] -ne '040add5d3862b48e9e4ca7549bf96f79192f6c48b4709461f074644fb2f46a8f') { throw 'Native guest witness Git blob differs' }
           $compiler=Join-Path $env:SYSTEMROOT 'Microsoft.NET/Framework64/v4.0.30319/csc.exe'
           $buildRoot=(Resolve-Path -LiteralPath guest-native-build).Path
           $helperSource=(Get-Item -LiteralPath (Join-Path $buildRoot 'windows_guest_bootstrap.cs')).FullName

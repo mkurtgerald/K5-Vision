@@ -9,7 +9,14 @@ $config = Get-Content -LiteralPath (Join-Path $root 'public-config.json') -Raw |
 if ($config.schema_version -ne 1 -or [guid]::Parse($config.transfer_id).ToString() -cne $config.transfer_id) { exit 2 }
 $transfer = [string]$config.transfer_id
 $systemSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-if ($systemSid -ne 'S-1-5-18' -or [Diagnostics.Process]::GetCurrentProcess().SessionId -ne 0) { exit 2 }
+$guestWitnessSession=[Diagnostics.Process]::GetCurrentProcess().SessionId
+if($Mode -ceq 'Setup'){
+    # Diagnostic context only, before admission/native compilation. Windows
+    # Setup may use a different session; observer proof remains SYSTEM/session0.
+    $entry=@{schema_version=1;phase='setup_entry';stage='setup_admission';status='context_captured';configuration_valid=$true;system_account_verified=($systemSid -ceq 'S-1-5-18');observer_session=$guestWitnessSession;setup_session_admitted=($systemSid -ceq 'S-1-5-18' -and $guestWitnessSession -eq 0)}
+    [IO.File]::WriteAllText((Join-Path $root 'setup-entry.json'),($entry|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))
+}
+if ($systemSid -ne 'S-1-5-18' -or $guestWitnessSession -ne 0) { exit 2 }
 
 Add-Type -TypeDefinition @'
 using System;
