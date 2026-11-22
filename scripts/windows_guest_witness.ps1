@@ -50,6 +50,27 @@ using System.Runtime.InteropServices;
 using System.Security.Principal;
 public static class K5GuestNative {
   [StructLayout(LayoutKind.Sequential)] struct Boot { public Guid Id; public int Firmware; public ulong Flags; }
+  // Exact Microsoft WDK 10.0.26100.0 ntddk.h layout, independently
+  // range-extracted from Microsoft.Windows.WDK.x64 10.0.26100.1:
+  // ntddk.h SHA256 2d82908d3c5cfda7214a1d299dc730fd4863c090df7d146a62b0f7fb080320f7.
+  // AlternativeArchitecture C_ASSERT 0x2C0; ULONG BootId; next C_ASSERT 0x2C8.
+  // SDK 10.0.26100.1742 ksamd64.inc defines user VA 0x7FFE0000; SHA256
+  // 832f26c59686cf6864da83681f97fc6fee3a7006399c48efa777d4330a499efb.
+  [StructLayout(LayoutKind.Explicit, Size=0x2D0)] struct SharedBootLayout {
+    [FieldOffset(0x2C0)] public uint AlternativeArchitecture;
+    [FieldOffset(0x2C4)] public uint BootSequence;
+    [FieldOffset(0x2C8)] public long SystemExpirationDate;
+  }
+  [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)] struct Version {
+    public uint Size, Major, Minor, Build, Platform;
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst=128)] public string ServicePack;
+    public ushort ServicePackMajor, ServicePackMinor, SuiteMask;
+    public byte ProductType, Reserved;
+  }
+  [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
+  [DllImport("kernel32.dll", SetLastError=true)] [return:MarshalAs(UnmanagedType.Bool)] static extern bool IsWow64Process2(IntPtr process,out ushort processMachine,out ushort nativeMachine);
+  [DllImport("kernel32.dll", SetLastError=true)] [return:MarshalAs(UnmanagedType.Bool)] static extern bool ReadProcessMemory(IntPtr process,IntPtr address,[Out] byte[] buffer,UIntPtr size,out UIntPtr bytesRead);
+  [DllImport("ntdll.dll", ExactSpelling=true)] static extern int RtlGetVersion(ref Version version);
   [StructLayout(LayoutKind.Sequential)] struct Session { public int Id; public IntPtr Name; public int State; }
   [StructLayout(LayoutKind.Sequential)] struct Audit { public Guid Subcategory; public uint Flags; public Guid Category; }
   [DllImport("ntdll.dll")] static extern int NtQuerySystemInformation(int kind, ref Boot boot, int size, out int length);
@@ -65,6 +86,34 @@ public static class K5GuestNative {
   [DllImport("advapi32.dll",SetLastError=true)] [return:MarshalAs(UnmanagedType.U1)] static extern bool AuditQuerySystemPolicy(ref Guid subcategory,uint count,out IntPtr policy);
   [DllImport("advapi32.dll")] static extern void AuditFree(IntPtr buffer);
   public static string BootId() { var b=new Boot(); int n; if(NtQuerySystemInformation(90,ref b,Marshal.SizeOf(b),out n)<0 || b.Id==Guid.Empty) throw new InvalidOperationException(); return b.Id.ToString(); }
+  public static uint BootSequence() {
+    ushort processMachine,nativeMachine;
+    if(!IsWow64Process2(GetCurrentProcess(),out processMachine,out nativeMachine)) throw new Win32Exception();
+    var version=new Version(); version.Size=(uint)Marshal.SizeOf(typeof(Version));
+    int status=RtlGetVersion(ref version);
+    AssertBootSequenceContext(Environment.Is64BitProcess,Environment.Is64BitOperatingSystem,IntPtr.Size,processMachine,nativeMachine,version.Size,status,version.Major,version.Minor,version.Build);
+    // This checks our managed ABI only. The vendor-header derivation of 0x2C4
+    // is separately pinned; this manually explicit struct is not a WDK compile.
+    if(Marshal.SizeOf(typeof(SharedBootLayout))!=0x2D0 || Marshal.OffsetOf(typeof(SharedBootLayout),"AlternativeArchitecture").ToInt32()!=0x2C0 || Marshal.OffsetOf(typeof(SharedBootLayout),"BootSequence").ToInt32()!=0x2C4 || Marshal.OffsetOf(typeof(SharedBootLayout),"SystemExpirationDate").ToInt32()!=0x2C8) throw new InvalidOperationException("Unsupported native layout");
+    string entry=BootId(); uint first=ReadBootSequence();
+    System.Threading.Thread.Sleep(10);
+    if(ReadBootSequence()!=first || BootId()!=entry) throw new InvalidOperationException("Unstable native boot sequence");
+    return first;
+  }
+  static void AssertBootSequenceContext(bool process64,bool operatingSystem64,int pointerBytes,ushort processMachine,ushort nativeMachine,uint versionSize,int status,uint major,uint minor,uint build) {
+    if(!process64 || !operatingSystem64 || pointerBytes!=8 || processMachine!=0 || nativeMachine!=0x8664) throw new InvalidOperationException("Unsupported native architecture");
+    if(versionSize!=284 || status!=0 || major!=10 || minor!=0 || build!=26100) throw new InvalidOperationException("Unsupported native version");
+  }
+  static uint DecodeBootSequence(bool success,UIntPtr received,byte[] bytes) {
+    if(!success) throw new Win32Exception();
+    if(received.ToUInt64()!=4 || bytes==null || bytes.Length!=4) throw new InvalidOperationException("Native boot sequence length differs");
+    return BitConverter.ToUInt32(bytes,0);
+  }
+  static uint ReadBootSequence() {
+    var bytes=new byte[4]; UIntPtr received;
+    bool success=ReadProcessMemory(GetCurrentProcess(),new IntPtr(0x7FFE02C4L),bytes,new UIntPtr(4u),out received);
+    return DecodeBootSequence(success,received,bytes);
+  }
   static bool AuditSuccess(string category) { var g=new Guid(category); IntPtr p; if(!AuditQuerySystemPolicy(ref g,1,out p)) throw new Win32Exception(); try{return (((Audit)Marshal.PtrToStructure(p,typeof(Audit))).Flags&1)!=0;} finally{AuditFree(p);} }
   public static bool LogonAuditEnabled() { return AuditSuccess("0cce9215-69ae-11d9-bed3-505054503030"); }
   public static bool StartupAuditEnabled() { return AuditSuccess("0cce9210-69ae-11d9-bed3-505054503030"); }
@@ -170,25 +219,31 @@ function Security-EventHash($Event) {
     $hash=[Security.Cryptography.SHA256]::Create()
     try{return [BitConverter]::ToString($hash.ComputeHash($bytes)).Replace('-','').ToLowerInvariant()}finally{$hash.Dispose()}
 }
-function Security-Checkpoint([string]$Boot) {
+function Assert-NextBootSequence([long]$Previous,[long]$Current) {
+    # The documented ULONG loader sequence is a per-boot marker. Refuse wrap,
+    # reset, multiple boot attempts and unchanged values in this exact VM.
+    if($Previous -lt 0 -or $Previous -ge 4294967295 -or $Current -ne ($Previous+1)){throw 'Native reboot sequence differs'}
+}
+function Security-Checkpoint([string]$Boot,[long]$Sequence) {
     $newest=@();$oldest=@()
     try{
         $newest=@(Get-WinEvent -LogName Security -MaxEvents 1 -ErrorAction Stop)
         $oldest=@(Get-WinEvent -LogName Security -MaxEvents 1 -Oldest -ErrorAction Stop)
         if($newest.Count -ne 1 -or $oldest.Count -ne 1 -or $newest[0].RecordId -lt $oldest[0].RecordId -or $oldest[0].RecordId -lt 1){throw 'Security checkpoint unavailable'}
-        return @{boot_id=$Boot;record_id=[long]$newest[0].RecordId;oldest_record_id=[long]$oldest[0].RecordId;xml_sha256=(Security-EventHash $newest[0])}
+        return @{boot_id=$Boot;boot_sequence=$Sequence;record_id=[long]$newest[0].RecordId;oldest_record_id=[long]$oldest[0].RecordId;xml_sha256=(Security-EventHash $newest[0])}
     }finally{foreach($event in (@($newest)+@($oldest))){if($event -is [IDisposable]){$event.Dispose()}}}
 }
 function Assert-SecurityAuditContext {
     if(-not [K5GuestNative]::LogonAuditEnabled() -or -not [K5GuestNative]::StartupAuditEnabled()){throw 'Native audit policy coverage unavailable'}
     if(@([K5GuestNative]::InteractiveSessions()).Count -ne 0){throw 'Interactive session during audit boundary'}
 }
-function Security-RebootAudit($Checkpoint,[string]$PreviousBoot,[string]$CurrentBoot) {
+function Security-RebootAudit($Checkpoint,[string]$PreviousBoot,[string]$CurrentBoot,[long]$PreviousSequence,[long]$CurrentSequence) {
     $stability=[Diagnostics.Stopwatch]::StartNew()
     for($attempt=0;$attempt -lt 8;$attempt++){
         $oldest=@();$newest=@();$anchor=@();$events=@();$oldestAfter=@();$anchorAfter=@();$tailAfter=@();$boundaryOldest=@();$boundaryAnchor=@();$boundaryTail=@()
         try{
-            if($Checkpoint.boot_id -cne $PreviousBoot -or $CurrentBoot -ceq $PreviousBoot -or $Checkpoint.record_id -lt 1 -or $Checkpoint.oldest_record_id -lt 1 -or $Checkpoint.xml_sha256 -cnotmatch '^[a-f0-9]{64}$'){throw 'Security reboot checkpoint differs'}
+            Assert-NextBootSequence $PreviousSequence $CurrentSequence
+            if($Checkpoint.boot_id -cne $PreviousBoot -or $CurrentBoot -cne $PreviousBoot -or $Checkpoint.boot_sequence -ne $PreviousSequence -or $Checkpoint.record_id -lt 1 -or $Checkpoint.oldest_record_id -lt 1 -or $Checkpoint.xml_sha256 -cnotmatch '^[a-f0-9]{64}$'){throw 'Security reboot checkpoint differs'}
             $oldest=@(Get-WinEvent -LogName Security -MaxEvents 1 -Oldest -ErrorAction Stop)
             $newest=@(Get-WinEvent -LogName Security -MaxEvents 1 -ErrorAction Stop)
             if($oldest.Count -ne 1 -or $newest.Count -ne 1 -or $oldest[0].RecordId -ne $Checkpoint.oldest_record_id -or $newest[0].RecordId -le $Checkpoint.record_id){throw 'Security log cleared reset or wrapped'}
@@ -291,13 +346,14 @@ if ($Mode -eq 'Setup') {
 $phase = [string]$config.phase
 try{
     $boot = [K5GuestNative]::BootId()
-    Write-EntryDiagnostic ('observer-stage-'+$phase+'.json') @{schema_version=1;phase=$phase;status='native_ready';stage='native_boot_id';boot_id=$boot;observer_session=$guestWitnessSession}
+    $bootSequence = [K5GuestNative]::BootSequence()
+    Write-EntryDiagnostic ('observer-stage-'+$phase+'.json') @{schema_version=1;phase=$phase;status='native_ready';stage='native_boot_id';boot_id=$boot;boot_sequence=$bootSequence;observer_session=$guestWitnessSession}
 }catch{
     Write-EntryDiagnostic ('observer-preflight-failure-'+$phase+'.json') @{schema_version=1;phase=$phase;stage='native_boot_id';status='preflight_failed';error_kind=$_.Exception.GetType().Name;hresult=$_.Exception.HResult;observer_session=$guestWitnessSession}
     exit 1
 }
 $receipt = [ordered]@{
-    schema_version=1; phase=$phase; transfer_id=$transfer; status='failed'; boot_id=$boot;
+    schema_version=1; phase=$phase; transfer_id=$transfer; status='failed'; boot_id=$boot; boot_sequence=$bootSequence; native_boot_sequence_verified=$true;
     head_sha=$config.head_sha; installer_sha256=$config.setup_sha256; observer_sid='SYSTEM'; observer_session=0;
     startup_before_interactive_login=$false; recording_after_reboot=$false; recording_after_signout=$false;
     retained_closed_hashes_unchanged=$false; logon_audit_enabled=$false; cleanup_credentials_removed=$false
@@ -329,8 +385,10 @@ try {
             Start-Sleep -Seconds 1
         } while ($true)
         if(-not [K5GuestNative]::LogonAuditEnabled() -or -not [K5GuestNative]::StartupAuditEnabled()){throw 'Audit coverage disabled before reboot'}
-        $checkpoint=Security-Checkpoint $boot
-        $baseline = @{schema_version=1; boot_id=$boot; transfer_id=$transfer; files=$closed; security_checkpoint=$checkpoint}
+        $baselineSequence=[K5GuestNative]::BootSequence()
+        if($baselineSequence -ne $bootSequence){throw 'Bootstrap native sequence changed'}
+        $checkpoint=Security-Checkpoint $boot $bootSequence
+        $baseline = @{schema_version=1; boot_id=$boot; boot_sequence=$bootSequence; transfer_id=$transfer; files=$closed; security_checkpoint=$checkpoint}
         $receipt.startup_audit_enabled=$true
         $receipt.baseline_sha256 = Write-PrivateJson 'baseline.json' $baseline
         $receipt.service = Recorder-Facts
@@ -349,7 +407,8 @@ try {
         $receipt.logon_audit_enabled = [K5GuestNative]::LogonAuditEnabled()
         if (-not $receipt.logon_audit_enabled) { throw 'Logon audit disabled' }
         $baseline = Get-Content -LiteralPath (Join-Path $root 'baseline.json') -Raw | ConvertFrom-Json
-        if ($baseline.transfer_id -cne $transfer -or $baseline.boot_id -cne $config.previous_boot_id -or $boot -ceq $baseline.boot_id) { throw 'Actual reboot not established' }
+        if ($baseline.transfer_id -cne $transfer -or $baseline.boot_id -cne $config.previous_boot_id -or $boot -cne $baseline.boot_id -or $baseline.boot_sequence -ne $config.previous_boot_sequence) { throw 'Reboot source identity differs' }
+        Assert-NextBootSequence $baseline.boot_sequence $bootSequence
         $receipt.startup_audit_enabled=[K5GuestNative]::StartupAuditEnabled()
         if(-not $receipt.startup_audit_enabled){throw 'Startup audit disabled'}
         $observationStage='service_before_login'
@@ -357,7 +416,7 @@ try {
         $watch = [Diagnostics.Stopwatch]::StartNew()
         while ($true) {
             if (@([K5GuestNative]::InteractiveSessions()).Count -ne 0) { throw 'Interactive session preceded boot witness' }
-            try { $observationStage='boot_security_audit';$audit=Security-RebootAudit $baseline.security_checkpoint $baseline.boot_id $boot;$observationStage='service_before_login';$service = Recorder-Facts; break } catch { if ($watch.Elapsed.TotalSeconds -gt 90) { throw }; Start-Sleep -Milliseconds 250 }
+            try { $observationStage='boot_security_audit';$audit=Security-RebootAudit $baseline.security_checkpoint $baseline.boot_id $boot $baseline.boot_sequence $bootSequence;$observationStage='service_before_login';$service = Recorder-Facts; break } catch { if ($watch.Elapsed.TotalSeconds -gt 90) { throw }; Start-Sleep -Milliseconds 250 }
         }
         $before = Recording-Bytes
         $observationStage='prelogin_recording_growth'
@@ -385,7 +444,7 @@ try {
             $postboot=@(Closed-Recordings|Where-Object{(Join-Path $recordingRoot $_.path) -notin $startupPaths})
             if($postboot.Count -gt 0){break}
             if($rebootWatch.Elapsed.TotalSeconds -ge 200){throw 'New closed postboot recording unavailable'}
-            if($auditWatch.Elapsed.TotalSeconds -ge 1){$audit=Security-RebootAudit $baseline.security_checkpoint $baseline.boot_id $boot;$auditWatch.Restart()}
+            if($auditWatch.Elapsed.TotalSeconds -ge 1){$audit=Security-RebootAudit $baseline.security_checkpoint $baseline.boot_id $boot $baseline.boot_sequence $bootSequence;$auditWatch.Restart()}
             Start-Sleep -Milliseconds 250
         }while($true)
         $receipt.postboot_closed_recording=$postboot[0]
@@ -393,7 +452,7 @@ try {
         $receipt.reboot_observation_total_seconds=[Math]::Round($rebootWatch.Elapsed.TotalSeconds,3)
         $observationStage='final_boot_security_audit'
         Write-EntryDiagnostic 'observer-stage-reboot.json' @{schema_version=1;phase=$phase;status='observing';stage=$observationStage;boot_id=$boot;observer_session=$guestWitnessSession}
-        $audit=Security-RebootAudit $baseline.security_checkpoint $baseline.boot_id $boot
+        $audit=Security-RebootAudit $baseline.security_checkpoint $baseline.boot_id $boot $baseline.boot_sequence $bootSequence
         $receipt.security_audit_checkpoint_retained=$audit.checkpoint_retained
         $receipt.security_no_clear_reset_wrap=$audit.no_clear_reset_wrap
         $receipt.security_policy_coverage_verified=$audit.policy_coverage_verified
@@ -402,6 +461,8 @@ try {
         $receipt.startup_audit_record_id=$audit.startup_record_id
         $receipt.security_observed_through_record_id=$audit.through_record_id
         $receipt.previous_boot_id = $baseline.boot_id
+        $receipt.previous_boot_sequence = $baseline.boot_sequence
+        $receipt.native_boot_sequence_increment_verified = $true
         $receipt.startup_before_interactive_login = $true
         $receipt.recording_after_reboot = $true
         $receipt.retained_closed_hashes_unchanged = $true
@@ -416,7 +477,7 @@ try {
         $observationStage='interactive_session_admission'
         Disable-TemporaryAutoLogon
         $receipt.cleanup_credentials_removed = $true
-        if ($boot -cne $config.previous_boot_id) { throw 'Signout changed boot' }
+        if ($boot -cne $config.previous_boot_id -or $bootSequence -ne $config.previous_boot_sequence) { throw 'Signout changed boot' }
         $sessions = @([K5GuestNative]::InteractiveSessions())
         if ($sessions.Count -ne 1 -or $sessions[0] -le 0) { throw 'Exact interactive session unavailable' }
         $service = Recorder-Facts
@@ -436,7 +497,7 @@ try {
             Start-Sleep -Milliseconds 250
         } while ($watch.Elapsed.TotalSeconds -lt 20)
         $after = Recording-Bytes
-        if ($after -le $before -or [K5GuestNative]::BootId() -cne $boot) { throw 'Recording did not survive same-boot signout' }
+        if ($after -le $before -or [K5GuestNative]::BootId() -cne $boot -or [K5GuestNative]::BootSequence() -ne $bootSequence) { throw 'Recording did not survive same-boot signout' }
         $receipt.signed_out_session_id = $sessions[0]
         $receipt.recording_after_signout = $true
         $receipt.recording_bytes_before = $before

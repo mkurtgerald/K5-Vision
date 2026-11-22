@@ -541,7 +541,7 @@ function Read-BootFailureOffline {
             if($info.Length -gt 65536 -or ($info.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0){continue}
             try{
                 $parsed=Get-Content -LiteralPath $path -Raw|ConvertFrom-Json;$safe=@{}
-                foreach($field in @('status','phase','stage','failure_stage','error_kind','failure_type','hresult','failure_hresult','native_code','http_status','mfa_enabled_before_reboot','mfa_confirmed_via_normal_api','gui_admin_setup','camera_source_enrolled','service_running','gui_client_closed','cleanup_credentials_removed','configuration_valid','system_account_verified','observer_session','setup_session_admitted','observer_session_admitted','logon_audit_enabled','startup_audit_enabled','security_policy_coverage_verified','security_tail_stable','boot_id','previous_boot_id')){
+                foreach($field in @('status','phase','stage','failure_stage','error_kind','failure_type','hresult','failure_hresult','native_code','http_status','mfa_enabled_before_reboot','mfa_confirmed_via_normal_api','gui_admin_setup','camera_source_enrolled','service_running','gui_client_closed','cleanup_credentials_removed','configuration_valid','system_account_verified','observer_session','setup_session_admitted','observer_session_admitted','logon_audit_enabled','startup_audit_enabled','security_policy_coverage_verified','security_tail_stable','boot_id','previous_boot_id','boot_sequence','previous_boot_sequence','native_boot_sequence_verified','native_boot_sequence_increment_verified')){
                     $property=$parsed.PSObject.Properties[$field]
                     if($null -eq $property){continue};$value=$property.Value
                     if($value -is [bool] -or $value -is [int] -or $value -is [long]){$safe[$field]=$value}
@@ -768,7 +768,7 @@ try{
     Copy-Item -LiteralPath $BootstrapExe -Destination (Join-Path $guestRoot 'windows_guest_bootstrap.exe')
     Copy-Item -LiteralPath $SetupPath -Destination (Join-Path $guestRoot 'K5VisionSetup.exe')
     $mac='00155D'+([guid]::NewGuid().ToString('N').Substring(0,6)).ToUpperInvariant()
-    $public=@{schema_version=1;transfer_id=$transfer;head_sha=$ProductHead;setup_sha256=$SetupSha256;phase='bootstrap';previous_boot_id='';guest_mac=$mac;guest_ip=$guestIP;host_ip=$hostIPAddress}
+    $public=@{schema_version=1;transfer_id=$transfer;head_sha=$ProductHead;setup_sha256=$SetupSha256;phase='bootstrap';previous_boot_id='';previous_boot_sequence=-1;guest_mac=$mac;guest_ip=$guestIP;host_ip=$hostIPAddress}
     $request=@{schema_version=1;head_sha=$ProductHead;setup_sha256=$SetupSha256;source_uri=$source;transfer_id=$transfer;receipt_path='C:\K5GuestWitness\bootstrap-receipt.json'}
     [IO.File]::WriteAllText((Join-Path $guestRoot 'public-config.json'),($public|ConvertTo-Json -Depth 5),[Text.UTF8Encoding]::new($false))
     [IO.File]::WriteAllText((Join-Path $guestRoot 'bootstrap-request.json'),($request|ConvertTo-Json -Depth 5),[Text.UTF8Encoding]::new($false))
@@ -843,27 +843,27 @@ try{
     $direct=Open-Direct
     $initial=Read-GuestReceipt 'bootstrap' $firstSeal
     $receipt.bootstrap_witness=$initial
-    if($initial.status -cne 'bootstrap_sealed' -or -not $initial.cleanup_credentials_removed){throw 'Guest bootstrap not sealed'}
+    if($initial.status -cne 'bootstrap_sealed' -or -not $initial.cleanup_credentials_removed -or $initial.native_boot_sequence_verified -ne $true -or $initial.boot_sequence -lt 0 -or $initial.boot_sequence -ge 4294967295){throw 'Guest bootstrap not sealed'}
     $receipt.actual_guest_boot=$true
     $receipt.stage='real_guest_reboot'
     Invoke-Command -Session $direct -ScriptBlock {
-        param($boot)
+        param($boot,$sequence)
         $path='C:\K5GuestWitness\public-config.json';$configuration=Get-Content -LiteralPath $path -Raw|ConvertFrom-Json
-        $configuration.phase='reboot';$configuration.previous_boot_id=$boot
+        $configuration.phase='reboot';$configuration.previous_boot_id=$boot;$configuration.previous_boot_sequence=$sequence
         if(([IO.File]::GetAttributes($path) -band [IO.FileAttributes]::ReparsePoint) -ne 0){throw 'Owned phase file refused'}
         $bytes=[Text.UTF8Encoding]::new($false).GetBytes(($configuration|ConvertTo-Json -Depth 5))
         $stream=[IO.FileStream]::new($path,[IO.FileMode]::Open,[IO.FileAccess]::Write,[IO.FileShare]::Read,4096,[IO.FileOptions]::WriteThrough)
         try{$stream.SetLength(0);$stream.Write($bytes,0,$bytes.Length);$stream.Flush($true)}finally{$stream.Dispose()}
         $verified=Get-Content -LiteralPath $path -Raw|ConvertFrom-Json
-        if($verified.phase -cne 'reboot' -or $verified.previous_boot_id -cne $boot){throw 'Durable reboot phase verification failed'}
-    } -ArgumentList $initial.boot_id -ErrorAction Stop
+        if($verified.phase -cne 'reboot' -or $verified.previous_boot_id -cne $boot -or $verified.previous_boot_sequence -ne $sequence){throw 'Durable reboot phase verification failed'}
+    } -ArgumentList $initial.boot_id,$initial.boot_sequence -ErrorAction Stop
     Remove-PSSession -Session $direct;$direct=$null
     Bounded-Job (Restart-VM -VM (Owned-VM) -Force -AsJob -Confirm:$false) 40|Out-Null
     $rebootSeal=Kvp-Seal 'reboot' 240
     $receipt.stage='reboot_receipt_read'
     $direct=Open-Direct
     $reboot=Read-GuestReceipt 'reboot' $rebootSeal;$receipt.reboot_witness=$reboot
-    if($reboot.status -cne 'reboot_sealed' -or -not $reboot.startup_before_interactive_login -or -not $reboot.recording_after_reboot -or -not $reboot.retained_closed_hashes_unchanged -or $reboot.boot_id -ceq $initial.boot_id){throw 'Reboot recording witness failed'}
+    if($reboot.status -cne 'reboot_sealed' -or -not $reboot.startup_before_interactive_login -or -not $reboot.recording_after_reboot -or -not $reboot.retained_closed_hashes_unchanged -or $reboot.boot_id -cne $initial.boot_id -or $reboot.native_boot_sequence_verified -ne $true -or $reboot.native_boot_sequence_increment_verified -ne $true -or $reboot.previous_boot_sequence -ne $initial.boot_sequence -or $reboot.boot_sequence -ne ($initial.boot_sequence+1)){throw 'Reboot recording witness failed'}
     if(-not $reboot.security_policy_coverage_verified -or -not $reboot.security_tail_stable -or -not $reboot.startup_audit_enabled -or -not $reboot.startup_audit_4608_verified -or -not $reboot.security_audit_checkpoint_retained -or -not $reboot.security_no_clear_reset_wrap -or -not $reboot.postboot_clip_created_after_system_inventory -or $null -eq $reboot.postboot_closed_recording){throw 'Reboot audit or new closed recording witness unavailable'}
     $receipt.recording_after_reboot_before_login=$true
     $receipt.stage='actual_console_logon'
@@ -887,17 +887,17 @@ try{
     if($interactive -lt 1){throw 'Actual interactive guest login not observed'}
     $receipt.stage='actual_guest_signout'
     Invoke-Command -Session $direct -ScriptBlock {
-        param($boot,$transfer)
+        param($boot,$sequence,$transfer)
         $path='C:\K5GuestWitness\public-config.json';$configuration=Get-Content -LiteralPath $path -Raw|ConvertFrom-Json
-        $configuration.phase='signout';$configuration.previous_boot_id=$boot
+        $configuration.phase='signout';$configuration.previous_boot_id=$boot;$configuration.previous_boot_sequence=$sequence
         [IO.File]::WriteAllText($path,($configuration|ConvertTo-Json -Depth 5),[Text.UTF8Encoding]::new($false))
         Start-ScheduledTask -TaskName ('K5GuestWitness-'+$transfer)
-    } -ArgumentList $reboot.boot_id,$transfer -ErrorAction Stop
+    } -ArgumentList $reboot.boot_id,$reboot.boot_sequence,$transfer -ErrorAction Stop
     Remove-PSSession -Session $direct;$direct=$null
     $signoutSeal=Kvp-Seal 'signout' 120
     $direct=Open-Direct
     $signout=Read-GuestReceipt 'signout' $signoutSeal;$receipt.signout_witness=$signout
-    if($signout.status -cne 'signout_sealed' -or -not $signout.recording_after_signout -or $signout.boot_id -cne $reboot.boot_id){throw 'Signout recording witness failed'}
+    if($signout.status -cne 'signout_sealed' -or -not $signout.recording_after_signout -or $signout.boot_id -cne $reboot.boot_id -or $signout.native_boot_sequence_verified -ne $true -or $signout.boot_sequence -ne $reboot.boot_sequence){throw 'Signout recording witness failed'}
     $receipt.recording_after_actual_signout=$true
     $receipt.stage='retained_media_decode'
     $preboot=Invoke-Command -Session $direct -ScriptBlock {

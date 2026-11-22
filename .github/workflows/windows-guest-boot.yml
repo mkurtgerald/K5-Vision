@@ -15,6 +15,7 @@ on:
       - scripts/windows_guest_witness.ps1
       - scripts/windows_guest_bootstrap.cs
       - scripts/windows_guest_bootstrap_controls.cs
+      - scripts/windows_guest_boot_sequence_controls.ps1
 permissions:
   contents: read
 concurrency:
@@ -87,7 +88,7 @@ jobs:
         run: |
           $ErrorActionPreference='Stop'
           New-Item -ItemType Directory -Path guest-native-build | Out-Null
-          foreach ($name in @('probe_windows_guest_recording.ps1','windows_guest_witness.ps1','windows_guest_bootstrap.cs','windows_guest_bootstrap_controls.cs')) {
+          foreach ($name in @('probe_windows_guest_recording.ps1','windows_guest_witness.ps1','windows_guest_bootstrap.cs','windows_guest_bootstrap_controls.cs','windows_guest_boot_sequence_controls.ps1')) {
             & (Join-Path $env:SYSTEMROOT 'System32/cmd.exe') /d /c "git cat-file blob HEAD:scripts/$name > guest-native-build\$name"
             if ($LASTEXITCODE -ne 0) { throw 'Guest source Git blob unavailable' }
           }
@@ -100,9 +101,10 @@ jobs:
               if (@($errors).Count) { throw 'Guest controller source did not parse' }
             }
           }
-          if ($sourceHashes['windows_guest_witness.ps1'] -ne 'efde26d882422608f25b6b94eed1e047bd3ecea7528a9163ea2d17cdb5018109') { throw 'Native guest witness Git blob differs' }
+          if ($sourceHashes['windows_guest_witness.ps1'] -ne '2ff2f5d53a5efeed004f963ef04bb12357f140f1ad3c6122acafea03f60b98ec') { throw 'Native guest witness Git blob differs' }
           if ($sourceHashes['windows_guest_bootstrap.cs'] -ne 'b8ef1a885d876d0a66833b3350221bd66794f972843e418815628278b9163909' -or
               $sourceHashes['windows_guest_bootstrap_controls.cs'] -ne '4757e92ab04d387d9d04f0572949c1224dbfa2f25222cb5680290577ec30c837') { throw 'Guest GUI bootstrap controls source differs' }
+          if ($sourceHashes['windows_guest_boot_sequence_controls.ps1'] -ne '84204b182165214c3cf46558ff812c87892b6213a0529d7641a2ea3606cb48c0') { throw 'Native boot sequence controls source differs' }
           $compiler=Join-Path $env:SYSTEMROOT 'Microsoft.NET/Framework64/v4.0.30319/csc.exe'
           $buildRoot=(Resolve-Path -LiteralPath guest-native-build).Path
           $helperSource=(Get-Item -LiteralPath (Join-Path $buildRoot 'windows_guest_bootstrap.cs')).FullName
@@ -143,11 +145,23 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Compiled QA TOTP codec did not run' }
           $after=(& python guest-native-build/totp-reference.py).Trim()
           if ($LASTEXITCODE -ne 0 -or $actual -notin @($before,$after)) { throw 'Compiled QA TOTP codec disagreed with independent reference' }
+          # Compile the exact literal native witness class and exercise its ABI,
+          # refusal controls and actual same-boot x64/build26100 read before a VM.
+          # The paired host reads never claim an actual guest reboot.
+          $counterOutput=& (Join-Path $env:SYSTEMROOT 'System32/WindowsPowerShell/v1.0/powershell.exe') -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $buildRoot 'windows_guest_boot_sequence_controls.ps1') -Source (Join-Path $buildRoot 'windows_guest_witness.ps1')
+          if ($LASTEXITCODE -ne 0) { throw 'Native boot sequence ABI or read controls failed' }
+          $counter=$counterOutput | ConvertFrom-Json
+          if ($counter.schema_version -ne 1 -or $counter.diagnostic_only -ne $true -or $counter.product_qualification -ne $false -or
+              $counter.native_same_boot_read_observed -ne $true -or $counter.actual_guest_reboot_observed -ne $false -or
+              $counter.contract_controls_passed -ne 34 -or $counter.source_sha256 -ne $sourceHashes['windows_guest_witness.ps1'] -or
+              $counter.vendor_wdk_header_sha256 -ne '2d82908d3c5cfda7214a1d299dc730fd4863c090df7d146a62b0f7fb080320f7' -or
+              $counter.vendor_sdk_mapping_header_sha256 -ne '832f26c59686cf6864da83681f97fc6fee3a7006399c48efa777d4330a499efb') { throw 'Native boot read controls receipt differs' }
+          $counterOutput
           $sourceHashes['windows_guest_bootstrap.exe']=(Get-FileHash -LiteralPath guest-native-build/windows_guest_bootstrap.exe -Algorithm SHA256).Hash.ToLowerInvariant()
           @{schema_version=1; diagnostic_only=$true; product_qualification=$false; harness_head=$env:GITHUB_SHA;
             product_head=$env:K5_GUEST_PRODUCT_HEAD; installer_sha256=$env:K5_GUEST_SETUP_SHA256;
             image_sha256='2d175924c8e647969a82e36f931b22397108bd94a030e0e947b7e66e47e0be9a';
-            source_hashes=$sourceHashes; run_id=$env:GITHUB_RUN_ID; run_attempt=$env:GITHUB_RUN_ATTEMPT} |
+            source_hashes=$sourceHashes; native_boot_sequence_read=$counter; run_id=$env:GITHUB_RUN_ID; run_attempt=$env:GITHUB_RUN_ATTEMPT} |
             ConvertTo-Json -Depth 5 | Set-Content -LiteralPath windows-guest-recording-provenance.json -Encoding utf8
       - name: Admit the exact f354 GUI producer and its unqualified candidate
         shell: pwsh
