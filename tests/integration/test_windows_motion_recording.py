@@ -575,7 +575,11 @@ def test_native_windows_motion_recording_and_zones(record_testsuite_property):
                         name: hashlib.sha256(
                             Path(__file__).with_name(name).read_bytes()
                         ).hexdigest()
-                        for name in (Path(__file__).name, "test_operator_product_runtime.py")
+                        for name in (
+                            Path(__file__).name,
+                            "test_operator_product_runtime.py",
+                            "windows_service_image_observer.py",
+                        )
                     },
                 },
                 sort_keys=True,
@@ -610,6 +614,7 @@ def test_native_windows_motion_recording_and_zones(record_testsuite_property):
     installed, profile = desktop._machine_paths()
     api, processes, fixtures, reservations = desktop._Windows(), [], [], []
     cohort = desktop._Cohort(api)
+    image_observer = _helpers("windows_service_image_observer").install(cohort)
     app = form = playwright = browser = context = page = publisher = None
     failed = cleanup_failed = False
     try:
@@ -1079,6 +1084,7 @@ def test_native_windows_motion_recording_and_zones(record_testsuite_property):
                 diagnostic["failure_line"] = trace.tb_lineno
             trace = trace.tb_next
     finally:
+        image_observer.safe_checkpoint("before_fixture_cleanup")
         for label, resource in (
             ("browser_context", context),
             ("browser", browser),
@@ -1137,6 +1143,10 @@ def test_native_windows_motion_recording_and_zones(record_testsuite_property):
             except BaseException as error:
                 cleanup_failed = True
                 _cleanup_note(diagnostic, "temporary_tree", error)
+        record(
+            "motion_service_image_observations",
+            json.dumps(image_observer.finalize(), sort_keys=True),
+        )
         if failed or cleanup_failed:
             safe = {
                 k: v
