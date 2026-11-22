@@ -1,0 +1,178 @@
+name: Exact f354 camera wall diagnostic
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [codex/camera-wall-diagnostics-20261122]
+    paths:
+      - .github/workflows/camera-wall-diagnostics.yml
+      - tests/integration/test_windows_camera_video_settings.py
+      - tests/integration/test_windows_camera_wall_failure_diagnostic.py
+      - tests/unit/test_windows_camera_wall_diagnostic.py
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: camera-wall-diagnostic-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  camera-wall-diagnostic:
+    name: DIAGNOSTIC ONLY - exact f354 five-camera wall
+    runs-on: windows-2025
+    timeout-minutes: 12
+    env:
+      K5_DESKTOP_HEAD_SHA: f354dc3c4412ef6e074545ee523dea0cf2a888f9
+      K5_DESKTOP_SETUP_SHA256: 44ae455d8937c8b39cd07085c981303b140616205ae7dfcc1235b37982f73942
+      K5_OPERATOR_BROWSER_ACCEPTANCE: "1"
+      K5_OPERATOR_BROWSER_CHANNEL: msedge
+      K5_NATIVE_CAMERA_VIDEO_ACCEPTANCE: "1"
+      K5_NATIVE_CAMERA_WALL_DIAGNOSTIC_ONLY: "1"
+      K5_DIAGNOSTIC_HARNESS_HEAD_SHA: ${{ github.sha }}
+      K5_CAMERA_WALL_WRAPPER_SHA256: ac3d07d72ef162f900f491d7e6338832f2dacb8a398435ea2a1fa7e82a2bde6b
+    steps:
+      - name: Checkout exact original installer runtime and acceptance source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: f354dc3c4412ef6e074545ee523dea0cf2a888f9
+          persist-credentials: false
+      - name: Checkout separately identified diagnostic observer source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          path: diagnostic-source
+          persist-credentials: false
+      - name: Admit immutable original candidate and successful GUI producer
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $headers = @{ Authorization="Bearer $env:GH_TOKEN"; Accept='application/vnd.github+json'; 'X-GitHub-Api-Version'='2022-11-28' }
+          $api = "https://api.github.com/repos/$env:GITHUB_REPOSITORY/actions"
+          $meta = Invoke-RestMethod -Uri "$api/artifacts/14741238112" -Headers $headers
+          $attempt = Invoke-RestMethod -Uri "$api/runs/44989807369/attempts/1" -Headers $headers
+          $jobs = Invoke-RestMethod -Uri "$api/runs/44989807369/attempts/1/jobs?per_page=100" -Headers $headers
+          $producer = @($jobs.jobs | Where-Object { $_.id -eq 137108170949 })
+          if ($meta.id -ne 14741238112 -or $meta.expired -ne $false -or
+              $meta.name -ne "k5-vision-windows-upgrade-candidate-$($env:K5_DESKTOP_HEAD_SHA)-44989807369-attempt-1" -or
+              $meta.size_in_bytes -ne 285141694 -or
+              $meta.digest -ne 'sha256:7eb6f1aa566d9c1376a5f2f82e54c33fca22f7847fe7e9473f7f6a0ba66184d5' -or
+              $meta.workflow_run.id -ne 44989807369 -or $meta.workflow_run.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or
+              $attempt.id -ne 44989807369 -or $attempt.run_attempt -ne 1 -or $attempt.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or
+              $producer.Count -ne 1 -or $producer[0].conclusion -ne 'success') {
+            throw 'Original camera replay candidate or GUI producer identity mismatch'
+          }
+      - name: Download exact admitted original candidate by fixed artifact ID
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          artifact-ids: 14741238112
+          github-token: ${{ github.token }}
+          run-id: 44989807369
+          path: camera-replay-input
+          merge-multiple: true
+      - name: Bind original bytes and exact diagnostic Git blobs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $harnessHead = (& git -C diagnostic-source rev-parse HEAD).Trim()
+          $productHead = (& git rev-parse HEAD).Trim()
+          if ($harnessHead -ne $env:K5_DIAGNOSTIC_HARNESS_HEAD_SHA -or
+              $productHead -ne $env:K5_DESKTOP_HEAD_SHA -or $harnessHead -eq $productHead) {
+            throw 'Camera replay product and diagnostic source identities differ from admission'
+          }
+          $setup = Get-Item -LiteralPath camera-replay-input/K5VisionSetup.exe
+          $setupSha = (Get-FileHash -LiteralPath $setup.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          $package = Get-Content -LiteralPath camera-replay-input/desktop-package.json -Raw | ConvertFrom-Json
+          $manifest = Get-Content -LiteralPath camera-replay-input/payload-manifest.json -Raw | ConvertFrom-Json
+          $manifestSha = (Get-FileHash -LiteralPath camera-replay-input/payload-manifest.json -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($setup.Length -ne 286579944 -or $setupSha -ne $env:K5_DESKTOP_SETUP_SHA256 -or
+              $package.setup_sha256 -ne $setupSha -or $package.setup_bytes -ne $setup.Length -or
+              $package.head_sha -ne $productHead -or $manifest.head_sha -ne $productHead -or
+              $package.run_id -ne 44989807369 -or $package.run_attempt -ne 1 -or
+              $package.qualification_status -ne 'unqualified' -or
+              $manifestSha -ne '227b45ad96045277306e4c12f90c7c23006a795615874cb44ff12182c1627173' -or
+              $package.payload_manifest_sha256 -ne $manifestSha -or
+              $package.launcher_sha256 -ne '145e3bd12a31aa5721044664d2545c6a3c8b450e13d60ca882f9baf29594a4f6' -or
+              $manifest.files.path -notcontains 'K5VisionRecorder.exe' -or $manifest.files.path -notcontains 'K5VisionRecorder.xml') {
+            throw 'Original camera replay installer or manifest byte identity mismatch'
+          }
+          # Native redirection preserves exact Git blobs before Windows checkout EOL conversion.
+          & (Join-Path $env:SYSTEMROOT 'System32/cmd.exe') /d /c 'git -C diagnostic-source cat-file blob HEAD:tests/integration/test_windows_camera_video_settings.py > camera-observer-admitted.py'
+          if ($LASTEXITCODE -ne 0 -or (Get-FileHash -LiteralPath camera-observer-admitted.py -Algorithm SHA256).Hash.ToLowerInvariant() -ne '3502790fcf730bf0479265af2e3719e721f4d0c3721eca1a4e86c424ea008289') {
+            throw 'Camera failure observer Git blob identity mismatch'
+          }
+          & (Join-Path $env:SYSTEMROOT 'System32/cmd.exe') /d /c 'git -C diagnostic-source cat-file blob HEAD:tests/integration/test_windows_camera_wall_failure_diagnostic.py > camera-wrapper-admitted.py'
+          if ($LASTEXITCODE -ne 0 -or (Get-FileHash -LiteralPath camera-wrapper-admitted.py -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:K5_CAMERA_WALL_WRAPPER_SHA256) {
+            throw 'Diagnostic-only camera wrapper Git blob identity mismatch'
+          }
+          & (Join-Path $env:SYSTEMROOT 'System32/cmd.exe') /d /c 'git -C diagnostic-source cat-file blob HEAD:tests/unit/test_windows_camera_wall_diagnostic.py > camera-privacy-tests-admitted.py'
+          if ($LASTEXITCODE -ne 0 -or (Get-FileHash -LiteralPath camera-privacy-tests-admitted.py -Algorithm SHA256).Hash.ToLowerInvariant() -ne '6c8b7849403615df9bf619ff12b6503d22f896aaefde49a15687166ba6cc811f') {
+            throw 'Camera observation privacy tests Git blob identity mismatch'
+          }
+          Copy-Item -LiteralPath camera-observer-admitted.py -Destination tests/integration/test_windows_camera_video_settings.py -Force
+          Copy-Item -LiteralPath camera-wrapper-admitted.py -Destination tests/integration/test_windows_camera_wall_failure_diagnostic.py -Force
+          Copy-Item -LiteralPath camera-privacy-tests-admitted.py -Destination tests/unit/test_windows_camera_wall_diagnostic.py -Force
+          "K5_DESKTOP_SETUP=$($setup.FullName)" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+          @{ schema_version=1; diagnostic_only=$true; product_qualification=$false;
+             installer_head=$productHead; harness_head=$harnessHead; installer_sha256=$setupSha; installer_bytes=$setup.Length;
+             candidate_artifact_id=14741238112; candidate_run_id=44989807369; candidate_run_attempt=1; candidate_producer_job_id=137108170949;
+             candidate_api_sha256='7eb6f1aa566d9c1376a5f2f82e54c33fca22f7847fe7e9473f7f6a0ba66184d5';
+             observer_overlay_sha256='3502790fcf730bf0479265af2e3719e721f4d0c3721eca1a4e86c424ea008289'; wrapper_sha256=$env:K5_CAMERA_WALL_WRAPPER_SHA256;
+             privacy_tests_sha256='6c8b7849403615df9bf619ff12b6503d22f896aaefde49a15687166ba6cc811f'; replay_run_id=$env:GITHUB_RUN_ID; replay_run_attempt=$env:GITHUB_RUN_ATTEMPT } |
+            ConvertTo-Json | Set-Content -LiteralPath camera-wall-replay-provenance.json -Encoding utf8
+      - name: Prepare only the disposable Windows CI user's default browser
+        uses: ./.github/actions/prepare-windows-browser
+      - name: Set up exact development Python for diagnostic controller
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install original acceptance controller dependencies
+        shell: pwsh
+        run: |
+          python -m pip install -e ".[dev]" "playwright==1.58.0"
+          if ($LASTEXITCODE -ne 0) { throw 'Camera replay controller dependencies failed' }
+      - name: Provision exact original manifest's generated-media tools
+        uses: ./.github/actions/provision-operator-tools
+      - name: Verify failure formatter privacy and original camera receipt checks
+        shell: pwsh
+        run: |
+          python -m pytest tests/unit/test_windows_camera_wall_diagnostic.py tests/unit/test_windows_camera_video_settings_receipt.py -o addopts= --no-cov -q
+          if ($LASTEXITCODE -ne 0) { throw 'Camera observation privacy controls failed' }
+      - name: Replay all original installed camera criteria with diagnostic-only properties
+        timeout-minutes: 8
+        shell: pwsh
+        run: |
+          python -m pytest tests/integration/test_windows_camera_wall_failure_diagnostic.py -o addopts= --no-cov -s --tb=short -o faulthandler_timeout=400 --junitxml=camera-wall-diagnostic.xml
+          $testResult = $LASTEXITCODE
+          [xml]$report = Get-Content -LiteralPath camera-wall-diagnostic.xml -Raw
+          $properties = @($report.SelectNodes('//property'))
+          $bindingNodes = @($report.SelectNodes('//property[@name="diagnostic_only_camera_wall_binding"]'))
+          $outcomeNodes = @($report.SelectNodes('//property[@name="diagnostic_only_camera_wall_outcome"]'))
+          if (@($properties | Where-Object { $_.name -notlike 'diagnostic_only_camera_wall_*' }).Count -ne 0 -or
+              $bindingNodes.Count -ne 1 -or $outcomeNodes.Count -ne 1) {
+            throw 'Camera diagnostic replay emitted an invalid qualification scope'
+          }
+          $binding = $bindingNodes[0].value | ConvertFrom-Json
+          $outcome = $outcomeNodes[0].value | ConvertFrom-Json
+          if ($binding.diagnostic_only -ne $true -or $binding.product_qualification -ne $false -or
+              $binding.installer_head -ne $env:K5_DESKTOP_HEAD_SHA -or $binding.harness_head -ne $env:K5_DIAGNOSTIC_HARNESS_HEAD_SHA -or
+              $binding.installer_sha256 -ne $env:K5_DESKTOP_SETUP_SHA256 -or
+              $binding.observer_overlay_sha256 -ne '3502790fcf730bf0479265af2e3719e721f4d0c3721eca1a4e86c424ea008289' -or $binding.wrapper_sha256 -ne $env:K5_CAMERA_WALL_WRAPPER_SHA256 -or
+              $outcome.diagnostic_only -ne $true -or $outcome.product_qualification -ne $false) {
+            throw 'Camera diagnostic product or harness binding mismatch'
+          }
+          if ($testResult -ne 0) { throw 'Diagnostic-only camera replay reproduced a failing original criterion' }
+      - name: Retain only explicitly diagnostic observations without promotion
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: diagnostic-only-f354-camera-wall-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            camera-wall-diagnostic.xml
+            camera-wall-replay-provenance.json
+          if-no-files-found: warn
+          retention-days: 14

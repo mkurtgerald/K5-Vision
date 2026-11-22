@@ -451,29 +451,206 @@ def _open_wall(page):
     page.locator("#wall-panel").wait_for(state="visible")
 
 
-def _decoded_geometry(page, selector, color, width, height):
+def _finite_media_dom(value):
+    """Retain numeric/boolean media state, never source URLs or arbitrary text."""
+    if type(value) is not dict:
+        return {}
+    result = {}
+    for name in ("present", "visible", "paused", "connected", "snapshot_read_failed"):
+        if type(value.get(name)) is bool:
+            result[name] = value[name]
+    for name, maximum in (
+        ("ready_state", 4),
+        ("network_state", 3),
+        ("error_code", 4),
+        ("video_width", 32768),
+        ("video_height", 32768),
+        ("decoded_frames", 2**53 - 1),
+        ("video_count", 64),
+    ):
+        item = value.get(name)
+        if type(item) is int and 0 <= item <= maximum:
+            result[name] = item
+    for name in ("current_time", "box_width", "box_height"):
+        item = value.get(name)
+        if type(item) in (int, float) and 0 <= item <= 10**9 and math.isfinite(item):
+            result[name] = round(item, 3)
+    for name in ("layout", "layout_choice"):
+        if type(value.get(name)) is str and value[name] in {"auto", "1", "4", "9", "16"}:
+            result[name] = value[name]
+    return result
+
+
+def _bounded_media_dom_read(page, expression, argument):
+    # Always return a truthy mapping, including missing/error states: this is
+    # one observation, not another readiness wait. Public server-side timeout
+    # owns the operation and its cleanup; no detached private RPC is created.
+    # Return a primitive: object-handle json_value() can execute in the
+    # renderer again and hang after the bounded capture has already completed.
+    wrapped = (
+        "argument => { try { return JSON.stringify(("
+        + expression
+        + ")(argument)) || '{\"snapshot_read_failed\":true}'; } "
+        + "catch { return '{\"snapshot_read_failed\":true}'; } }"
+    )
+    handle = page.wait_for_function(wrapped, arg=argument, timeout=1000, polling=1000)
+    try:
+        value = handle.json_value()
+        if type(value) is not str or not 0 < len(value) <= 8192:
+            raise ValueError("Media observation serialization exceeded its bound")
+        return json.loads(value)
+    finally:
+        handle.dispose()
+
+
+def _media_timeout_snapshot(
+    page, selector, width, height, *, phase, camera_id=None, camera_index=None
+):
+    result = {"wait_phase": phase if phase in {"initial_decode", "frame_progress"} else "other"}
+    for name, value in (("expected_width", width), ("expected_height", height)):
+        if type(value) is int and 1 <= value <= 32768:
+            result[name] = value
+    if type(camera_index) is int and 0 <= camera_index < 64:
+        result["camera_index"] = camera_index
+    if type(camera_id) is str:
+        try:
+            if str(UUID(camera_id)) == camera_id:
+                result["camera_id"] = camera_id
+        except ValueError:
+            pass
+    try:
+        raw = _bounded_media_dom_read(
+            page,
+            """selector => { try {
+          const v=document.querySelector(selector);
+          const grid=document.querySelector('#wall-panel .camera-wall-grid');
+          const choice=document.querySelector('#wall-layout');
+          const base={present:!!v,layout:grid?.dataset.layout,
+            layout_choice:choice?.value,video_count:grid?.querySelectorAll('video').length};
+          if(!v) return base;
+          const box=v.getBoundingClientRect(), style=getComputedStyle(v);
+          return {...base, connected:v.isConnected,
+            visible:box.width>0&&box.height>0&&style.display!=='none'&&style.visibility!=='hidden',
+            box_width:box.width,box_height:box.height,
+            ready_state:v.readyState,network_state:v.networkState,paused:v.paused,
+            error_code:v.error?.code,video_width:v.videoWidth,video_height:v.videoHeight,
+            decoded_frames:v.getVideoPlaybackQuality?.().totalVideoFrames,current_time:v.currentTime};
+        } catch { return {snapshot_read_failed:true}; } }""",
+            selector,
+        )
+        result["observed"] = _finite_media_dom(raw)
+        result["snapshot_available"] = result["observed"].get("snapshot_read_failed") is not True
+        if not result["snapshot_available"]:
+            result["snapshot_error"] = "dom_read_failed"
+    except Exception as error:
+        result["snapshot_available"] = False
+        result["snapshot_error"] = (
+            type(error).__name__
+            if type(error).__name__ in {"TimeoutError", "Error", "TypeError", "ValueError"}
+            else "other"
+        )
+    return result
+
+
+def _camera_failure_context(client, cohort):
+    """One read of existing HTTP facts and already-owned process identities."""
+    result = {}
+    status = getattr(client, "last_http_status", None)
+    if type(status) is int and 100 <= status <= 599:
+        result["client_last_http_status"] = status
+    transport = getattr(client, "transport_failure", None)
+    if type(transport) is dict:
+        safe = {}
+        for name in ("exception_type", "reason_type"):
+            if type(transport.get(name)) is str and transport[name] in {
+                "TimeoutError",
+                "ConnectionRefusedError",
+                "ConnectionResetError",
+                "ConnectionAbortedError",
+                "BrokenPipeError",
+                "RemoteDisconnected",
+                "URLError",
+                "OSError",
+                "none",
+            }:
+                safe[name] = transport[name]
+        elapsed = transport.get("elapsed_seconds")
+        if type(elapsed) in (int, float) and 0 <= elapsed <= 60 and math.isfinite(elapsed):
+            safe["elapsed_seconds"] = round(elapsed, 3)
+        result["client_transport_failure"] = safe
+    counts = dict.fromkeys(("wrapper", "host", "python", "mediamtx", "caddy", "console_host"), 0)
+    health = {"owned_running_counts": counts, "query_failures": 0}
+    try:
+        with cohort.lock:
+            known = [
+                (identity, process, cohort.ownership_records.get(identity, {}))
+                for identity, process in list(cohort.processes.items())[:128]
+            ]
+            health.update(
+                cohort_failed=bool(cohort.failed),
+                service_stopped=bool(cohort.service_stopped),
+                truncated=len(cohort.processes) > 128,
+            )
+        for _identity, process, note in known:
+            if (
+                note.get("accepted") is not True
+                or note.get("role") != "service"
+                or note.get("kind") not in counts
+            ):
+                continue
+            try:
+                if cohort.is_owned_running(process):
+                    counts[note["kind"]] += 1
+            except Exception:
+                health["query_failures"] += 1
+    except Exception:
+        health["query_failures"] += 1
+    result["owned_worker_health"] = health
+    return result
+
+
+def _decoded_geometry(
+    page, selector, color, width, height, *, diagnostic=None, camera_id=None, camera_index=None
+):
     """Read actual K5-delivered pixels, dimensions and new decoded frames."""
     wanted = {"selector": selector, "width": width, "height": height}
-    page.wait_for_function(
-        """wanted => {
-      const v=document.querySelector(wanted.selector);
-      return v && v.getBoundingClientRect().width > 0 && v.readyState >= 2 &&
-        !v.paused && v.videoWidth === wanted.width && v.videoHeight === wanted.height &&
-        v.getVideoPlaybackQuality().totalVideoFrames >= 4;
-    }""",
-        arg=wanted,
-        timeout=25_000,
-    )
-    before = page.locator(selector).evaluate("v => v.getVideoPlaybackQuality().totalVideoFrames")
-    page.wait_for_function(
-        """wanted => {
-      const v=document.querySelector(wanted.selector);
-      return v && v.videoWidth === wanted.width && v.videoHeight === wanted.height &&
-        v.getVideoPlaybackQuality().totalVideoFrames >= wanted.before + 4;
-    }""",
-        arg={**wanted, "before": before},
-        timeout=10_000,
-    )
+    phase = "initial_decode"
+    try:
+        page.wait_for_function(
+            """wanted => {
+          const v=document.querySelector(wanted.selector);
+          return v && v.getBoundingClientRect().width > 0 && v.readyState >= 2 &&
+            !v.paused && v.videoWidth === wanted.width && v.videoHeight === wanted.height &&
+            v.getVideoPlaybackQuality().totalVideoFrames >= 4;
+        }""",
+            arg=wanted,
+            timeout=25_000,
+        )
+        phase = "frame_progress"
+        before = page.locator(selector).evaluate(
+            "v => v.getVideoPlaybackQuality().totalVideoFrames"
+        )
+        page.wait_for_function(
+            """wanted => {
+          const v=document.querySelector(wanted.selector);
+          return v && v.videoWidth === wanted.width && v.videoHeight === wanted.height &&
+            v.getVideoPlaybackQuality().totalVideoFrames >= wanted.before + 4;
+        }""",
+            arg={**wanted, "before": before},
+            timeout=10_000,
+        )
+    except Exception as error:
+        if type(error).__name__ == "TimeoutError" and diagnostic is not None:
+            diagnostic["decoded_media_timeout"] = _media_timeout_snapshot(
+                page,
+                selector,
+                width,
+                height,
+                phase=phase,
+                camera_id=camera_id,
+                camera_index=camera_index,
+            )
+        raise
     value = page.locator(selector).evaluate("""v => {
       const c=document.createElement('canvas'); c.width=c.height=1;
       const x=c.getContext('2d'); x.drawImage(v,0,0,1,1);
@@ -537,7 +714,16 @@ def _closed_subset(files):
 
 
 def _wall_probe(
-    page, ids, colors, *, layout, expected_size, expected_players, browser_helpers, dimensions=None
+    page,
+    ids,
+    colors,
+    *,
+    layout,
+    expected_size,
+    expected_players,
+    browser_helpers,
+    dimensions=None,
+    diagnostic=None,
 ):
     _open_wall(page)
     _require(
@@ -566,6 +752,9 @@ def _wall_probe(
             colors[ids.index(camera_id)],
             width,
             height,
+            diagnostic=diagnostic,
+            camera_id=camera_id,
+            camera_index=ids.index(camera_id),
         )
     return len(shown)
 
@@ -695,6 +884,7 @@ def run_camera_video_journey(
                 expected_size=auto_sizes[-1],
                 expected_players=index + 1,
                 browser_helpers=browser_helpers,
+                diagnostic=diagnostic,
             )
         )
     target, other = camera_ids[:2]
@@ -827,7 +1017,7 @@ def run_camera_video_journey(
             diagnostic=diagnostic,
             phase="changed",
         )
-        _decoded_geometry(page, "#live-video", "red", 640, 360)
+        _decoded_geometry(page, "#live-video", "red", 640, 360, diagnostic=diagnostic)
         desktop._wait(
             lambda: _closed_subset(prechange_files),
             "Closed pre-change recording",
@@ -866,7 +1056,7 @@ def run_camera_video_journey(
             diagnostic=diagnostic,
             phase="restored",
         )
-        _decoded_geometry(page, "#live-video", "red", 640, 360)
+        _decoded_geometry(page, "#live-video", "red", 640, 360, diagnostic=diagnostic)
         diagnostic["stage"] = "shared_encoder_acknowledgement"
         fixtures[0].shared(True)
         shared = _settings_read(page, route, open_dialog=True)
@@ -960,6 +1150,7 @@ def run_camera_video_journey(
                 expected_players=5,
                 browser_helpers=browser_helpers,
                 dimensions={target: (640, 360)},
+                diagnostic=diagnostic,
             )
         )
         evidence.update(
@@ -980,6 +1171,7 @@ def run_camera_video_journey(
                     expected_players=count,
                     browser_helpers=browser_helpers,
                     dimensions={target: (640, 360)},
+                    diagnostic=diagnostic,
                 )
             )
         page.locator("#wall-layout").select_option("auto")
@@ -992,6 +1184,7 @@ def run_camera_video_journey(
             expected_players=5,
             browser_helpers=browser_helpers,
             dimensions={target: (640, 360)},
+            diagnostic=diagnostic,
         )
         diagnostic["stage"] = "unsupported_direct_rtsp"
         browser_helpers._rtsp_enroll(
@@ -1100,7 +1293,12 @@ def run_camera_video_journey(
         page.locator("#playback-duration").fill("2")
         page.locator("#play-recording").click()
         evidence["retained_playback_frames"] = _decoded_geometry(
-            page, "#playback-video", "red", 320, 240
+            page,
+            "#playback-video",
+            "red",
+            320,
+            240,
+            diagnostic=diagnostic,
         )
         export_path = Path(parent) / "generated retained encoder footage.mp4"
         export = {}
@@ -1219,7 +1417,7 @@ def test_native_windows_camera_video_settings_and_automatic_wall(record_testsuit
     api = desktop._Windows()
     cohort = desktop._Cohort(api)
     processes, fixtures, reservations = [], [], []
-    playwright = browser = context = page = app = form = None
+    playwright = browser = context = page = app = form = client = None
     diagnostic = {"stage": "graphical_install"}
     receipt, failed, cleanup_failed = {}, False, False
     try:
@@ -1368,8 +1566,26 @@ def test_native_windows_camera_video_settings_and_automatic_wall(record_testsuit
         )
         receipt["uninstall_preserves_profile"] = True
     except BaseException as error:
-        _failure_note(diagnostic, error)
         failed = True
+        _failure_note(diagnostic, error)
+        if "decoded_media_timeout" in diagnostic:
+            try:
+                diagnostic.update(_camera_failure_context(client, cohort))
+            except Exception as observation_error:
+                kind = type(observation_error).__name__
+                diagnostic["camera_observation_error"] = (
+                    kind
+                    if kind
+                    in {
+                        "OverflowError",
+                        "TypeError",
+                        "ValueError",
+                        "RuntimeError",
+                        "OSError",
+                        "AttributeError",
+                    }
+                    else "other"
+                )
     finally:
         for resource in (context, browser, playwright):
             if resource is not None:
@@ -1426,6 +1642,11 @@ def test_native_windows_camera_video_settings_and_automatic_wall(record_testsuit
                     "installer_action",
                     "installer_install_posted",
                     "health_http_status",
+                    "decoded_media_timeout",
+                    "owned_worker_health",
+                    "camera_observation_error",
+                    "client_last_http_status",
+                    "client_transport_failure",
                     "stop_identity_checks",
                     "stop_wait_seconds",
                     "stop_owned_identity_count",
