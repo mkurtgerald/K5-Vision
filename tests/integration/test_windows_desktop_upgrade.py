@@ -19,6 +19,7 @@ import subprocess
 import sys
 import time
 import xml.etree.ElementTree as ET
+from contextlib import closing
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request
@@ -187,9 +188,39 @@ def _source_authorities(profile):
     }
 
 
+def _record_owned_cleanup_failure(diagnostic, role, operation, error):
+    """Keep finite failure facts without filenames, paths or exception text."""
+    if type(role) is not str or role not in {"machine_data", "legacy_profile", "proof_parent"}:
+        role = "unknown"
+    if type(operation) is not str or operation not in {"root_identity", "remove_tree"}:
+        operation = "unknown"
+    try:
+        code = getattr(error, "winerror", None)
+    except BaseException:
+        code = None
+    if type(code) is not int or not 0 < code <= 65535:
+        code = None
+    kind = type(error).__name__
+    if kind not in {
+        "AssertionError",
+        "OSError",
+        "PermissionError",
+        "FileNotFoundError",
+        "NotADirectoryError",
+    }:
+        kind = "Other"
+    facts = diagnostic.setdefault("owned_file_cleanup_facts", [])
+    if len(facts) < 3:
+        facts.append(
+            {"tree_role": role, "operation": operation, "error_type": kind, "winerror": code}
+        )
+
+
 def _security(profile):
     path = profile / "identity" / "operator-account-security.sqlite3"
-    with sqlite3.connect(path.as_uri() + "?mode=ro&immutable=1", uri=True, timeout=3) as connection:
+    with closing(
+        sqlite3.connect(path.as_uri() + "?mode=ro&immutable=1", uri=True, timeout=3)
+    ) as connection:
         rows = connection.execute(
             "SELECT user_id,secret,generation FROM mfa ORDER BY user_id"
         ).fetchall()
@@ -209,10 +240,12 @@ def _retained(client, profile):
     cameras = client.json("/api/v1/operator/cameras")["cameras"]
     storage = client.json("/api/v1/operator/admin/storage")
     site = client.json("/api/v1/operator/admin/activity/export")["site_id"]
-    with sqlite3.connect(
-        (profile / "identity" / "operator-cameras.sqlite3").as_uri() + "?mode=ro",
-        uri=True,
-        timeout=3,
+    with closing(
+        sqlite3.connect(
+            (profile / "identity" / "operator-cameras.sqlite3").as_uri() + "?mode=ro",
+            uri=True,
+            timeout=3,
+        )
     ) as connection:
         sources = connection.execute(
             "SELECT device_id,device_json,source_uri FROM camera_sources ORDER BY device_id"
@@ -819,12 +852,13 @@ def test_native_windows_legacy_service_migration_and_manual_reversal(record_test
         )
         page = context.new_page()
         page.set_default_timeout(25_000)
-        settings._mfa_login(
+        signed_in = settings._mfa_login(
             page,
             client.origin,
             {"username": username, "password": password, "id": administrator_id},
             recovery[4],
         )
+        client.token = signed_in["session_token"]
         browser_helpers._open_camera_recordings(page, camera_id)
         playback = _retained_timeline_play(browser_helpers, page, camera_id)
         export_path = parent / "migrated actual export.mp4"
@@ -858,7 +892,9 @@ def test_native_windows_legacy_service_migration_and_manual_reversal(record_test
         assert app.wait(timeout=40) == 0
         app = None
         d._wait(
-            lambda: d._tray_recording(client, machine_profile, camera_id, previous_bytes, {}),
+            lambda: d._tray_recording(
+                client, machine_profile, camera_id, previous_bytes, diagnostic
+            ),
             "Service recordings grow after all clients close",
             timeout=30,
         )
@@ -1019,15 +1055,22 @@ def test_native_windows_legacy_service_migration_and_manual_reversal(record_test
             except BaseException:
                 cleanup_errors.append("camera_fixture_cleanup")
         if not cleanup_errors:
-            for tree in (machine_profile, profile, parent):
+            for role, tree in (
+                ("machine_data", machine_profile),
+                ("legacy_profile", profile),
+                ("proof_parent", parent),
+            ):
                 if tree.exists():
+                    operation = "root_identity"
                     try:
                         assert (
                             tree in owned_trees
                             and (tree.stat().st_dev, tree.stat().st_ino) == owned_trees[tree]
                         )
+                        operation = "remove_tree"
                         d._remove_owned_temporary_tree(tree)
-                    except BaseException:
+                    except BaseException as error:
+                        _record_owned_cleanup_failure(diagnostic, role, operation, error)
                         cleanup_errors.append("owned_files_cleanup")
         diagnostic["cleanup_failures"] = cleanup_errors[:8]
         diagnostic["no_console_windows"] = not cohort.console_seen

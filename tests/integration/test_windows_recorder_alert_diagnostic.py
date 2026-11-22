@@ -16,8 +16,8 @@ from uuid import UUID, uuid4
 
 import pytest
 
-PRODUCT_HEAD = "23a24e57679534d77a5ea3881902f24a2d8e8e5f"
-SETUP_SHA = "ee8868069902cc2112b619df3240f10c6c5214acfa91846e14b295e20dd98935"
+PRODUCT_HEAD = "68d009d7be8e94611da3c27d9e81bc79a8c98724"
+SETUP_SHA = "b2dcf13e6d358f3f5fc70671a806f97404431b4591643f49cec438d79a54a126"
 MONITOR_SHA = "0f8b62be95e772de55d2bccfc489d55e1f14e3561bba8198f1c8726a39a688d0"
 PREFIX = "diagnostic_only_installed_recorder_alert_"
 SOURCE_PINS = {
@@ -37,7 +37,7 @@ SOURCE_PINS = {
         "2a1240ada1d63bb0454fa11e9f30e0591d3b1c9fd5f394857ecfc5174603764f"
     ),
     "windows_process_identity.py": (
-        "8bc6bac12a9c2bb8c667c879f48fe4de51948f8d68cbcfd255a020dde575e2f4"
+        "780605038abd93dcd0f166512d2720db731c83fe87d569cfc22ee9decc5064ff"
     ),
     "onvif_camera_fixture.py": "ec739ca0d75cebd6cf9cc13647ed96f125e63c315e3e066f223d0d02456c61f5",
 }
@@ -164,7 +164,7 @@ def test_diagnostic_only_installed_recorder_alert_persistence(record_testsuite_p
     wrapper_sha = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
     assert wrapper_sha == os.environ["K5_RECORDER_ALERT_DIAGNOSTIC_SHA256"]
     setup = Path(os.environ["K5_DESKTOP_SETUP"]).resolve(strict=True)
-    assert setup.stat().st_size == 286587086
+    assert setup.stat().st_size == 286587345
     with setup.open("rb") as stream:
         assert hashlib.file_digest(stream, "sha256").hexdigest() == SETUP_SHA
     record_testsuite_property(
@@ -177,11 +177,11 @@ def test_diagnostic_only_installed_recorder_alert_persistence(record_testsuite_p
                 "installer_head": PRODUCT_HEAD,
                 "harness_head": harness,
                 "installer_sha256": SETUP_SHA,
-                "installer_bytes": 286587086,
-                "candidate_artifact_id": 14745897366,
-                "candidate_run_id": 45001731180,
+                "installer_bytes": 286587345,
+                "candidate_artifact_id": 14748028663,
+                "candidate_run_id": 45006604063,
                 "candidate_run_attempt": 1,
-                "candidate_producer_job_id": 137144542629,
+                "candidate_producer_job_id": 137159494480,
                 "wrapper_sha256": wrapper_sha,
                 "product_monitor_canonical_lf_sha256": MONITOR_SHA,
                 "original_source_canonical_lf_sha256": SOURCE_PINS,

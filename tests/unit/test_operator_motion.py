@@ -827,6 +827,172 @@ def test_ambiguous_native_enable_is_compensated_even_when_old_cache_was_false(en
     asyncio.run(scenario())
 
 
+def test_zone_policy_edit_keeps_fresh_decoder_and_applies_new_policy_on_next_sample(engine):
+    async def scenario():
+        service, source = engine.service, engine.sources[0]
+        runtime, path = service._motion, source.binding.path_name
+        await service.start(engine.sources)
+        try:
+            await service.apply_motion_policy(source, 0, _body())
+            await _sample(engine)
+            worker = runtime.workers[path]
+            worker.moving = True
+            await _sample(engine)
+            assert runtime.holds and service._media.paths[path]["record"] is True
+            reference = copy.deepcopy(runtime.observed[path])
+            zones = {
+                "reference": {k: v for k, v in reference.items() if k != "generation"},
+                "include": [
+                    {
+                        "id": "00000000-0000-4000-8000-000000000001",
+                        "name": "Included",
+                        "points": [[0, 0], [0.5, 0], [0.5, 1], [0, 1]],
+                    }
+                ],
+                "exclude": [],
+            }
+            await service.apply_motion_policy(
+                source, 1, _body(zones=zones), reference_generation=reference["generation"]
+            )
+            assert runtime.workers.get(path) is worker and not worker.closed
+            assert path not in runtime.holds and service._media.paths[path]["record"] is False
+            assert runtime.observed[path] == reference  # Frozen preview lease stays bound.
+            received, sample = [], worker.sample
+
+            def record(policy):
+                received.append(copy.deepcopy(policy))
+                return sample(policy)
+
+            worker.sample = record
+            worker.moving = False
+            await _sample(engine)
+            assert received == [motion.worker_policy(runtime.policies[path])]
+            assert received[0]["include"] == [zones["include"][0]["points"]]
+            assert received[0]["revision"] == 2
+            assert await service.motion_preview(source)
+            assert len(engine.workers) == 1
+
+            def fail(_policy):
+                raise RuntimeError("Controlled native sampling failure")
+
+            worker.sample = fail
+            await _sample(engine)
+            assert worker.closed and path not in runtime.workers
+            assert service._media.paths[path]["record"] is False
+        finally:
+            await service.stop()
+
+    asyncio.run(scenario())
+
+
+def test_policy_edit_fences_old_inflight_frame_and_requires_fresh_preview(engine):
+    async def scenario():
+        service, source = engine.service, engine.sources[0]
+        runtime, path = service._motion, source.binding.path_name
+        pending = preview = None
+        worker = None
+        await service.start(engine.sources)
+        try:
+            await service.apply_motion_policy(source, 0, _body())
+            await _sample(engine)
+            worker = runtime.workers[path]
+            worker.moving, worker.release = True, threading.Event()
+            worker.started.clear()
+            pending = asyncio.create_task(_sample(engine))
+            assert await asyncio.to_thread(worker.started.wait, 1)
+            await service.apply_motion_policy(source, 1, _body(sensitivity=80))
+            preview = asyncio.create_task(service.motion_preview(source))
+            await asyncio.sleep(0.01)
+            assert not preview.done(), "A pre-edit frame was returned as the new preview"
+            worker.release.set()
+            await pending
+            assert path not in runtime.samples and path not in runtime.holds
+            assert service._media.paths[path]["record"] is False
+            assert runtime.workers.get(path) is worker and not worker.closed
+            worker.moving = False
+            await _sample(engine)
+            assert (await preview)["capture_id"] == runtime.samples[path]["capture_id"]
+        finally:
+            if worker is not None and worker.release is not None:
+                worker.release.set()
+            if pending is not None:
+                await pending
+            if preview is not None and not preview.done():
+                preview.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await preview
+            await service.stop()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "condition", ["stale", "media_generation", "unavailable", "missing_sample"]
+)
+def test_policy_edit_never_retains_a_worker_without_current_healthy_capture(engine, condition):
+    async def scenario():
+        service, source = engine.service, engine.sources[0]
+        runtime, path = service._motion, source.binding.path_name
+        await service.start(engine.sources)
+        try:
+            await service.apply_motion_policy(source, 0, _body())
+            await _sample(engine)
+            worker = runtime.workers[path]
+            if condition == "stale":
+                runtime.samples[path]["captured_at"] -= 3
+            elif condition == "media_generation":
+                service._media_generation += 1
+            elif condition == "unavailable":
+                runtime.health[path] = "unavailable"
+            else:
+                runtime.samples.pop(path)
+            await service.apply_motion_policy(source, 1, _body(sensitivity=80))
+            assert worker.closed and path not in runtime.workers
+            assert path not in runtime.samples and path not in runtime.holds
+            assert service._media.paths[path]["record"] is False
+        finally:
+            await service.stop()
+
+    asyncio.run(scenario())
+
+
+def test_failed_old_request_retires_only_its_still_retained_decoder(engine):
+    async def scenario():
+        service, source = engine.service, engine.sources[0]
+        runtime, path = service._motion, source.binding.path_name
+        entered, release = threading.Event(), threading.Event()
+        pending = None
+        await service.start(engine.sources)
+        try:
+            await service.apply_motion_policy(source, 0, _body())
+            await _sample(engine)
+            worker = runtime.workers[path]
+
+            def fail(_policy):
+                entered.set()
+                assert release.wait(2)
+                raise RuntimeError("Controlled pre-edit native failure")
+
+            worker.sample = fail
+            pending = asyncio.create_task(_sample(engine))
+            assert await asyncio.to_thread(entered.wait, 1)
+            await service.apply_motion_policy(source, 1, _body(sensitivity=80))
+            assert runtime.workers.get(path) is worker and not worker.closed
+            release.set()
+            await pending
+            assert worker.closed and path not in runtime.workers
+            assert service._media.paths[path]["record"] is False
+            await _sample(engine)
+            assert runtime.workers[path] is not worker
+        finally:
+            release.set()
+            if pending is not None:
+                await pending
+            await service.stop()
+
+    asyncio.run(scenario())
+
+
 def test_clear_all_zones_accepts_the_current_owned_preview_generation(engine):
     async def scenario():
         service, source = engine.service, engine.sources[0]

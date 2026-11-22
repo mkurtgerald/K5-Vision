@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import platform
+import subprocess
 import sys
 import threading
 from concurrent.futures import Future
@@ -45,23 +47,34 @@ def document(root):
     }
 
 
-def test_windows_native_cpu_dispatch_caps_amx_and_bf16_before_inference(monkeypatch):
+@pytest.mark.parametrize("runtime_name", ["nt", "posix"])
+def test_windows_native_cpu_dispatch_caps_amx_and_bf16_before_inference(monkeypatch, runtime_name):
     # GitHub-hosted Windows has previously hard-exited inside OpenVINO infer.
     # Keep actual detection and model admission unchanged while constraining
     # unsupported native kernel selection to the OpenVINO 2026 AVX2 floor.
-    monkeypatch.setattr(module, "system", lambda: "Windows")
-    for name in ("ONEDNN_MAX_CPU_ISA", "OV_CPU_MAX_ISA"):
-        monkeypatch.setenv(name, "AVX512_CORE_AMX")
+    names = ("ONEDNN_MAX_CPU_ISA", "OV_CPU_MAX_ISA")
+    environment = {name: "AVX512_CORE_AMX" for name in names}
+    monkeypatch.setattr(module, "os", SimpleNamespace(name=runtime_name, environ=environment))
     module._cap_windows_native_cpu_isa()
-    for name in ("ONEDNN_MAX_CPU_ISA", "OV_CPU_MAX_ISA"):
-        assert module.os.environ[name] == "AVX2"
+    expected = "AVX2" if runtime_name == "nt" else "AVX512_CORE_AMX"
+    assert environment == {name: expected for name in names}
 
-    monkeypatch.setattr(module, "system", lambda: "Linux")
-    for name in ("ONEDNN_MAX_CPU_ISA", "OV_CPU_MAX_ISA"):
-        monkeypatch.setenv(name, "AVX512_CORE_AMX")
+
+@pytest.mark.parametrize("runtime_name", ["nt", "posix"])
+def test_native_cpu_dispatch_never_queries_platform_or_starts_a_process(monkeypatch, runtime_name):
+    def forbidden(*args, **kwargs):
+        pytest.fail("Native CPU dispatch must not query platform identity or start processes")
+
+    monkeypatch.setattr(module, "os", SimpleNamespace(name=runtime_name, environ={}))
+    monkeypatch.setattr(platform, "system", forbidden)
+    # Cover the old imported alias as well as any future late platform lookup.
+    monkeypatch.setattr(module, "system", forbidden, raising=False)
+    for name in ("Popen", "run", "check_output"):
+        monkeypatch.setattr(subprocess, name, forbidden)
     module._cap_windows_native_cpu_isa()
-    for name in ("ONEDNN_MAX_CPU_ISA", "OV_CPU_MAX_ISA"):
-        assert module.os.environ[name] == "AVX512_CORE_AMX"
+    assert module.os.environ == (
+        {"ONEDNN_MAX_CPU_ISA": "AVX2", "OV_CPU_MAX_ISA": "AVX2"} if runtime_name == "nt" else {}
+    )
 
 
 def test_absent_optional_config_does_not_admit_or_construct_native(monkeypatch):

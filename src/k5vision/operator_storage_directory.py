@@ -81,7 +81,7 @@ def _pin_ancestors(path: Path):
         for directory in reversed((path, *path.parents)):
             _admit_path(directory)
             handle = kernel.CreateFileW(
-                str(directory), 0, 3, None, 3, 0x02000000 | 0x00200000, None
+                str(directory), 1, 3, None, 3, 0x02000000 | 0x00200000, None
             )
             if not handle or handle == ctypes.c_void_p(-1).value:
                 raise StorageContainerError("Storage directory could not be pinned")

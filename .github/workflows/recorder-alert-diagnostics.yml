@@ -19,22 +19,22 @@ concurrency:
 
 jobs:
   installed-recorder-alert:
-    name: DIAGNOSTIC ONLY - exact23 installed alert persistence
+    name: DIAGNOSTIC ONLY - exact68d installed alert persistence
     runs-on: windows-2025
     timeout-minutes: 12
     env:
-      K5_DESKTOP_HEAD_SHA: 23a24e57679534d77a5ea3881902f24a2d8e8e5f
-      K5_DESKTOP_SETUP_SHA256: ee8868069902cc2112b619df3240f10c6c5214acfa91846e14b295e20dd98935
+      K5_DESKTOP_HEAD_SHA: 68d009d7be8e94611da3c27d9e81bc79a8c98724
+      K5_DESKTOP_SETUP_SHA256: b2dcf13e6d358f3f5fc70671a806f97404431b4591643f49cec438d79a54a126
       K5_NATIVE_RECORDER_ALERT_DIAGNOSTIC: "1"
       K5_OPERATOR_BROWSER_ACCEPTANCE: "1"
       K5_OPERATOR_BROWSER_CHANNEL: msedge
       K5_DIAGNOSTIC_HARNESS_HEAD_SHA: ${{ github.sha }}
-      K5_RECORDER_ALERT_DIAGNOSTIC_SHA256: 8d844633873e7439e5cca0fb6c80ba73aab4c0574df4c7e8992a26b530b0d669
+      K5_RECORDER_ALERT_DIAGNOSTIC_SHA256: 17b792cc78d70252a64421821017d448fda61dbf7db83f586f19d34de0dcbfe4
     steps:
       - name: Checkout exact installer source and normal native helpers
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: 23a24e57679534d77a5ea3881902f24a2d8e8e5f
+          ref: 68d009d7be8e94611da3c27d9e81bc79a8c98724
           persist-credentials: false
       - name: Checkout separately identified component diagnostic
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -50,25 +50,25 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $headers = @{ Authorization="Bearer $env:GH_TOKEN"; Accept='application/vnd.github+json'; 'X-GitHub-Api-Version'='2022-11-28' }
           $api = "https://api.github.com/repos/$env:GITHUB_REPOSITORY/actions"
-          $meta = Invoke-RestMethod -Uri "$api/artifacts/14745897366" -Headers $headers
-          $attempt = Invoke-RestMethod -Uri "$api/runs/45001731180/attempts/1" -Headers $headers
-          $jobs = Invoke-RestMethod -Uri "$api/runs/45001731180/attempts/1/jobs?per_page=100" -Headers $headers
-          $producer = @($jobs.jobs | Where-Object { $_.id -eq 137144542629 })
-          if ($meta.id -ne 14745897366 -or $meta.expired -ne $false -or
-              $meta.name -ne "k5-vision-windows-upgrade-candidate-$($env:K5_DESKTOP_HEAD_SHA)-45001731180-attempt-1" -or
-              $meta.size_in_bytes -ne 285148987 -or
-              $meta.digest -ne 'sha256:d25e812247d592866c1f02c05754e9d2d62dea667a9aa3b31766f2f0a2f4a489' -or
-              $meta.workflow_run.id -ne 45001731180 -or $meta.workflow_run.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or
-              $attempt.id -ne 45001731180 -or $attempt.run_attempt -ne 1 -or $attempt.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or
+          $meta = Invoke-RestMethod -Uri "$api/artifacts/14748028663" -Headers $headers
+          $attempt = Invoke-RestMethod -Uri "$api/runs/45006604063/attempts/1" -Headers $headers
+          $jobs = Invoke-RestMethod -Uri "$api/runs/45006604063/attempts/1/jobs?per_page=100" -Headers $headers
+          $producer = @($jobs.jobs | Where-Object { $_.id -eq 137159494480 })
+          if ($meta.id -ne 14748028663 -or $meta.expired -ne $false -or
+              $meta.name -ne "k5-vision-windows-upgrade-candidate-$($env:K5_DESKTOP_HEAD_SHA)-45006604063-attempt-1" -or
+              $meta.size_in_bytes -ne 285149185 -or
+              $meta.digest -ne 'sha256:9fd44e087ed4aa63bb39b5930c63cdc59ba23636121003e917fae1dba48bf9f3' -or
+              $meta.workflow_run.id -ne 45006604063 -or $meta.workflow_run.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or
+              $attempt.id -ne 45006604063 -or $attempt.run_attempt -ne 1 -or $attempt.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or
               $producer.Count -ne 1 -or $producer[0].conclusion -ne 'success') {
             throw 'Original alert candidate or successful GUI producer identity mismatch'
           }
       - name: Download only the exact admitted original candidate
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:
-          artifact-ids: 14745897366
+          artifact-ids: 14748028663
           github-token: ${{ github.token }}
-          run-id: 45001731180
+          run-id: 45006604063
           path: recorder-alert-input
           merge-multiple: true
       - name: Bind complete installer bytes and only two diagnostic Git blobs
@@ -83,13 +83,13 @@ jobs:
           $manifest = Get-Content -LiteralPath recorder-alert-input/payload-manifest.json -Raw | ConvertFrom-Json
           $manifestSha = (Get-FileHash -LiteralPath recorder-alert-input/payload-manifest.json -Algorithm SHA256).Hash.ToLowerInvariant()
           if ($product -ne $env:K5_DESKTOP_HEAD_SHA -or $harness -ne $env:K5_DIAGNOSTIC_HARNESS_HEAD_SHA -or $product -eq $harness -or
-              $setup.Length -ne 286587086 -or $sha -ne $env:K5_DESKTOP_SETUP_SHA256 -or
+              $setup.Length -ne 286587345 -or $sha -ne $env:K5_DESKTOP_SETUP_SHA256 -or
               $package.setup_sha256 -ne $sha -or $package.setup_bytes -ne $setup.Length -or
               $package.head_sha -ne $product -or $manifest.head_sha -ne $product -or
-              $package.run_id -ne 45001731180 -or $package.run_attempt -ne 1 -or $package.qualification_status -ne 'unqualified' -or
-              $manifestSha -ne '41878219fa16c6e68b79dffabb468673e7821c3688fb181cd7749685551ea821' -or
+              $package.run_id -ne 45006604063 -or $package.run_attempt -ne 1 -or $package.qualification_status -ne 'unqualified' -or
+              $manifestSha -ne 'b33cce05f10d418c79f3da8b9f63a6cc63b9714d68f8829a5ba641b39729b47b' -or
               $package.payload_manifest_sha256 -ne $manifestSha -or
-              $package.launcher_sha256 -ne '134d6cb027d188ac936410d5c72f924e2bf99d275895d5248c6dd29748cdba52' -or
+              $package.launcher_sha256 -ne '77da96de73281af55f6165d1b9c784fdd5d76bc5b0f79e7b2bfc89f03708ec4b' -or
               $manifest.files.path -notcontains 'K5VisionRecorder.exe' -or $manifest.files.path -notcontains 'K5VisionRecorder.xml') {
             throw 'Original installed alert source or full byte identity mismatch'
           }
@@ -106,7 +106,7 @@ jobs:
           "K5_DESKTOP_SETUP=$($setup.FullName)" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
           @{ schema_version=1; diagnostic_only=$true; product_qualification=$false;
              installer_head=$product; harness_head=$harness; installer_sha256=$sha; installer_bytes=$setup.Length;
-             candidate_artifact_id=14745897366; candidate_run_id=45001731180; candidate_run_attempt=1; candidate_producer_job_id=137144542629;
+             candidate_artifact_id=14748028663; candidate_run_id=45006604063; candidate_run_attempt=1; candidate_producer_job_id=137159494480;
              wrapper_sha256=$env:K5_RECORDER_ALERT_DIAGNOSTIC_SHA256; replay_run_id=$env:GITHUB_RUN_ID; replay_run_attempt=$env:GITHUB_RUN_ATTEMPT } |
             ConvertTo-Json | Set-Content -LiteralPath installed-recorder-alert-provenance.json -Encoding utf8
       - name: Prepare only the disposable CI user's browser
@@ -159,7 +159,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
-          name: diagnostic-only-23-installed-recorder-alert-${{ github.run_id }}-${{ github.run_attempt }}
+          name: diagnostic-only-68d-installed-recorder-alert-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             installed-recorder-alert-diagnostic.xml
             installed-recorder-alert-provenance.json
