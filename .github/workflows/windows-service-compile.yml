@@ -20,6 +20,8 @@ on:
       - tests/integration/test_windows_desktop_app.py
       - tests/integration/windows_process_identity.py
       - scripts/probe_windows_motion_sampler.py
+      - scripts/probe_windows_nested_vm.ps1
+      - scripts/probe_windows_motion_runtime.py
   pull_request:
     branches: [main]
     paths:
@@ -38,6 +40,8 @@ on:
       - tests/integration/test_windows_desktop_app.py
       - tests/integration/windows_process_identity.py
       - scripts/probe_windows_motion_sampler.py
+      - scripts/probe_windows_nested_vm.ps1
+      - scripts/probe_windows_motion_runtime.py
 
 permissions:
   contents: read
@@ -47,6 +51,122 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  motion-runtime-diagnostic:
+    name: DIAGNOSTIC ONLY - actual 333 motion service runtime without an installer
+    runs-on: windows-2025
+    timeout-minutes: 5
+    env:
+      K5_DESKTOP_HEAD_SHA: 333685876d8f5dfd65cc4dcafeb2b4a694393283
+      K5_DIAGNOSTIC_HARNESS_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - name: Checkout original immutable product service, store and camera fixtures
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: 333685876d8f5dfd65cc4dcafeb2b4a694393283
+          persist-credentials: false
+      - name: Checkout separately identified parent-only runtime diagnostic
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          path: diagnostic-source
+          persist-credentials: false
+      - name: Admit exact runtime diagnostic Git blob without checkout conversion
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $harnessHead = (& git -C diagnostic-source rev-parse HEAD).Trim()
+          & (Join-Path $env:SYSTEMROOT 'System32/cmd.exe') /d /c 'git -C diagnostic-source cat-file blob HEAD:scripts/probe_windows_motion_runtime.py > scripts/probe_windows_motion_runtime.py'
+          $scriptSha = (Get-FileHash -LiteralPath scripts/probe_windows_motion_runtime.py -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($LASTEXITCODE -ne 0 -or $scriptSha -ne '1386ddb595a3b5a078e0c52322e7385b675926b7e300bfc873fe98c652edfa43' -or
+              $harnessHead -ne $env:K5_DIAGNOSTIC_HARNESS_SHA -or $harnessHead -eq $env:K5_DESKTOP_HEAD_SHA) {
+            throw 'Diagnostic motion runtime source identity mismatch'
+          }
+          @{ schema_version=1; diagnostic_only=$true; product_qualification=$false;
+             runtime_head=$env:K5_DESKTOP_HEAD_SHA; harness_head=$harnessHead; script_sha256=$scriptSha } |
+            ConvertTo-Json | Set-Content -LiteralPath motion-runtime-provenance.json -Encoding utf8
+      - name: Set up native development Python for the diagnostic controller
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install original development dependencies and declared CV5 stack
+        shell: pwsh
+        run: |
+          python -m pip install -e ".[dev]" "numpy==2.2.6" "opencv-python-headless==5.0.0.93"
+          if ($LASTEXITCODE -ne 0) { throw 'Diagnostic motion runtime dependencies unavailable' }
+      - name: Provision original pinned media, gateway and generated-video tools
+        uses: ./.github/actions/provision-operator-tools
+      - name: Observe real API enrollment, motion save and runtime restart without child tracing
+        timeout-minutes: 3
+        shell: pwsh
+        run: |
+          python scripts/probe_windows_motion_runtime.py --output native-motion-runtime.json
+          if ($LASTEXITCODE -ne 0) { throw 'Diagnostic motion runtime infrastructure or cleanup failed' }
+          $evidence = Get-Content -LiteralPath native-motion-runtime.json -Raw | ConvertFrom-Json
+          if ($evidence.schema_version -ne 1 -or $evidence.status -ne 'diagnostic_complete' -or
+              $evidence.diagnostic_only -ne $true -or $evidence.cleanup_complete -ne $true) {
+            throw 'Diagnostic motion runtime did not complete its observation'
+          }
+      - name: Retain only diagnostic runtime observations without qualification
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: diagnostic-only-motion-runtime-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            native-motion-runtime.json
+            motion-runtime-provenance.json
+          if-no-files-found: warn
+          retention-days: 14
+  nested-vm-diagnostic:
+    name: DIAGNOSTIC ONLY - observe an isolated diskless nested guest running interval
+    runs-on: windows-2025
+    timeout-minutes: 3
+    steps:
+      - name: Checkout exact bounded VM capability diagnostic
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Admit exact probe bytes and observe actual VM start without boot qualification
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted' -or $env:RUNNER_OS -ne 'Windows') {
+            throw 'Nested guest capacity diagnostic requires a disposable hosted Windows VM'
+          }
+          & (Join-Path $env:SYSTEMROOT 'System32/cmd.exe') /d /c 'git cat-file blob HEAD:scripts/probe_windows_nested_vm.ps1 > nested-vm-admitted.ps1'
+          $scriptSha = (Get-FileHash -LiteralPath nested-vm-admitted.ps1 -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($LASTEXITCODE -ne 0 -or $scriptSha -ne 'be62164ef454f71e7281b27af3eeab494043ea67412b3ad2fd4cbb5773ada2de') {
+            throw 'Nested guest capacity diagnostic source identity mismatch'
+          }
+          pwsh -NoProfile -NonInteractive -File nested-vm-admitted.ps1 | Tee-Object -FilePath nested-vm-diagnostic.json
+          if ($LASTEXITCODE -ne 0) { throw 'Nested guest capacity diagnostic could not clean up its exact guest' }
+          $evidence = Get-Content -LiteralPath nested-vm-diagnostic.json -Raw | ConvertFrom-Json
+          if ($evidence.schema_version -ne 1 -or $evidence.status -ne 'diagnostic_complete' -or
+              $evidence.cleanup_complete -ne $true -or $evidence.running_guest_interval_observed -isnot [bool]) {
+            throw 'Nested guest capacity diagnostic did not complete its observation'
+          }
+          if ($evidence.running_guest_interval_observed -and
+              ($evidence.start_completed -ne $true -or $evidence.running_observed -ne $true -or
+               $evidence.guest_created -ne $true -or $evidence.guest_vm_id_bound -ne $true -or
+               $evidence.uptime_delta_ms -lt 1000 -or $evidence.guest_generation -ne 2 -or
+               $evidence.guest_startup_memory_bytes -ne 536870912 -or
+               $evidence.guest_network_adapters -ne 0 -or $evidence.guest_virtual_disks -ne 0)) {
+            throw 'Nested guest capacity execution was not supported by an isolated actual VM start'
+          }
+          @{ schema_version=1; diagnostic_only=$true; windows_boot_qualified=$false; product_qualification=$false;
+             harness_head='${{ github.event.pull_request.head.sha || github.sha }}'; script_sha256=$scriptSha } |
+            ConvertTo-Json | Set-Content -LiteralPath nested-vm-provenance.json -Encoding utf8
+      - name: Retain finite nested guest capacity capability observations without promotion
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: diagnostic-only-nested-vm-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            nested-vm-diagnostic.json
+            nested-vm-provenance.json
+          if-no-files-found: warn
+          retention-days: 14
   motion-sampler-diagnostic:
     name: DIAGNOSTIC ONLY - actual 333 live motion worker and capture phases
     runs-on: windows-2025
@@ -73,7 +193,7 @@ jobs:
           $harnessHead = (& git -C diagnostic-source rev-parse HEAD).Trim()
           & (Join-Path $env:SYSTEMROOT 'System32/cmd.exe') /d /c 'git -C diagnostic-source cat-file blob HEAD:scripts/probe_windows_motion_sampler.py > scripts/probe_windows_motion_sampler.py'
           $scriptSha = (Get-FileHash -LiteralPath scripts/probe_windows_motion_sampler.py -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($LASTEXITCODE -ne 0 -or $scriptSha -ne '7139c1165c58e6b63d35d3792a83b79cd55eb180f5da45062b86ed16f1e83228' -or
+          if ($LASTEXITCODE -ne 0 -or $scriptSha -ne '9d2d4d51519869b966ec884944b00763fb0899e1e9dee61f926c000040154e0f' -or
               $harnessHead -ne $env:K5_DIAGNOSTIC_HARNESS_SHA -or $harnessHead -eq $env:K5_DESKTOP_HEAD_SHA) {
             throw 'Diagnostic motion sampler source identity mismatch'
           }

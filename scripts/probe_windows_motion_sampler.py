@@ -153,6 +153,7 @@ def main():
     original_popen, original_document = subprocess.Popen, motion._document
     metadata = {}
     diagnostic_streams = []
+    phase, config_path = "initialization", None
     with tempfile.TemporaryDirectory(prefix="k5-motion-sampler-") as temporary:
         root = Path(temporary)
         try:
@@ -285,10 +286,14 @@ def main():
                 response.read(4096)
             config["paths"][path]["record"] = False
             replacement = root / "relay-new.json"
+            phase = "replacement_write"
             replacement.write_text(json.dumps(config), encoding="utf-8")
+            phase = "replacement_chmod"
             replacement.chmod(0o600)
+            phase = "replacement_replace"
             replacement.replace(config_path)
             receipt["recording_config_replaced"] = True
+            phase = "direct_sampling"
             _sample(
                 worker,
                 policy,
@@ -325,6 +330,7 @@ def main():
 
             subprocess.Popen = traced_popen
             worker = motion.LiveMotionWorker(relay_uri)
+            phase = "traced_sampling"
             _sample(
                 worker,
                 policy,
@@ -338,6 +344,7 @@ def main():
             )
             publisher.close()
             publisher = None
+            phase = "source_stopped"
             _sample(
                 worker,
                 policy,
@@ -352,6 +359,23 @@ def main():
             receipt["status"] = "diagnostic_complete"
         except BaseException as error:
             receipt["failure_kind"] = type(error).__name__
+            receipt["failure_phase"] = phase
+            for field in ("winerror", "hresult", "errno"):
+                value = getattr(error, field, None)
+                if type(value) is int:
+                    receipt["failure_" + field] = value
+            if config_path is not None:
+                try:
+                    data = config_path.read_bytes()
+                    attributes = getattr(config_path.stat(), "st_file_attributes", 0)
+                    receipt["configuration_after_failure"] = {
+                        "readable": True,
+                        "bytes": len(data),
+                        "empty": not data,
+                        "readonly_attribute": bool(attributes & 1),
+                    }
+                except OSError:
+                    receipt["configuration_after_failure"] = {"readable": False}
         finally:
             cleanup = True
             for action in (
