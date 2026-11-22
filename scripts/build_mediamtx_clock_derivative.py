@@ -262,8 +262,9 @@ def main():
             # Prevent git apply from discovering that parent and silently
             # skipping source-relative hunks outside its inferred prefix.
             patch_environment = dict(os.environ, GIT_CEILING_DIRECTORIES=str(rtsp.parent))
-            run(["git", "apply", "--check", str(patch)], cwd=rtsp, env=patch_environment)
-            run(["git", "apply", str(patch)], cwd=rtsp, env=patch_environment)
+            git_apply = ["git", "-c", "core.autocrlf=false", "-c", "core.eol=lf", "apply"]
+            run([*git_apply, "--check", str(patch)], cwd=rtsp, env=patch_environment)
+            run([*git_apply, str(patch)], cwd=rtsp, env=patch_environment)
             for name, pin in peer_pin["source_files"].items():
                 if digest(rtsp / name) != pin["patched_sha256"]:
                     raise ValueError("Patched TCP watchdog source identity differs")
