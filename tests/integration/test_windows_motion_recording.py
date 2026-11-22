@@ -91,12 +91,37 @@ def _policy(client, camera):
     return client.json(f"/api/v1/operator/cameras/{camera}/recording-policy")
 
 
-def _policy_state(client, camera, wanted, desktop, *, app=None, timeout=20):
+def _policy_state(client, camera, wanted, desktop, *, app=None, timeout=20, diagnostic=None):
     observed = {}
+    started = time.monotonic()
+    wait = {
+        "wanted": sorted(wanted),
+        "timeout_seconds": timeout,
+        "poll_count": 0,
+        "state_edges": [],
+    }
+    if diagnostic is not None:
+        diagnostic["policy_wait"] = wait
 
     def ready():
+        began = time.monotonic()
         observed.clear()
-        observed.update(_policy(client, camera))
+        try:
+            observed.update(_policy(client, camera))
+        finally:
+            wait["last_http_status"] = getattr(client, "last_http_status", None)
+            failure = getattr(client, "transport_failure", None)
+            if failure is not None:
+                wait["transport_failure"] = failure
+        state = observed.get("status")
+        wait["poll_count"] += 1
+        wait["last_status"] = state
+        wait["elapsed_seconds"] = round(time.monotonic() - started, 3)
+        wait["max_poll_seconds"] = max(
+            wait.get("max_poll_seconds", 0), round(time.monotonic() - began, 3)
+        )
+        if not wait["state_edges"] or wait["state_edges"][-1]["state"] != state:
+            wait["state_edges"].append({"state": state, "elapsed_seconds": wait["elapsed_seconds"]})
         return observed.get("status") in set(wanted)
 
     desktop._wait(ready, "Actual motion recorder state", timeout=timeout, process=app)
@@ -118,9 +143,19 @@ def _observe_recording(
     seconds=4,
     diagnostic=None,
 ):
+    observation = {
+        "movement": movement,
+        "expected_growing": growing,
+        "expected_states": sorted(state),
+        "phase": "waiting_for_state",
+    }
+    if diagnostic is not None:
+        diagnostic["motion_observation"] = observation
     publisher.movement(movement)
-    _policy_state(client, camera, state, desktop, app=app)
+    boundary = _policy_state(client, camera, state, desktop, app=app)
+    observation["entry_state"] = boundary["status"]
     if not growing:
+        observation["phase"] = "waiting_for_quiescence"
         # A completed record-only PATCH closes its fragment. Require actual
         # file quiescence before starting the measured idle interval.
         previous, stable_since = None, time.monotonic()
@@ -134,27 +169,41 @@ def _observe_recording(
 
         desktop._wait(closed, "Closed motion recording fragment", timeout=10, process=app)
     before = [desktop._recording_bytes(profile, path) for path in paths]
+    frames_before = publisher.frames_written
     began, observed_states = time.monotonic(), set()
+    state_edges, poll_seconds = [], []
+    observation["phase"] = "observing"
     while time.monotonic() - began < seconds:
         publisher.check()
-        observed_states.add(_policy(client, camera)["status"])
+        poll_began = time.monotonic()
+        current = _policy(client, camera)["status"]
+        poll_seconds.append(time.monotonic() - poll_began)
+        observed_states.add(current)
+        if not state_edges or current != state_edges[-1]["state"]:
+            state_edges.append(
+                {"state": current, "elapsed_seconds": round(time.monotonic() - began, 3)}
+            )
         if app is not None:
             _require(app.poll() is None, "Installed motion recorder exited")
         time.sleep(0.2)
     elapsed = time.monotonic() - began
     after = [desktop._recording_bytes(profile, path) for path in paths]
-    if diagnostic is not None:
-        diagnostic["motion_observation"] = {
-            "movement": movement,
-            "expected_growing": growing,
-            "expected_states": sorted(state),
+    observation.update(
+        {
+            "phase": "complete",
             "observed_states": sorted(observed_states),
+            "state_edges": state_edges,
+            "policy_poll_count": len(poll_seconds),
+            "policy_poll_max_seconds": round(max(poll_seconds, default=0), 3),
+            "publisher_frames_before": frames_before,
+            "publisher_frames_after": publisher.frames_written,
             "target_before": before[0],
             "target_after": after[0],
             "other_before": before[1],
             "other_after": after[1],
             "elapsed_seconds": round(elapsed, 3),
         }
+    )
     _require(
         after[0] > before[0] if growing else after[0] == before[0],
         "Actual recording bytes disagreed with the motion gate",
@@ -279,40 +328,100 @@ def _author_zones(page, camera):
     return saved, preview
 
 
-def _clock_holds(client, camera, *, desktop, publisher, app, parent, other_path, profile):
+def _clock_holds(
+    client, camera, *, desktop, publisher, app, parent, other_path, profile, diagnostic=None
+):
     guard = _helpers("windows_vm_clock").WindowsVmClockGuard(
         parent / "motion-clock-guard.json", watchdog_seconds=90
     )
-    phases = []
-    with guard:
-        for offset in (172800, -172800):
-            publisher.movement("included")
-            _policy_state(client, camera, {"recording"}, desktop, app=app, timeout=15)
-            before = desktop._recording_bytes(profile, other_path)
-            publisher.movement("idle")
-            _policy_state(client, camera, {"post_capture"}, desktop, app=app, timeout=10)
-            began = time.monotonic()
-            native = guard.shift(offset)
-            _require(native["verified"] is True, "Actual motion clock step was not observed")
-            after_step = _policy(client, camera)["status"]
-            _require(after_step == "post_capture", "Wall time expired the motion hold early")
-            _policy_state(client, camera, {"armed"}, desktop, app=app, timeout=8)
-            elapsed = time.monotonic() - began
-            _require(0.5 <= elapsed <= 8, "Motion post-capture did not use elapsed time")
-            restored = guard.restore()
-            after = desktop._recording_bytes(profile, other_path)
-            _require(after > before, "Clock correction interrupted the other recorder")
-            _require(restored["restored"] is True, "Motion test did not restore actual UTC")
-            phases.append(
-                {
+    phases, clock_note = [], {"phases": []}
+    if diagnostic is not None:
+        diagnostic["motion_clock_observation"] = clock_note
+    try:
+        with guard:
+            for offset in (172800, -172800):
+                note = {
                     "offset_seconds": offset,
-                    "after_step_state": after_step,
-                    "final_state": "armed",
-                    "post_capture_elapsed_seconds": round(elapsed, 3),
-                    "other_recording_grew": True,
-                    "utc_restored": True,
+                    "step": "waiting_for_recording",
+                    "publisher_frames_before": publisher.frames_written,
                 }
-            )
+                clock_note["phases"].append(note)
+                try:
+                    publisher.movement("included")
+                    _policy_state(
+                        client, camera, {"recording"}, desktop, app=app, timeout=15, diagnostic=note
+                    )
+                    before = desktop._recording_bytes(profile, other_path)
+                    note["other_bytes_before"] = before
+                    publisher.movement("idle")
+                    note["step"] = "waiting_for_post_capture"
+                    _policy_state(
+                        client,
+                        camera,
+                        {"post_capture"},
+                        desktop,
+                        app=app,
+                        timeout=10,
+                        diagnostic=note,
+                    )
+                    began = time.monotonic()
+                    note["step"] = "applying_clock_step"
+                    native = guard.shift(offset)
+                    note["shift"] = native
+                    _require(
+                        native["verified"] is True, "Actual motion clock step was not observed"
+                    )
+                    after_step = _policy(client, camera)["status"]
+                    note["after_step_state"] = after_step
+                    note["publisher_frames_at_step"] = publisher.frames_written
+                    _require(
+                        after_step == "post_capture", "Wall time expired the motion hold early"
+                    )
+                    note["other_bytes_at_step"] = desktop._recording_bytes(profile, other_path)
+                    note["step"] = "waiting_for_armed_after_step"
+                    _policy_state(
+                        client, camera, {"armed"}, desktop, app=app, timeout=8, diagnostic=note
+                    )
+                    elapsed = time.monotonic() - began
+                    _require(0.5 <= elapsed <= 8, "Motion post-capture did not use elapsed time")
+                    note["step"] = "restoring_utc"
+                    restored = guard.restore()
+                    note["restoration"] = restored
+                    after = desktop._recording_bytes(profile, other_path)
+                    _require(after > before, "Clock correction interrupted the other recorder")
+                    _require(restored["restored"] is True, "Motion test did not restore actual UTC")
+                    phases.append(
+                        {
+                            "offset_seconds": offset,
+                            "after_step_state": after_step,
+                            "final_state": "armed",
+                            "post_capture_elapsed_seconds": round(elapsed, 3),
+                            "other_recording_grew": True,
+                            "utc_restored": True,
+                        }
+                    )
+                    note["step"] = "complete"
+                finally:
+                    note["publisher_frames_after"] = publisher.frames_written
+                    note["publisher_process_alive"] = publisher.process.poll() is None
+                    note["publisher_writer_alive"] = publisher._writer.is_alive()
+                    note["publisher_writer_failed"] = publisher._failure
+                    try:
+                        note["other_bytes_after"] = desktop._recording_bytes(profile, other_path)
+                        cameras = client.json("/api/v1/operator/cameras")
+                        note["worker_status_after"] = cameras["worker_status"]
+                        note["camera_status_after"] = next(
+                            item["status"]
+                            for item in cameras["cameras"]
+                            if item["device_id"] == camera
+                        )
+                    except BaseException as error:
+                        note["snapshot_failure_kind"] = type(error).__name__
+    finally:
+        try:
+            clock_note["guard"] = guard.receipt()
+        except Exception as error:
+            clock_note["guard_failure_kind"] = type(error).__name__
     return {"guard": guard.receipt(), "phases": phases}
 
 
@@ -708,6 +817,7 @@ def test_native_windows_motion_recording_and_zones(record_testsuite_property):
             state={"armed"},
             growing=False,
             app=app,
+            diagnostic=diagnostic,
         )
         observations["outside_inclusion"] = _observe_recording(
             client,
@@ -720,6 +830,7 @@ def test_native_windows_motion_recording_and_zones(record_testsuite_property):
             state={"armed"},
             growing=False,
             app=app,
+            diagnostic=diagnostic,
         )
         publisher.movement("idle")
         observations["zoned_idle"] = _observe_recording(
@@ -733,6 +844,7 @@ def test_native_windows_motion_recording_and_zones(record_testsuite_property):
             state={"armed"},
             growing=False,
             app=app,
+            diagnostic=diagnostic,
         )
         idle_middle = datetime.now(UTC) - timedelta(seconds=2)
         trigger_start = datetime.now(UTC)
@@ -749,6 +861,7 @@ def test_native_windows_motion_recording_and_zones(record_testsuite_property):
             growing=True,
             app=app,
             seconds=6,
+            diagnostic=diagnostic,
         )
         trigger_end = datetime.now(UTC)
         publisher.movement("idle")
@@ -764,6 +877,7 @@ def test_native_windows_motion_recording_and_zones(record_testsuite_property):
             state={"armed"},
             growing=False,
             app=app,
+            diagnostic=diagnostic,
         )
         retained = video_helpers._closed_subset(sorted(paths[0].glob("*.mp4")))
         diagnostic["stage"] = "browser_closed_motion"
@@ -780,6 +894,7 @@ def test_native_windows_motion_recording_and_zones(record_testsuite_property):
             state={"recording"},
             growing=True,
             app=app,
+            diagnostic=diagnostic,
         )
         observations["browser_closed_idle"] = _observe_recording(
             client,
@@ -792,6 +907,7 @@ def test_native_windows_motion_recording_and_zones(record_testsuite_property):
             state={"armed"},
             growing=False,
             app=app,
+            diagnostic=diagnostic,
         )
         diagnostic["stage"] = "native_motion_restart"
         before_restart = _policy(client, target)
@@ -831,6 +947,7 @@ def test_native_windows_motion_recording_and_zones(record_testsuite_property):
             state={"armed"},
             growing=False,
             app=app,
+            diagnostic=diagnostic,
         )
         diagnostic["stage"] = "master_pause_override"
         route = f"/api/v1/operator/cameras/{target}/recording"
@@ -849,6 +966,7 @@ def test_native_windows_motion_recording_and_zones(record_testsuite_property):
             state={"paused"},
             growing=False,
             app=app,
+            diagnostic=diagnostic,
         )
         publisher.movement("idle")
         _require(
@@ -866,6 +984,7 @@ def test_native_windows_motion_recording_and_zones(record_testsuite_property):
             parent=parent,
             other_path=paths[1],
             profile=profile,
+            diagnostic=diagnostic,
         )
         context = browser.new_context(
             viewport={"width": 1440, "height": 1000}, accept_downloads=True
@@ -905,6 +1024,7 @@ def test_native_windows_motion_recording_and_zones(record_testsuite_property):
             state={"zones_need_review"},
             growing=False,
             app=app,
+            diagnostic=diagnostic,
         )
         browser_helpers._open_camera_watch(page, target)
         page.locator("#camera-recording-settings-button").click()
@@ -1060,6 +1180,7 @@ def test_native_windows_motion_recording_and_zones(record_testsuite_property):
                     "motion_saved_policy",
                     "motion_saved_zone_counts",
                     "motion_observation",
+                    "motion_clock_observation",
                     "cleanup_failures",
                     "cohort_failed_after_finish",
                     "installer_action",

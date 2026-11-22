@@ -1,451 +1,112 @@
-name: Windows recorder source compilation
+name: Windows motion clock diagnostics
 
 on:
   workflow_dispatch:
   push:
-    branches: [codex/unattended-windows-20261121, codex/browser-probe-20261121]
+    branches: [codex/browser-probe-20261121]
     paths:
       - .github/workflows/windows-service-compile.yml
-      - windows/desktop/**
-      - scripts/compile_desktop_launcher.py
-      - tests/integration/windows_standard_user_probe.cs
-      - scripts/probe_windows_machine_admission.cs
-      - scripts/probe_windows_machine_admission.py
-      - scripts/probe_windows_recorder_wire.cs
-      - scripts/probe_windows_browser_launch.cs
-      - scripts/probe_windows_native_worker_images.py
       - tests/integration/test_windows_motion_recording.py
-      - tests/integration/test_windows_service_recording.py
-      - tests/integration/test_windows_time_administration.py
-      - tests/integration/test_windows_desktop_app.py
-      - tests/integration/windows_process_identity.py
-      - scripts/probe_windows_motion_sampler.py
-      - scripts/probe_windows_nested_vm.ps1
-      - scripts/probe_windows_motion_runtime.py
-      - src/k5vision/operator_motion_process.py
+      - scripts/probe_windows_motion*.py
   pull_request:
     branches: [main]
     paths:
       - .github/workflows/windows-service-compile.yml
-      - windows/desktop/**
-      - scripts/compile_desktop_launcher.py
-      - tests/integration/windows_standard_user_probe.cs
-      - scripts/probe_windows_machine_admission.cs
-      - scripts/probe_windows_machine_admission.py
-      - scripts/probe_windows_recorder_wire.cs
-      - scripts/probe_windows_browser_launch.cs
-      - scripts/probe_windows_native_worker_images.py
       - tests/integration/test_windows_motion_recording.py
-      - tests/integration/test_windows_service_recording.py
-      - tests/integration/test_windows_time_administration.py
-      - tests/integration/test_windows_desktop_app.py
-      - tests/integration/windows_process_identity.py
-      - scripts/probe_windows_motion_sampler.py
-      - scripts/probe_windows_nested_vm.ps1
-      - scripts/probe_windows_motion_runtime.py
-      - src/k5vision/operator_motion_process.py
+      - scripts/probe_windows_motion*.py
 
 permissions:
   contents: read
 
 concurrency:
-  group: recorder-source-compile-${{ github.ref }}
+  group: motion-clock-diagnostic-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  motion-runtime-diagnostic:
-    name: DIAGNOSTIC ONLY - actual 333 motion service runtime without an installer
+  motion-runtime-clock-diagnostic:
+    name: DIAGNOSTIC ONLY - exact d171 motion runtime across real clock steps
     runs-on: windows-2025
     timeout-minutes: 5
     env:
-      K5_DESKTOP_HEAD_SHA: 333685876d8f5dfd65cc4dcafeb2b4a694393283
+      K5_DESKTOP_HEAD_SHA: d17120f413ff0cf7415c4462b3a50e1e19e65aaa
       K5_DIAGNOSTIC_HARNESS_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      K5_VM_CLOCK_ACCEPTANCE: "1"
     steps:
-      - name: Checkout original immutable product service, store and camera fixtures
+      - name: Checkout exact d171 product runtime, store and original clock guard
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: 333685876d8f5dfd65cc4dcafeb2b4a694393283
+          ref: d17120f413ff0cf7415c4462b3a50e1e19e65aaa
           persist-credentials: false
-      - name: Checkout separately identified parent-only runtime diagnostic
+      - name: Checkout separately identified parent-only runtime clock diagnostic
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           path: diagnostic-source
           persist-credentials: false
-      - name: Admit exact runtime diagnostic Git blob without checkout conversion
+      - name: Admit exact controller Git blob without changing the original runtime
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted' -or $env:RUNNER_OS -ne 'Windows') {
+            throw 'Runtime clock diagnostic requires a disposable hosted Windows VM'
+          }
           $harnessHead = (& git -C diagnostic-source rev-parse HEAD).Trim()
           & (Join-Path $env:SYSTEMROOT 'System32/cmd.exe') /d /c 'git -C diagnostic-source cat-file blob HEAD:scripts/probe_windows_motion_runtime.py > scripts/probe_windows_motion_runtime.py'
           $scriptSha = (Get-FileHash -LiteralPath scripts/probe_windows_motion_runtime.py -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($LASTEXITCODE -ne 0 -or $scriptSha -ne '1386ddb595a3b5a078e0c52322e7385b675926b7e300bfc873fe98c652edfa43' -or
+          if ($LASTEXITCODE -ne 0 -or $scriptSha -ne '5e6a16caf3a6bb29188a84b678b6c652c604e94d5890fd510e11b309b73730d2' -or
               $harnessHead -ne $env:K5_DIAGNOSTIC_HARNESS_SHA -or $harnessHead -eq $env:K5_DESKTOP_HEAD_SHA) {
-            throw 'Diagnostic motion runtime source identity mismatch'
+            throw 'Diagnostic runtime clock controller identity mismatch'
           }
           @{ schema_version=1; diagnostic_only=$true; product_qualification=$false;
              runtime_head=$env:K5_DESKTOP_HEAD_SHA; harness_head=$harnessHead; script_sha256=$scriptSha } |
-            ConvertTo-Json | Set-Content -LiteralPath motion-runtime-provenance.json -Encoding utf8
+            ConvertTo-Json | Set-Content -LiteralPath motion-runtime-clock-provenance.json -Encoding utf8
       - name: Set up native development Python for the diagnostic controller
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: "3.12"
           cache: pip
-      - name: Install original development dependencies and declared CV5 stack
+      - name: Install exact d171 development dependencies and declared CV5 stack
         shell: pwsh
         run: |
           python -m pip install -e ".[dev]" "numpy==2.2.6" "opencv-python-headless==5.0.0.93"
-          if ($LASTEXITCODE -ne 0) { throw 'Diagnostic motion runtime dependencies unavailable' }
-      - name: Provision original pinned media, gateway and generated-video tools
+          if ($LASTEXITCODE -ne 0) { throw 'Runtime clock diagnostic dependencies unavailable' }
+      - name: Provision exact d171 pinned media, gateway and generated-video tools
         uses: ./.github/actions/provision-operator-tools
-      - name: Observe real API enrollment, motion save and runtime restart without child tracing
+      - name: Observe parent runtime and source progress across guarded plus and minus two-day steps
         timeout-minutes: 3
         shell: pwsh
         run: |
-          python scripts/probe_windows_motion_runtime.py --output native-motion-runtime.json
-          if ($LASTEXITCODE -ne 0) { throw 'Diagnostic motion runtime infrastructure or cleanup failed' }
+          python scripts/probe_windows_motion_runtime.py --clock-steps --baseline-source-head $env:K5_DESKTOP_HEAD_SHA --output native-motion-runtime.json
+          if ($LASTEXITCODE -ne 0) { throw 'Runtime clock diagnostic infrastructure or restoration failed' }
           $evidence = Get-Content -LiteralPath native-motion-runtime.json -Raw | ConvertFrom-Json
           if ($evidence.schema_version -ne 1 -or $evidence.status -ne 'diagnostic_complete' -or
-              $evidence.diagnostic_only -ne $true -or $evidence.cleanup_complete -ne $true) {
-            throw 'Diagnostic motion runtime did not complete its observation'
+              $evidence.diagnostic_only -ne $true -or $evidence.cleanup_complete -ne $true -or
+              $evidence.baseline_source_head -ne $env:K5_DESKTOP_HEAD_SHA -or
+              $evidence.motion_child_argv_unchanged -ne $true -or
+              @($evidence.clock_steps).Count -ne 2 -or $evidence.clock_guard.clock_restored -ne $true -or
+              $evidence.clock_guard.services_restored -ne $true) {
+            throw 'Runtime clock diagnostic scope, observation or restoration mismatch'
           }
-      - name: Retain only diagnostic runtime observations without qualification
+      - name: Retain parent-only clock observations without qualification or promotion
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
-          name: diagnostic-only-motion-runtime-${{ github.run_id }}-${{ github.run_attempt }}
+          name: diagnostic-only-d171-motion-runtime-clock-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             native-motion-runtime.json
-            motion-runtime-provenance.json
-          if-no-files-found: warn
-          retention-days: 14
-  nested-vm-diagnostic:
-    name: DIAGNOSTIC ONLY - observe an isolated diskless nested guest running interval
-    runs-on: windows-2025
-    timeout-minutes: 3
-    steps:
-      - name: Checkout exact bounded VM capability diagnostic
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-          persist-credentials: false
-      - name: Admit exact probe bytes and observe actual VM start without boot qualification
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted' -or $env:RUNNER_OS -ne 'Windows') {
-            throw 'Nested guest capacity diagnostic requires a disposable hosted Windows VM'
-          }
-          & (Join-Path $env:SYSTEMROOT 'System32/cmd.exe') /d /c 'git cat-file blob HEAD:scripts/probe_windows_nested_vm.ps1 > nested-vm-admitted.ps1'
-          $scriptSha = (Get-FileHash -LiteralPath nested-vm-admitted.ps1 -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($LASTEXITCODE -ne 0 -or $scriptSha -ne 'be62164ef454f71e7281b27af3eeab494043ea67412b3ad2fd4cbb5773ada2de') {
-            throw 'Nested guest capacity diagnostic source identity mismatch'
-          }
-          pwsh -NoProfile -NonInteractive -File nested-vm-admitted.ps1 | Tee-Object -FilePath nested-vm-diagnostic.json
-          if ($LASTEXITCODE -ne 0) { throw 'Nested guest capacity diagnostic could not clean up its exact guest' }
-          $evidence = Get-Content -LiteralPath nested-vm-diagnostic.json -Raw | ConvertFrom-Json
-          if ($evidence.schema_version -ne 1 -or $evidence.status -ne 'diagnostic_complete' -or
-              $evidence.cleanup_complete -ne $true -or $evidence.running_guest_interval_observed -isnot [bool]) {
-            throw 'Nested guest capacity diagnostic did not complete its observation'
-          }
-          if ($evidence.running_guest_interval_observed -and
-              ($evidence.start_completed -ne $true -or $evidence.running_observed -ne $true -or
-               $evidence.guest_created -ne $true -or $evidence.guest_vm_id_bound -ne $true -or
-               $evidence.uptime_delta_ms -lt 1000 -or $evidence.guest_generation -ne 2 -or
-               $evidence.guest_startup_memory_bytes -ne 536870912 -or
-               $evidence.guest_network_adapters -ne 0 -or $evidence.guest_virtual_disks -ne 0)) {
-            throw 'Nested guest capacity execution was not supported by an isolated actual VM start'
-          }
-          @{ schema_version=1; diagnostic_only=$true; windows_boot_qualified=$false; product_qualification=$false;
-             harness_head='${{ github.event.pull_request.head.sha || github.sha }}'; script_sha256=$scriptSha } |
-            ConvertTo-Json | Set-Content -LiteralPath nested-vm-provenance.json -Encoding utf8
-      - name: Retain finite nested guest capacity capability observations without promotion
-        if: always()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
-        with:
-          name: diagnostic-only-nested-vm-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            nested-vm-diagnostic.json
-            nested-vm-provenance.json
-          if-no-files-found: warn
-          retention-days: 14
-  motion-capture-matrix:
-    name: DIAGNOSTIC ONLY - original 333 CV${{ matrix.opencv }} ${{ matrix.transport }}
-    runs-on: windows-2025
-    timeout-minutes: 5
-    strategy:
-      fail-fast: false
-      max-parallel: 6
-      matrix:
-        opencv: ["5.0.0.93", "4.12.0.88"]
-        transport: [default, tcp, tcp-nobuffer]
-    env:
-      K5_DESKTOP_HEAD_SHA: 333685876d8f5dfd65cc4dcafeb2b4a694393283
-      K5_DIAGNOSTIC_HARNESS_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-      K5_DIAGNOSTIC_OPENCV_VERSION: ${{ matrix.opencv }}
-      K5_DIAGNOSTIC_CAPTURE_OPTIONS: ${{ matrix.transport }}
-    steps:
-      - name: Checkout original immutable motion runtime and generated camera fixtures
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          ref: 333685876d8f5dfd65cc4dcafeb2b4a694393283
-          persist-credentials: false
-      - name: Checkout separately identified dependency and transport diagnostic controller
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-          path: diagnostic-source
-          persist-credentials: false
-      - name: Admit exact controller Git blob while preserving original worker source
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $harnessHead = (& git -C diagnostic-source rev-parse HEAD).Trim()
-          & (Join-Path $env:SYSTEMROOT 'System32/cmd.exe') /d /c 'git -C diagnostic-source cat-file blob HEAD:scripts/probe_windows_motion_sampler.py > scripts/probe_windows_motion_sampler.py'
-          $scriptSha = (Get-FileHash -LiteralPath scripts/probe_windows_motion_sampler.py -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($LASTEXITCODE -ne 0 -or $scriptSha -ne 'aa995681ceca4fa28219213290e4063d9cb088cb498e9ab74b18bb962872f520' -or
-              $harnessHead -ne $env:K5_DIAGNOSTIC_HARNESS_SHA -or $harnessHead -eq $env:K5_DESKTOP_HEAD_SHA) {
-            throw 'Dependency/transport diagnostic controller identity mismatch'
-          }
-          git diff --exit-code -- src/k5vision/operator_motion_process.py
-          if ($LASTEXITCODE -ne 0) { throw 'Original motion worker source was modified' }
-          $workerSha = (Get-FileHash -LiteralPath src/k5vision/operator_motion_process.py -Algorithm SHA256).Hash.ToLowerInvariant()
-          $workerBlob = (& git rev-parse HEAD:src/k5vision/operator_motion_process.py).Trim()
-          "K5_DIAGNOSTIC_ORIGINAL_WORKER_SHA256=$workerSha" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
-          @{ schema_version=1; diagnostic_only=$true; product_qualification=$false;
-             source_head=$env:K5_DESKTOP_HEAD_SHA; harness_head=$harnessHead; script_sha256=$scriptSha;
-             original_worker_sha256=$workerSha; original_worker_git_blob=$workerBlob;
-             selected_opencv_distribution=$env:K5_DIAGNOSTIC_OPENCV_VERSION;
-             current_product_opencv_requirement='opencv-python-headless==5.0.0.93';
-             matches_current_product_cv_requirement=($env:K5_DIAGNOSTIC_OPENCV_VERSION -eq '5.0.0.93');
-             dependency_override=($env:K5_DIAGNOSTIC_OPENCV_VERSION -ne '5.0.0.93');
-             transport_profile=$env:K5_DIAGNOSTIC_CAPTURE_OPTIONS;
-             transport_override=($env:K5_DIAGNOSTIC_CAPTURE_OPTIONS -ne 'default') } |
-            ConvertTo-Json | Set-Content -LiteralPath motion-capture-provenance.json -Encoding utf8
-      - name: Set up native development Python for this isolated diagnostic variant
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
-        with:
-          python-version: "3.12"
-          cache: pip
-      - name: Install the explicitly selected diagnostic CV dependency without changing product requirements
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          python -m pip install -e ".[dev]" "numpy==2.2.6" "opencv-python-headless==$env:K5_DIAGNOSTIC_OPENCV_VERSION"
-          if ($LASTEXITCODE -ne 0) { throw 'Diagnostic matrix dependency installation failed' }
-          python -c "import importlib.metadata as m, os, tomllib; d=tomllib.load(open('pyproject.toml','rb')); assert 'opencv-python-headless==5.0.0.93' in d['project']['optional-dependencies']['operator-analytics']; assert m.version('opencv-python-headless')==os.environ['K5_DIAGNOSTIC_OPENCV_VERSION']; assert m.version('numpy')=='2.2.6'"
-          if ($LASTEXITCODE -ne 0) { throw 'Selected diagnostic dependency or unchanged product requirement mismatch' }
-      - name: Provision original pinned native RTSP and generated-video tools
-        uses: ./.github/actions/provision-operator-tools
-      - name: Observe 120 original untraced worker samples and genuine source stop
-        timeout-minutes: 3
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          python scripts/probe_windows_motion_sampler.py --untraced-only --opencv-version $env:K5_DIAGNOSTIC_OPENCV_VERSION --capture-options $env:K5_DIAGNOSTIC_CAPTURE_OPTIONS --baseline-source-head $env:K5_DESKTOP_HEAD_SHA --output native-motion-sampler.json
-          if ($LASTEXITCODE -ne 0) { throw 'Diagnostic capture matrix infrastructure or cleanup failed' }
-          $evidence = Get-Content -LiteralPath native-motion-sampler.json -Raw | ConvertFrom-Json
-          $workerSha = (Get-FileHash -LiteralPath src/k5vision/operator_motion_process.py -Algorithm SHA256).Hash.ToLowerInvariant()
-          $optionProfiles = @{ 'default'=''; 'tcp'='rtsp_transport;tcp'; 'tcp-nobuffer'='rtsp_transport;tcp|fflags;nobuffer' }
-          $expectedOptions = $optionProfiles[$env:K5_DIAGNOSTIC_CAPTURE_OPTIONS]
-          if ($evidence.schema_version -ne 1 -or $evidence.status -ne 'diagnostic_complete' -or
-              $evidence.diagnostic_only -ne $true -or $evidence.cleanup_complete -ne $true -or
-              $evidence.scope -ne 'original_worker_dependency_transport_matrix' -or
-              $evidence.baseline_source_head -ne $env:K5_DESKTOP_HEAD_SHA -or
-              $evidence.requested_opencv_distribution_version -ne $env:K5_DIAGNOSTIC_OPENCV_VERSION -or
-              $evidence.opencv_distribution_version -ne $env:K5_DIAGNOSTIC_OPENCV_VERSION -or
-              $evidence.capture_options_label -ne $env:K5_DIAGNOSTIC_CAPTURE_OPTIONS -or
-              $evidence.capture_options -ne $expectedOptions -or $evidence.capture_options_applied -ne $expectedOptions -or
-              $evidence.capture_options_child_env_match -ne $true -or
-              $evidence.wheel_record_sha256 -notmatch '^[a-f0-9]{64}$' -or
-              $evidence.runtime_module_sha256 -ne $env:K5_DIAGNOSTIC_ORIGINAL_WORKER_SHA256 -or
-              $evidence.runtime_module_sha256_after -ne $env:K5_DIAGNOSTIC_ORIGINAL_WORKER_SHA256 -or
-              $evidence.runtime_module_unchanged -ne $true -or
-              $workerSha -ne $env:K5_DIAGNOSTIC_ORIGINAL_WORKER_SHA256 -or
-              $evidence.child_entrypoint_unchanged -ne $true -or $evidence.motion_child_launches -lt 1 -or
-              @($evidence.observations | Where-Object { $_.phase -eq 'quiet_live' }).Count -ne 120 -or
-              @($evidence.observations | Where-Object { $_.phase -eq 'source_stopped' }).Count -ne 3 -or
-              @($evidence.observations | Where-Object { $_.phase -in @('candidate_quiet_live', 'traced_quiet_live') }).Count -ne 0) {
-            throw 'Diagnostic dependency/transport matrix scope or original worker identity mismatch'
-          }
-          git diff --exit-code -- src/k5vision/operator_motion_process.py
-          if ($LASTEXITCODE -ne 0) { throw 'Diagnostic matrix changed original product worker source' }
-      - name: Retain only explicitly scoped dependency and transport diagnostic observations
-        if: always()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
-        with:
-          name: diagnostic-only-motion-cv-${{ matrix.opencv }}-${{ matrix.transport }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            native-motion-sampler.json
-            motion-capture-provenance.json
-          if-no-files-found: warn
-          retention-days: 14
-  installed-diagnostic:
-    name: DIAGNOSTIC ONLY - original 333 ${{ matrix.lane }} replay
-    runs-on: windows-2025
-    timeout-minutes: 12
-    permissions:
-      contents: read
-      actions: read
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - lane: service
-            test_file: test_windows_service_recording.py
-            test_minutes: 8
-            faulthandler_seconds: 400
-          - lane: time
-            test_file: test_windows_time_administration.py
-            test_minutes: 6
-            faulthandler_seconds: 90
-    env:
-      K5_DESKTOP_HEAD_SHA: 333685876d8f5dfd65cc4dcafeb2b4a694393283
-      K5_DESKTOP_SETUP_SHA256: 647a2e2231b17efbfd08ff7bced749d42fef889ce17c83df8ee43225f6f9d730
-      K5_NATIVE_SERVICE_ACCEPTANCE: ${{ matrix.lane == 'service' && '1' || '0' }}
-      K5_NATIVE_TIME_ACCEPTANCE: ${{ matrix.lane == 'time' && '1' || '0' }}
-      K5_VM_CLOCK_ACCEPTANCE: ${{ matrix.lane == 'time' && '1' || '0' }}
-      K5_OPERATOR_BROWSER_ACCEPTANCE: "1"
-      K5_OPERATOR_BROWSER_CHANNEL: msedge
-      K5_SERVICE_DIAGNOSTIC_ONLY: "1"
-      K5_TIME_DIAGNOSTIC_ONLY: "1"
-      K5_SERVICE_DIAGNOSTIC_HARNESS_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-      K5_TIME_DIAGNOSTIC_HARNESS_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-      K5_REPLAY_LANE: ${{ matrix.lane }}
-    steps:
-      - name: Checkout original immutable product source and acceptance helpers
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          ref: 333685876d8f5dfd65cc4dcafeb2b4a694393283
-          persist-credentials: false
-      - name: Checkout separately identified diagnostic harness overlays
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-          path: diagnostic-source
-          persist-credentials: false
-      - name: Admit original unqualified candidate producer and immutable artifact
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $headers = @{ Authorization="Bearer $env:GH_TOKEN"; Accept='application/vnd.github+json'; 'X-GitHub-Api-Version'='2022-11-28' }
-          $api = "https://api.github.com/repos/$env:GITHUB_REPOSITORY/actions"
-          $meta = Invoke-RestMethod -Uri "$api/artifacts/14729755647" -Headers $headers
-          $attempt = Invoke-RestMethod -Uri "$api/runs/44960391488/attempts/1" -Headers $headers
-          $jobs = Invoke-RestMethod -Uri "$api/runs/44960391488/attempts/1/jobs?per_page=100" -Headers $headers
-          $producer = @($jobs.jobs | Where-Object { $_.id -eq 137017687325 })
-          if ($meta.id -ne 14729755647 -or $meta.expired -ne $false -or
-              $meta.name -ne "k5-vision-windows-upgrade-candidate-$($env:K5_DESKTOP_HEAD_SHA)-44960391488-attempt-1" -or
-              $meta.digest -ne 'sha256:4aef37994193049a83fac634da9c5e2d919c1d6ff100d43ca76178bbbddf8da5' -or
-              $meta.size_in_bytes -ne 298908451 -or $meta.workflow_run.id -ne 44960391488 -or
-              $meta.workflow_run.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or
-              $attempt.id -ne 44960391488 -or $attempt.run_attempt -ne 1 -or
-              $attempt.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or
-              $producer.Count -ne 1 -or $producer[0].conclusion -ne 'success') {
-            throw 'Original candidate diagnostic producer or artifact identity mismatch'
-          }
-      - name: Download original candidate by exact artifact ID without rebuilding
-        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
-        with:
-          artifact-ids: 14729755647
-          github-token: ${{ github.token }}
-          run-id: 44960391488
-          path: original-candidate-input
-          merge-multiple: true
-      - name: Bind original candidate bytes and exact diagnostic Git blob overlays
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $package = Get-Content -LiteralPath original-candidate-input/desktop-package.json -Raw | ConvertFrom-Json
-          $manifest = Get-Content -LiteralPath original-candidate-input/payload-manifest.json -Raw | ConvertFrom-Json
-          $setup = Get-Item -LiteralPath original-candidate-input/K5VisionSetup.exe
-          $sha = (Get-FileHash -LiteralPath $setup.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-          $harnessHead = (& git -C diagnostic-source rev-parse HEAD).Trim()
-          if ($sha -ne $env:K5_DESKTOP_SETUP_SHA256 -or $package.setup_sha256 -ne $sha -or
-              $package.setup_bytes -ne $setup.Length -or $package.qualification_status -ne 'unqualified' -or
-              $package.run_id -ne 44960391488 -or $package.run_attempt -ne 1 -or
-              $package.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or $manifest.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or
-              $package.payload_manifest_sha256 -ne (Get-FileHash -LiteralPath original-candidate-input/payload-manifest.json -Algorithm SHA256).Hash.ToLowerInvariant() -or
-              $package.launcher_sha256 -notmatch '^[a-f0-9]{64}$' -or
-              $manifest.files.path -notcontains 'K5VisionRecorder.exe' -or $manifest.files.path -notcontains 'K5VisionRecorder.xml' -or
-              $harnessHead -ne $env:K5_SERVICE_DIAGNOSTIC_HARNESS_SHA -or
-              $harnessHead -ne $env:K5_TIME_DIAGNOSTIC_HARNESS_SHA -or $harnessHead -eq $env:K5_DESKTOP_HEAD_SHA) {
-            throw 'Original candidate diagnostic installer or harness identity mismatch'
-          }
-          $overlays = @{
-            'tests/integration/test_windows_service_recording.py'='c4b949f7bb36d757f72e03f873305b6c845984f695ccde56fc24943917044dac'
-            'tests/integration/test_windows_time_administration.py'='7d00b7399911b071ee235af49a2d836d37ac42ea84050e2c37ab4d973c40dee4'
-            'tests/integration/test_windows_desktop_app.py'='5ebdba1924c42997ccec4758c8991a639f189074c7087c99518598e765d42bf6'
-            'tests/integration/windows_process_identity.py'='383f65a8e91280aa7577a0809f41fbf9866533bea7854e2a90c8f5f3ae246a69'
-          }
-          $index = 0
-          foreach ($relative in $overlays.Keys) {
-            if ($relative -notmatch '^tests/integration/[a-z_]+\.py$') { throw 'Invalid diagnostic overlay path' }
-            $admitted = "diagnostic-overlay-$index.py"
-            & (Join-Path $env:SYSTEMROOT 'System32/cmd.exe') /d /c "git -C diagnostic-source cat-file blob HEAD:$relative > $admitted"
-            if ($LASTEXITCODE -ne 0 -or (Get-FileHash -LiteralPath $admitted -Algorithm SHA256).Hash.ToLowerInvariant() -ne $overlays[$relative]) {
-              throw 'Diagnostic Git blob overlay identity mismatch'
-            }
-            Copy-Item -LiteralPath $admitted -Destination $relative -Force
-            $index++
-          }
-          "K5_DESKTOP_SETUP=$($setup.FullName)" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
-          "K5_DESKTOP_LAUNCHER_SHA256=$($package.launcher_sha256)" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
-          "K5_DESKTOP_MANIFEST_SHA256=$($package.payload_manifest_sha256)" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
-          @{ schema_version=1; diagnostic_only=$true; product_qualification=$false; lane=$env:K5_REPLAY_LANE;
-             installer_head=$env:K5_DESKTOP_HEAD_SHA; harness_head=$harnessHead; overlay_sha256=$overlays;
-             source_run_id=44960391488; source_run_attempt=1; artifact_id=14729755647;
-             setup_sha256=$sha; installer_qualification_status='unqualified'; replay_run_id=$env:GITHUB_RUN_ID } |
-            ConvertTo-Json -Depth 4 | Set-Content -LiteralPath candidate-replay-provenance.json -Encoding utf8
-      - name: Prepare only the disposable CI user's browser
-        uses: ./.github/actions/prepare-windows-browser
-      - name: Set up development Python for diagnostic controllers
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
-        with:
-          python-version: "3.12"
-          cache: pip
-      - name: Install original acceptance dependencies before any guest clock changes
-        shell: pwsh
-        run: |
-          python -m pip install -e ".[dev]" "playwright==1.58.0"
-          if ($LASTEXITCODE -ne 0) { throw 'Diagnostic acceptance dependency installation failed' }
-      - name: Provision original pinned generated-media tools
-        uses: ./.github/actions/provision-operator-tools
-      - name: Replay original installed criteria with diagnostic-only properties
-        timeout-minutes: ${{ matrix.test_minutes }}
-        shell: pwsh
-        run: |
-          python -m pytest tests/integration/${{ matrix.test_file }} -o addopts= --no-cov -s --tb=short -o faulthandler_timeout=${{ matrix.faulthandler_seconds }} --junitxml=candidate-replay-diagnostic.xml
-          $testResult = $LASTEXITCODE
-          [xml]$report = Get-Content -LiteralPath candidate-replay-diagnostic.xml -Raw
-          $unscoped = @($report.SelectNodes('//property') | Where-Object { $_.name -notlike 'diagnostic_only_*' })
-          $scopeName = "diagnostic_only_$($env:K5_REPLAY_LANE)_scope"
-          if ($unscoped.Count -ne 0 -or $report.SelectNodes("//property[@name='$scopeName']").Count -ne 1) {
-            throw 'Diagnostic candidate replay emitted an invalid qualification scope'
-          }
-          if ($testResult -ne 0) { throw 'Diagnostic-only candidate replay reproduced a failure' }
-      - name: Retain only diagnostic replay scope and observations without promotion
-        if: always()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
-        with:
-          name: diagnostic-only-${{ matrix.lane }}-replay-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            candidate-replay-diagnostic.xml
-            candidate-replay-provenance.json
+            motion-runtime-clock-provenance.json
           if-no-files-found: warn
           retention-days: 14
   motion-diagnostic:
-    name: DIAGNOSTIC ONLY - replay original 333 motion installer without rebuilding
+    name: DIAGNOSTIC ONLY - replay exact d171 motion clock installer without rebuilding
     runs-on: windows-2025
     timeout-minutes: 12
     permissions:
       contents: read
       actions: read
     env:
-      K5_DESKTOP_HEAD_SHA: 333685876d8f5dfd65cc4dcafeb2b4a694393283
-      K5_DESKTOP_SETUP_SHA256: 647a2e2231b17efbfd08ff7bced749d42fef889ce17c83df8ee43225f6f9d730
+      K5_DESKTOP_HEAD_SHA: d17120f413ff0cf7415c4462b3a50e1e19e65aaa
+      K5_DESKTOP_SETUP_SHA256: 1d97d0161c103ec57e25d346d7d37b93e1c5f58f04a1befde244edaca5a7bdb2
       K5_OPERATOR_BROWSER_ACCEPTANCE: "1"
       K5_OPERATOR_BROWSER_CHANNEL: msedge
       K5_NATIVE_MOTION_ACCEPTANCE: "1"
@@ -456,7 +117,7 @@ jobs:
       - name: Checkout original immutable installer runtime and acceptance helpers
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: 333685876d8f5dfd65cc4dcafeb2b4a694393283
+          ref: d17120f413ff0cf7415c4462b3a50e1e19e65aaa
           persist-credentials: false
       - name: Checkout the separate diagnostic harness without replacing product source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -472,26 +133,26 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $headers = @{ Authorization="Bearer $env:GH_TOKEN"; Accept='application/vnd.github+json'; 'X-GitHub-Api-Version'='2022-11-28' }
           $api = "https://api.github.com/repos/$env:GITHUB_REPOSITORY/actions"
-          $meta = Invoke-RestMethod -Uri "$api/artifacts/14729726222" -Headers $headers
-          $attempt = Invoke-RestMethod -Uri "$api/runs/44960391488/attempts/1" -Headers $headers
-          $jobs = Invoke-RestMethod -Uri "$api/runs/44960391488/attempts/1/jobs?per_page=100" -Headers $headers
-          $producer = @($jobs.jobs | Where-Object { $_.id -eq 137017687325 })
-          if ($meta.id -ne 14729726222 -or $meta.expired -ne $false -or
-              $meta.name -ne "k5-vision-windows-setup-$env:K5_DESKTOP_HEAD_SHA" -or
-              $meta.digest -ne 'sha256:75cef53e0aa8aa25df83d1d2403d4b77e6c97a400ea4123b62b3f1eb78fda349' -or
-              $meta.size_in_bytes -ne 298920547 -or $meta.workflow_run.id -ne 44960391488 -or
+          $meta = Invoke-RestMethod -Uri "$api/artifacts/14733111153" -Headers $headers
+          $attempt = Invoke-RestMethod -Uri "$api/runs/44969219929/attempts/1" -Headers $headers
+          $jobs = Invoke-RestMethod -Uri "$api/runs/44969219929/attempts/1/jobs?per_page=100" -Headers $headers
+          $producer = @($jobs.jobs | Where-Object { $_.id -eq 137045084135 })
+          if ($meta.id -ne 14733111153 -or $meta.expired -ne $false -or
+              $meta.name -ne "k5-vision-windows-upgrade-candidate-$($env:K5_DESKTOP_HEAD_SHA)-44969219929-attempt-1" -or
+              $meta.digest -ne 'sha256:4ff14a67edc47d784cb71646a742ca5cd3c0dac3b59925cfc5a3f9f93dd6fa82' -or
+              $meta.size_in_bytes -ne 298908902 -or $meta.workflow_run.id -ne 44969219929 -or
               $meta.workflow_run.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or
-              $attempt.id -ne 44960391488 -or $attempt.run_attempt -ne 1 -or
+              $attempt.id -ne 44969219929 -or $attempt.run_attempt -ne 1 -or
               $attempt.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or
               $producer.Count -ne 1 -or $producer[0].conclusion -ne 'success') {
             throw 'Original motion replay producer or artifact identity mismatch'
           }
-      - name: Download original qualified primary installer by exact artifact ID
+      - name: Download exact original d171 candidate installer by exact artifact ID
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:
-          artifact-ids: 14729726222
+          artifact-ids: 14733111153
           github-token: ${{ github.token }}
-          run-id: 44960391488
+          run-id: 44969219929
           path: motion-replay-input
           merge-multiple: true
       - name: Bind original bytes and overlay only the diagnostic motion test
@@ -514,9 +175,11 @@ jobs:
               $package.setup_bytes -ne $setup.Length -or
               $package.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or $manifest.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or
               $package.payload_manifest_sha256 -ne (Get-FileHash -LiteralPath motion-replay-input/payload-manifest.json -Algorithm SHA256).Hash.ToLowerInvariant() -or
-              $package.motion_recording -ne $true -or $package.camera_trigger_zones -ne $true -or
-              $package.no_terminal_required -ne $true -or $package.workers_bundled -ne $true -or
-              $overlaySha -ne 'cb77f657cee15edf4a8b6007fb8101ea5b32a42ce7fecb324a56536e91706fdc' -or
+              $package.qualification_status -ne 'unqualified' -or $package.run_id -ne 44969219929 -or $package.run_attempt -ne 1 -or
+              $package.payload_manifest_sha256 -ne 'd3d90edde5b69ba52a124ec34d176ef4fc0efe5e79e48f530a716451b52bdb8c' -or
+              $package.launcher_sha256 -ne '7f0a48885feb936dffb14fe59d3f4efff1217e32dde98ab4068ab50241253317' -or
+              $manifest.files.path -notcontains 'K5VisionRecorder.exe' -or $manifest.files.path -notcontains 'K5VisionRecorder.xml' -or
+              $overlaySha -ne 'df6ea09b506c018fd0cc95933d54a54b1b10d2f55d7247a8c15eb4921d66438a' -or
               $env:K5_MOTION_DIAGNOSTIC_HARNESS_SHA -eq $env:K5_DESKTOP_HEAD_SHA) {
             throw 'Diagnostic motion replay source or installer byte identity mismatch'
           }
@@ -524,7 +187,7 @@ jobs:
           "K5_DESKTOP_SETUP=$($setup.FullName)" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
           @{ schema_version=1; diagnostic_only=$true; product_qualification=$false;
              installer_head=$env:K5_DESKTOP_HEAD_SHA; harness_head=$env:K5_MOTION_DIAGNOSTIC_HARNESS_SHA;
-             source_run_id=44960391488; source_run_attempt=1; artifact_id=14729726222;
+             source_run_id=44969219929; source_run_attempt=1; artifact_id=14733111153;
              setup_sha256=$sha; overlay_sha256=$overlaySha; replay_run_id=$env:GITHUB_RUN_ID } |
             ConvertTo-Json | Set-Content -LiteralPath motion-replay-provenance.json -Encoding utf8
       - name: Prepare only the disposable CI user's default browser
@@ -561,260 +224,5 @@ jobs:
           path: |
             motion-replay-diagnostic.xml
             motion-replay-provenance.json
-          if-no-files-found: warn
-          retention-days: 14
-  worker-images:
-    name: Observe actual owned worker image identities without installing K5
-    runs-on: windows-2025
-    timeout-minutes: 5
-    steps:
-      - name: Checkout exact diagnostic and production relay
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-          persist-credentials: false
-      - name: Checkout exact native identity implementation from the failed candidate
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          ref: ec5e898aa7c43b309bf937ca2471f2ed847fbef6
-          path: identity-source
-          persist-credentials: false
-      - name: Set up native development Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
-        with:
-          python-version: "3.12"
-      - name: Provision immutable native donor workers for the synthetic probe
-        uses: ./.github/actions/provision-operator-tools
-      - name: Observe actual production relay and native worker images
-        shell: pwsh
-        env:
-          PYTHONPATH: ${{ github.workspace }}/src
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $identityModule = (Resolve-Path -LiteralPath identity-source/tests/integration/windows_process_identity.py).Path
-          python scripts/probe_windows_native_worker_images.py --identity-module $identityModule
-          if ($LASTEXITCODE -ne 0) { throw 'Synthetic native worker observation failed' }
-          $evidence = Get-Content -LiteralPath native-worker-images.json -Raw | ConvertFrom-Json
-          if ($evidence.schema_version -ne 1 -or $evidence.status -ne 'diagnostic_complete') {
-            throw 'Synthetic native worker observation did not complete'
-          }
-      - name: Retain only synthetic worker image observations
-        if: always()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
-        with:
-          name: native-worker-images-${{ github.run_id }}
-          path: native-worker-images.json
-          if-no-files-found: warn
-          retention-days: 14
-  browser:
-    name: Observe actual Windows default-browser dispatch independently
-    runs-on: windows-2025
-    timeout-minutes: 5
-    steps:
-      - name: Checkout exact candidate browser client and native observation
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-          persist-credentials: false
-      - name: Complete the disposable CI user's browser prerequisite
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted' -or $env:RUNNER_OS -ne 'Windows') {
-            throw 'Browser preparation requires a disposable hosted Windows VM'
-          }
-          # Test-runner user only, never an installer or product operation.
-          # Official policy: https://learn.microsoft.com/deployedge/microsoft-edge-browser-policies/hidefirstrunexperience
-          $edgePolicy = 'HKCU:\Software\Policies\Microsoft\Edge'
-          New-Item -Path $edgePolicy -Force | Out-Null
-          New-ItemProperty -Path $edgePolicy -Name HideFirstRunExperience -PropertyType DWord -Value 1 -Force | Out-Null
-          if ((Get-ItemPropertyValue -Path $edgePolicy -Name HideFirstRunExperience) -ne 1) {
-            throw 'Disposable browser prerequisite could not be verified'
-          }
-          Write-Host 'Prepared the disposable CI user for native default-browser acceptance'
-      - name: Compile and run actual client browser dispatch against owned local HTML
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $compilerRoot = Join-Path $env:WINDIR 'Microsoft.NET/Framework64/v4.0.30319'
-          $compiler = Join-Path $compilerRoot 'csc.exe'
-          New-Item -ItemType Directory -Path browser-proof | Out-Null
-          @'
-          namespace K5VisionDesktop {
-            internal static class PayloadIdentity {
-              internal const string ManifestSha256 = "0000000000000000000000000000000000000000000000000000000000000000";
-              internal const string HeadSha = "0000000000000000000000000000000000000000";
-            }
-          }
-          '@ | Set-Content -LiteralPath browser-proof/PayloadIdentity.cs -Encoding utf8
-          $identity = (Resolve-Path -LiteralPath browser-proof/PayloadIdentity.cs).Path
-          $fixture = (Resolve-Path -LiteralPath scripts/probe_windows_browser_launch.cs).Path
-          $sources = @('K5Vision.cs', 'K5RecorderHost.cs', 'K5ServiceInstallation.cs', 'K5VisionClient.cs') |
-            ForEach-Object { (Resolve-Path -LiteralPath (Join-Path 'windows/desktop' $_)).Path }
-          $references = @('System.dll', 'System.Core.dll', 'System.Drawing.dll', 'System.Windows.Forms.dll',
-            'System.Web.Extensions.dll', 'System.IO.Compression.dll', 'System.IO.Compression.FileSystem.dll')
-          $referenceFlags = @($references | ForEach-Object { '/reference:' + $_ })
-          $referenceFlags += '/reference:' + (Join-Path $compilerRoot 'WPF/UIAutomationClient.dll')
-          $referenceFlags += '/reference:' + (Join-Path $compilerRoot 'WPF/UIAutomationTypes.dll')
-          $referenceFlags += '/reference:' + (Join-Path $compilerRoot 'WPF/WindowsBase.dll')
-          $output = Join-Path (Resolve-Path -LiteralPath browser-proof).Path 'BrowserLaunchProbe.exe'
-          & $compiler /nologo /target:exe /main:K5VisionDesktop.BrowserLaunchProbe /platform:x64 /optimize+ /warn:4 /warnaserror+ /codepage:65001 @referenceFlags "/out:$output" @sources $identity $fixture
-          if ($LASTEXITCODE -ne 0) { throw 'Actual client browser observation compilation failed' }
-          # Only QA Main executes. It invokes the real OpenDashboard against
-          # its own static HTML listener; no product Main, profile or service.
-          # Match the installed-client acceptance's deliberately minimal env.
-          $env:PATH = (Join-Path $env:SYSTEMROOT 'System32') + ';' + $env:SYSTEMROOT
-          $env:PYTHONHOME = Join-Path (Resolve-Path -LiteralPath browser-proof).Path 'no external Python'
-          $env:PYTHONPATH = Join-Path (Resolve-Path -LiteralPath browser-proof).Path 'no external modules'
-          & $output | Tee-Object -FilePath browser-dispatch-native.json
-          if ($LASTEXITCODE -ne 0) { throw 'Native browser observation did not complete' }
-          $browserEvidence = Get-Content -LiteralPath browser-dispatch-native.json -Raw | ConvertFrom-Json
-          if ($browserEvidence.schema_version -ne 1 -or $browserEvidence.status -ne 'diagnostic_complete') {
-            throw 'Native browser observation did not produce a completed receipt'
-          }
-          foreach ($field in @('actual_product_dispatch', 'origin_request_observed', 'origin_response_sent', 'browser_window_visible', 'browser_title_matches')) {
-            if ($browserEvidence.$field -isnot [bool] -or $browserEvidence.$field -ne $true) {
-              throw "Prepared default-browser acceptance failed: $field"
-            }
-          }
-          Remove-Item -LiteralPath browser-proof -Recurse -Force
-      - name: Retain synthetic browser-window evidence without claiming product qualification
-        if: always()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
-        with:
-          name: browser-dispatch-${{ github.run_id }}
-          # This probe uses only owned static HTML on a fresh VM, never an
-          # installed product, camera, credential or existing browser session.
-          path: |
-            browser-dispatch-native.json
-            browser-dispatch-*.png
-          if-no-files-found: warn
-          retention-days: 14
-  wire:
-    name: Reproduce and fix the actual Framework async pipe lifecycle
-    runs-on: windows-2025
-    timeout-minutes: 5
-    steps:
-      - name: Checkout exact candidate wire and native regression
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-          persist-credentials: false
-      - name: Checkout immutable source that reproduced the readiness failure
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          ref: d9f6a49099760485fb4b968cca309715cecf7885
-          path: wire-baseline
-          persist-credentials: false
-          sparse-checkout: windows/desktop
-      - name: Checkout immutable source with the unread-response disconnect race
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          ref: 6556833488ea51f246254185cd988f5873da35a1
-          path: wire-delivery-baseline
-          persist-credentials: false
-          sparse-checkout: windows/desktop
-      - name: Compile and run the real production wire against native asynchronous pipes
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $PSNativeCommandUseErrorActionPreference = $false
-          $compiler = Join-Path $env:WINDIR 'Microsoft.NET/Framework64/v4.0.30319/csc.exe'
-          $fixture = (Resolve-Path -LiteralPath scripts/probe_windows_recorder_wire.cs).Path
-          New-Item -ItemType Directory -Path wire-proof | Out-Null
-          @'
-          namespace K5VisionDesktop {
-            internal static class PayloadIdentity {
-              internal const string ManifestSha256 = "0000000000000000000000000000000000000000000000000000000000000000";
-              internal const string HeadSha = "0000000000000000000000000000000000000000";
-            }
-          }
-          '@ | Set-Content -LiteralPath wire-proof/PayloadIdentity.cs -Encoding utf8
-          $identity = (Resolve-Path -LiteralPath wire-proof/PayloadIdentity.cs).Path
-          $references = @('System.dll', 'System.Core.dll', 'System.Drawing.dll', 'System.Windows.Forms.dll',
-            'System.Web.Extensions.dll', 'System.IO.Compression.dll', 'System.IO.Compression.FileSystem.dll')
-          $referenceFlags = @($references | ForEach-Object { '/reference:' + $_ })
-          foreach ($variant in @('baseline', 'delivery-baseline', 'fixed')) {
-            $sourceRoot = if ($variant -eq 'baseline') { 'wire-baseline/windows/desktop' }
-              elseif ($variant -eq 'delivery-baseline') { 'wire-delivery-baseline/windows/desktop' }
-              else { 'windows/desktop' }
-            $sources = @('K5Vision.cs', 'K5RecorderHost.cs', 'K5ServiceInstallation.cs', 'K5VisionClient.cs') |
-              ForEach-Object { (Resolve-Path -LiteralPath (Join-Path $sourceRoot $_)).Path }
-            $output = Join-Path (Resolve-Path -LiteralPath wire-proof).Path ($variant + '.exe')
-            & $compiler /nologo /target:exe /main:K5VisionDesktop.RecorderWireProbe /platform:x64 /optimize+ /warn:4 /warnaserror+ /codepage:65001 @referenceFlags "/out:$output" @sources $identity $fixture
-            if ($LASTEXITCODE -ne 0) { throw 'Actual native wire fixture compilation failed' }
-            # Only the fixture's Main executes: private generated pipes, no
-            # product entry point, service, profile, account or clock operation.
-            & $output ('--' + $variant) | Tee-Object -FilePath ('recorder-wire-' + $variant + '.json')
-            $observed = $LASTEXITCODE
-            $expected = if ($variant -eq 'baseline') { 10 } elseif ($variant -eq 'delivery-baseline') { 11 } else { 0 }
-            if ($observed -ne $expected) { throw "Native wire $variant did not establish its required result" }
-          }
-          Remove-Item -LiteralPath wire-proof -Recurse -Force
-      - name: Retain finite native wire red and green observations
-        if: always()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
-        with:
-          name: recorder-wire-${{ github.run_id }}
-          path: |
-            recorder-wire-baseline.json
-            recorder-wire-delivery-baseline.json
-            recorder-wire-fixed.json
-          if-no-files-found: warn
-          retention-days: 14
-  compile:
-    name: Compile native recorder and client without building an installer
-    runs-on: windows-2025
-    timeout-minutes: 5
-    steps:
-      - name: Checkout exact source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-          persist-credentials: false
-      - name: Set up development Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
-        with:
-          python-version: "3.12"
-      - name: Compile all native entry points with warnings as errors
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Path compile-only/payload -Force | Out-Null
-          @'
-          namespace K5VisionDesktop {
-            internal static class PayloadIdentity {
-              internal const string ManifestSha256 = "0000000000000000000000000000000000000000000000000000000000000000";
-              internal const string HeadSha = "0000000000000000000000000000000000000000";
-            }
-          }
-          '@ | Set-Content -LiteralPath compile-only/PayloadIdentity.generated.cs -Encoding utf8
-          python scripts/compile_desktop_launcher.py --build compile-only
-          if ($LASTEXITCODE -ne 0) { throw "Native recorder source compilation failed" }
-          $compiler = Join-Path $env:WINDIR 'Microsoft.NET/Framework64/v4.0.30319/csc.exe'
-          $probeSource = (Resolve-Path -LiteralPath tests/integration/windows_standard_user_probe.cs).Path
-          $probeOutput = Join-Path (Resolve-Path -LiteralPath compile-only).Path 'OrdinaryUserProbe.exe'
-          & $compiler /nologo /target:winexe /platform:x64 /optimize+ /warn:4 /warnaserror+ /codepage:65001 /reference:System.dll /reference:System.Core.dll /reference:System.Web.Extensions.dll "/out:$probeOutput" $probeSource
-          if ($LASTEXITCODE -ne 0) { throw "Ordinary Windows account probe compilation failed" }
-          $admissionSource = (Resolve-Path -LiteralPath scripts/probe_windows_machine_admission.cs).Path
-          $admissionOutput = Join-Path (Resolve-Path -LiteralPath compile-only).Path 'MachineAdmissionProbe.exe'
-          & $compiler /nologo /target:exe /platform:x64 /warn:4 /warnaserror+ /reference:System.dll /reference:System.Core.dll /reference:System.Web.Extensions.dll "/out:$admissionOutput" $admissionSource
-          if ($LASTEXITCODE -ne 0) { throw "Read-only admission probe compilation failed" }
-          $launcher = (Resolve-Path -LiteralPath compile-only/payload/K5Vision.exe).Path
-          & $admissionOutput $launcher | Tee-Object -FilePath machine-admission-native.json
-          if ($LASTEXITCODE -ne 0) { throw "Read-only native admission observation failed" }
-          python scripts/probe_windows_machine_admission.py | Tee-Object -FilePath machine-admission-python.json
-          if ($LASTEXITCODE -ne 0) { throw "Read-only Python admission observation failed" }
-          # The probe invokes only the actual guard's read-only admission method.
-          # Never launch or distribute this placeholder product executable, or
-          # treat a completed diagnostic as installed-service qualification.
-          Remove-Item -LiteralPath compile-only -Recurse -Force
-      - name: Retain finite machine-admission observations
-        if: always()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
-        with:
-          name: machine-admission-${{ github.run_id }}
-          path: |
-            machine-admission-native.json
-            machine-admission-python.json
           if-no-files-found: warn
           retention-days: 14

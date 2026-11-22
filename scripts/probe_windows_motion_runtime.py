@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import importlib.util
 import json
 import os
@@ -13,6 +14,7 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
+from urllib.request import ProxyHandler, Request, build_opener
 
 
 def _load(name):
@@ -112,7 +114,11 @@ def _instrument(product, receipt, phase, began):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--clock-steps", action="store_true")
+    parser.add_argument("--baseline-source-head")
     args = parser.parse_args()
+    if args.clock_steps and not args.baseline_source_head:
+        parser.error("Clock diagnostics require the exact baseline source head")
     from k5vision import identity_state
     from k5vision import operator_product_service as product_module
     from k5vision.operator_native_process import OwnedNativeProcess
@@ -135,6 +141,9 @@ def main():
         "motion_child_launches": 0,
         "motion_child_argv_unchanged": True,
         "configuration_writes": [],
+        "baseline_source_head": args.baseline_source_head,
+        "source_progress": [],
+        "clock_steps": [],
     }
     product = upstream = publisher = None
     original_popen = subprocess.Popen
@@ -256,6 +265,37 @@ def main():
             saved = client.json(route, method="PUT", data={**policy, "expected_revision": 0})
             receipt["saved_policy"] = {key: saved[key] for key in ("mode", "revision", "status")}
 
+            def source_snapshot():
+                service = product.service
+                token = base64.b64encode(
+                    f"{service.credentials.username}:{service.credentials.password}".encode()
+                ).decode()
+                path = service._sources[0].binding.path_name
+                request = Request(
+                    f"http://127.0.0.1:{service.ports['api_port']}/v3/paths/get/{path}",
+                    headers={"Authorization": "Basic " + token},
+                )
+                note = {
+                    "phase": phase["name"],
+                    "elapsed_seconds": round(time.monotonic() - began, 4),
+                    "publisher_frames_written": publisher.frames_written,
+                    "publisher_process_alive": publisher.process.poll() is None,
+                    "publisher_writer_alive": publisher._writer.is_alive(),
+                    "publisher_writer_failed": publisher._failure,
+                }
+                try:
+                    with build_opener(ProxyHandler({})).open(request, timeout=1) as response:
+                        value = json.loads(response.read(65536))
+                    note.update(
+                        source_ready=value.get("ready") is True,
+                        inbound_bytes=value.get("inboundBytes", value.get("bytesReceived")),
+                        outbound_bytes=value.get("outboundBytes", value.get("bytesSent")),
+                    )
+                except (OSError, ValueError) as error:
+                    note["failure_kind"] = type(error).__name__
+                receipt["source_progress"].append(note)
+                return note
+
             def poll(name, seconds):
                 phase["name"] = name
                 until, index = time.monotonic() + seconds, 0
@@ -272,6 +312,7 @@ def main():
                         }
                     )
                     if index % 5 == 0:
+                        source_snapshot()
                         cameras = client.json("/api/v1/operator/cameras")
                         receipt["camera_observations"].append(
                             {
@@ -298,6 +339,27 @@ def main():
             _instrument(product, receipt, phase, began)
             native._login(client, username, password)
             poll("restart_idle", 20)
+            if args.clock_steps:
+                guard = _load("windows_vm_clock").WindowsVmClockGuard(
+                    root / "runtime-clock-guard.json", watchdog_seconds=90
+                )
+                try:
+                    with guard:
+                        for offset, label in ((172800, "forward"), (-172800, "backward")):
+                            phase["name"] = "clock_" + label + "_before"
+                            note = {"offset_seconds": offset, "before": source_snapshot()}
+                            receipt["clock_steps"].append(note)
+                            note["shift"] = guard.shift(offset)
+                            poll("clock_" + label + "_shifted", 8)
+                            note["after_shift"] = source_snapshot()
+                            note["restoration"] = guard.restore()
+                            poll("clock_" + label + "_restored", 5)
+                            note["after_restore"] = source_snapshot()
+                finally:
+                    try:
+                        receipt["clock_guard"] = guard.receipt()
+                    except BaseException as error:
+                        receipt["clock_guard_failure_kind"] = type(error).__name__
             phase["name"] = "source_stopped"
             publisher.close()
             poll("source_stopped", 5)
@@ -305,6 +367,9 @@ def main():
         except BaseException as error:
             receipt["failure_kind"] = type(error).__name__
             receipt["failure_phase"] = phase["name"]
+            if "client" in locals():
+                receipt["failure_http_status"] = client.last_http_status
+                receipt["transport_failure"] = client.transport_failure
         finally:
             cleanup = True
             for action in (
