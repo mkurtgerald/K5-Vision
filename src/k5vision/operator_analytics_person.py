@@ -17,7 +17,6 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from importlib import metadata
 from pathlib import Path
-from platform import system
 
 from k5vision.analytics_config import _local_path, _unique_object
 from k5vision.analytics_runtime import OwnedAnalyticsProvider, _AnalyticsSession, _protected_future
@@ -174,7 +173,7 @@ def _cap_windows_native_cpu_isa() -> None:
     bounds before the first native import/CPU inference in this process.
     This changes the kernel selection, never the inference assertions.
     """
-    if system() == "Windows":
+    if os.name == "nt":
         os.environ["ONEDNN_MAX_CPU_ISA"] = "AVX2"
         os.environ["OV_CPU_MAX_ISA"] = "AVX2"
 

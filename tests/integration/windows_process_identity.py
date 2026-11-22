@@ -388,6 +388,82 @@ def image_diagnostic(image, images, *, same_file=None):
     return result
 
 
+def _cmd_ver_arguments(arguments, system_directory):
+    """Classify only CPython's fixed version query; never return argv text."""
+    if type(arguments) is not list or len(arguments) != 3:
+        return False
+    if any(type(value) is not str or len(value) > 32768 for value in arguments):
+        return False
+    _form, executable = _local_image_path(arguments[0])
+    return (
+        executable == PureWindowsPath(system_directory) / "cmd.exe"
+        and arguments[1].casefold() == "/c"
+        and arguments[2].casefold() in {"ver", '"ver"'}
+    )
+
+
+def _cmd_ver_diagnostic(details, service_sid, *, native=None, command_line=None):
+    """Failure-only observation, bound to one live native object on both sides."""
+    result = {"status": "unavailable", "admission_changed": False}
+    handle = None
+    native = NativeProcessTree() if native is None else native
+    try:
+        identity = details["pid"], details["created_100ns"]
+        handle = native.api.OpenProcess(0x00101000, False, identity[0])
+        if not handle:
+            raise OSError("Diagnostic query handle unavailable")
+        expected = PureWindowsPath(native.system_directory()) / "cmd.exe"
+
+        def verify():
+            if (
+                native._handle_creation(handle) != identity[1]
+                or native._live_parent_birth(handle) != identity[1]
+            ):
+                raise ProcessLookupError("Diagnostic original process unavailable")
+            current = native.details(identity)
+            if (
+                current["sid"] != service_sid
+                or current["session"] != 0
+                or current["parent_pid"] != details["parent_pid"]
+                or not _same_local_file(current["image"], str(expected))
+            ):
+                raise ValueError("Diagnostic native authority changed")
+
+        verify()
+        if command_line is None:
+            import psutil
+
+            def command_line(pid):
+                return psutil.Process(pid).cmdline()
+
+        arguments = command_line(identity[0])
+        matches = _cmd_ver_arguments(arguments, native.system_directory())
+        del arguments
+        verify()
+        result.update(
+            status="observed",
+            argv_class="cmd_ver" if matches else "other",
+            original_native_process_bound=True,
+            service_token_and_session_verified=True,
+        )
+    except Exception as error:
+        kind = type(error).__name__
+        result["error_kind"] = (
+            kind
+            if kind
+            in {"OSError", "PermissionError", "ProcessLookupError", "ValueError", "RuntimeError"}
+            else "other"
+        )
+    finally:
+        if handle and not native.api.CloseHandle(handle):
+            result = {
+                "status": "unavailable",
+                "admission_changed": False,
+                "error_kind": "close_failed",
+            }
+    return result
+
+
 def service_candidate(details, service_sid, images, *, root=False, diagnose_image=None):
     """Parent PID topology nominates candidates; token/image/session admit them."""
     kind = images.get(str(PureWindowsPath(details["image"])).casefold(), "outside_payload")
@@ -412,6 +488,24 @@ def service_candidate(details, service_sid, images, *, root=False, diagnose_imag
                 result["image_diagnostic"] = diagnose_image(details["image"], images)
             except (OSError, ValueError, TypeError, RuntimeError):
                 result["image_diagnostic"] = {"comparison_status": "unavailable"}
+            image_note = result["image_diagnostic"]
+            fixed = image_note.get("fixed_known_file", {}) if type(image_note) is dict else {}
+            fixed = fixed if type(fixed) is dict else {}
+            if (
+                type(image_note) is dict
+                and image_note.get("basename_category") == "cmd"
+                and fixed.get("status") == "observed"
+                and fixed.get("scope") == "fixed_system32"
+                and fixed.get("same_file") is True
+                and fixed.get("trusted_code_custody_verified") is True
+            ):
+                try:
+                    image_note["command_observation"] = _cmd_ver_diagnostic(details, service_sid)
+                except Exception:
+                    image_note["command_observation"] = {
+                        "status": "unavailable",
+                        "admission_changed": False,
+                    }
         raise OwnershipFailure(result)
     if details["session"] != 0:
         result["outcome"] = "unexpected_service_session"

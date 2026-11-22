@@ -819,12 +819,13 @@ def test_native_windows_legacy_service_migration_and_manual_reversal(record_test
         )
         page = context.new_page()
         page.set_default_timeout(25_000)
-        settings._mfa_login(
+        signed_in = settings._mfa_login(
             page,
             client.origin,
             {"username": username, "password": password, "id": administrator_id},
             recovery[4],
         )
+        client.token = signed_in["session_token"]
         browser_helpers._open_camera_recordings(page, camera_id)
         playback = _retained_timeline_play(browser_helpers, page, camera_id)
         export_path = parent / "migrated actual export.mp4"
@@ -858,7 +859,9 @@ def test_native_windows_legacy_service_migration_and_manual_reversal(record_test
         assert app.wait(timeout=40) == 0
         app = None
         d._wait(
-            lambda: d._tray_recording(client, machine_profile, camera_id, previous_bytes, {}),
+            lambda: d._tray_recording(
+                client, machine_profile, camera_id, previous_bytes, diagnostic
+            ),
             "Service recordings grow after all clients close",
             timeout=30,
         )

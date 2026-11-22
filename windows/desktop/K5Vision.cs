@@ -540,7 +540,7 @@ namespace K5VisionDesktop
                     // Pin every directory from the fixed volume downwards.
                     // No FILE_SHARE_DELETE: a later reparse/rename cannot redirect
                     // elevated response creation to a different directory.
-                    SafeFileHandle handle = CreateFile(ancestor, 0, 3, IntPtr.Zero,
+                    SafeFileHandle handle = CreateFile(ancestor, 1, 3, IntPtr.Zero,
                         3, 0x02000000u | 0x00200000u, IntPtr.Zero);
                     FileIdentity identity;
                     if (handle.IsInvalid || !GetFileInformationByHandle(handle, out identity) ||
