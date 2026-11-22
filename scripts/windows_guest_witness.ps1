@@ -8,6 +8,25 @@ $root = 'C:\K5GuestWitness'
 $config = Get-Content -LiteralPath (Join-Path $root 'public-config.json') -Raw | ConvertFrom-Json
 if ($config.schema_version -ne 1 -or [guid]::Parse($config.transfer_id).ToString() -cne $config.transfer_id) { exit 2 }
 $transfer = [string]$config.transfer_id
+function Write-DurableNewFile([string]$Path,[string]$Text) {
+    $bytes=[Text.UTF8Encoding]::new($false).GetBytes($Text)
+    $stream=[IO.FileStream]::new($Path,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None,4096,[IO.FileOptions]::WriteThrough)
+    try{$stream.Write($bytes,0,$bytes.Length);$stream.Flush($true)}finally{$stream.Dispose()}
+}
+function Flush-DurableExistingFile([string]$Path) {
+    $stream=[IO.FileStream]::new($Path,[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]::Read,4096,[IO.FileOptions]::WriteThrough)
+    try{$stream.Flush($true)}finally{$stream.Dispose()}
+}
+function Write-EntryDiagnostic([string]$Name,[hashtable]$Value) {
+    if($Name -cnotmatch '^(?:observer-(?:entry|stage|preflight-failure)-(?:bootstrap|reboot|signout)|setup-preflight-failure)\.json$'){throw 'Diagnostic name refused'}
+    $path=Join-Path $root $Name;$temporary=Join-Path $root ([guid]::NewGuid().ToString('N')+'.tmp')
+    Write-DurableNewFile $temporary ($Value|ConvertTo-Json -Depth 6 -Compress)
+    if([IO.File]::Exists($path)){
+        if(([IO.File]::GetAttributes($path) -band [IO.FileAttributes]::ReparsePoint) -ne 0){throw 'Diagnostic target refused'}
+        [IO.File]::Replace($temporary,$path,[NullString]::Value)
+    }else{[IO.File]::Move($temporary,$path)}
+    Flush-DurableExistingFile $path
+}
 $systemSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 $guestWitnessSession=[Diagnostics.Process]::GetCurrentProcess().SessionId
 $guestWitnessAdmitted=($systemSid -ceq 'S-1-5-18' -and (($Mode -eq 'Setup' -and $guestWitnessSession -in @(0,1)) -or ($Mode -eq 'Observe' -and $guestWitnessSession -eq 0)))
@@ -17,8 +36,12 @@ if($Mode -eq 'Setup'){
     $entry=@{schema_version=1;phase='setup_entry';stage='setup_admission';status='context_captured';configuration_valid=$true;system_account_verified=($systemSid -ceq 'S-1-5-18');observer_session=$guestWitnessSession;setup_session_admitted=$guestWitnessAdmitted}
     [IO.File]::WriteAllText((Join-Path $root 'setup-entry.json'),($entry|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))
 }
+if($Mode -eq 'Observe' -and [string]$config.phase -in @('bootstrap','reboot','signout')){
+    Write-EntryDiagnostic ('observer-entry-'+$config.phase+'.json') @{schema_version=1;phase=[string]$config.phase;status='observer_entered';stage='observer_admission';system_account_verified=($systemSid -ceq 'S-1-5-18');observer_session=$guestWitnessSession;observer_session_admitted=$guestWitnessAdmitted}
+}
 if (-not $guestWitnessAdmitted) { exit 2 }
 
+try{
 Add-Type -TypeDefinition @'
 using System;
 using System.Collections.Generic;
@@ -65,13 +88,19 @@ public static class K5GuestNative {
   public static void Logoff(int id){if(id<=0 || !WTSLogoffSession(IntPtr.Zero,id,false))throw new Win32Exception();}
 }
 '@
+}catch{
+    $name=if($Mode -eq 'Setup'){'setup-preflight-failure.json'}else{'observer-preflight-failure-'+$config.phase+'.json'}
+    Write-EntryDiagnostic $name @{schema_version=1;phase=[string]$config.phase;stage='native_compile';status='preflight_failed';error_kind=$_.Exception.GetType().Name;hresult=$_.Exception.HResult;observer_session=$guestWitnessSession}
+    exit 1
+}
 
 function Write-PrivateJson([string]$Name, $Value) {
     $path = Join-Path $root $Name
     if (Test-Path -LiteralPath $path) { throw 'Witness receipt already exists' }
     $temporary = Join-Path $root ([guid]::NewGuid().ToString('N') + '.tmp')
-    [IO.File]::WriteAllText($temporary, ($Value | ConvertTo-Json -Depth 12 -Compress), [Text.UTF8Encoding]::new($false))
+    Write-DurableNewFile $temporary ($Value | ConvertTo-Json -Depth 12 -Compress)
     [IO.File]::Move($temporary, $path)
+    Flush-DurableExistingFile $path
     return (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 function Publish-Seal([string]$Phase, [string]$Boot, [string]$Hash) {
@@ -84,6 +113,8 @@ function Disable-TemporaryAutoLogon {
     Set-ItemProperty -Path $key -Name AutoAdminLogon -Value '0'
     Set-ItemProperty -Path $key -Name AutoLogonCount -Value 0 -Type DWord
     Remove-ItemProperty -Path $key -Name DefaultPassword -ErrorAction SilentlyContinue
+    $winlogon=[Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon',$true)
+    try{if($null -eq $winlogon){throw 'Temporary autologon key unavailable'};$winlogon.Flush()}finally{if($null -ne $winlogon){$winlogon.Dispose()}}
     foreach ($path in @('C:\Windows\Panther\Unattend.xml','C:\Windows\Panther\Unattend\Unattend.xml','C:\K5GuestWitness\Unattend.xml')) {
         if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force }
     }
@@ -232,6 +263,8 @@ if ($Mode -eq 'Setup') {
         if ($adapter.Count -ne 1) { throw 'Owned guest adapter unavailable' }
         New-NetIPAddress -InterfaceIndex $adapter[0].ifIndex -IPAddress $config.guest_ip -PrefixLength 30 -AddressFamily IPv4 | Out-Null
         $setupStage='register_observer'
+        # Task history is diagnostic-only; no output or credential is exported.
+        try{& (Join-Path $env:SystemRoot 'System32\wevtutil.exe') sl 'Microsoft-Windows-TaskScheduler/Operational' /e:true 2>&1|Out-Null}catch{}
         $observerAction = New-ScheduledTaskAction -Execute (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') -Argument '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File C:\K5GuestWitness\windows_guest_witness.ps1 -Mode Observe'
         $system = New-ScheduledTaskPrincipal -UserId SYSTEM -LogonType ServiceAccount -RunLevel Highest
         $observerName = 'K5GuestWitness-' + $transfer
@@ -256,7 +289,13 @@ if ($Mode -eq 'Setup') {
 }
 
 $phase = [string]$config.phase
-$boot = [K5GuestNative]::BootId()
+try{
+    $boot = [K5GuestNative]::BootId()
+    Write-EntryDiagnostic ('observer-stage-'+$phase+'.json') @{schema_version=1;phase=$phase;status='native_ready';stage='native_boot_id';boot_id=$boot;observer_session=$guestWitnessSession}
+}catch{
+    Write-EntryDiagnostic ('observer-preflight-failure-'+$phase+'.json') @{schema_version=1;phase=$phase;stage='native_boot_id';status='preflight_failed';error_kind=$_.Exception.GetType().Name;hresult=$_.Exception.HResult;observer_session=$guestWitnessSession}
+    exit 1
+}
 $receipt = [ordered]@{
     schema_version=1; phase=$phase; transfer_id=$transfer; status='failed'; boot_id=$boot;
     head_sha=$config.head_sha; installer_sha256=$config.setup_sha256; observer_sid='SYSTEM'; observer_session=0;
@@ -300,6 +339,7 @@ try {
         $receipt.status = 'bootstrap_sealed'
     } elseif ($phase -eq 'reboot') {
         $observationStage='reboot_identity'
+        Write-EntryDiagnostic 'observer-stage-reboot.json' @{schema_version=1;phase=$phase;status='observing';stage=$observationStage;boot_id=$boot;observer_session=$guestWitnessSession}
         $rebootWatch=[Diagnostics.Stopwatch]::StartNew()
         $recordingRoot=Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) 'K5Vision\recordings'
         $startupPaths=@(Recording-Files|ForEach-Object{$_.FullName})
@@ -313,6 +353,7 @@ try {
         $receipt.startup_audit_enabled=[K5GuestNative]::StartupAuditEnabled()
         if(-not $receipt.startup_audit_enabled){throw 'Startup audit disabled'}
         $observationStage='service_before_login'
+        Write-EntryDiagnostic 'observer-stage-reboot.json' @{schema_version=1;phase=$phase;status='observing';stage=$observationStage;boot_id=$boot;observer_session=$guestWitnessSession}
         $watch = [Diagnostics.Stopwatch]::StartNew()
         while ($true) {
             if (@([K5GuestNative]::InteractiveSessions()).Count -ne 0) { throw 'Interactive session preceded boot witness' }
@@ -320,6 +361,7 @@ try {
         }
         $before = Recording-Bytes
         $observationStage='prelogin_recording_growth'
+        Write-EntryDiagnostic 'observer-stage-reboot.json' @{schema_version=1;phase=$phase;status='observing';stage=$observationStage;boot_id=$boot;observer_session=$guestWitnessSession}
         $watch.Restart()
         do {
             if (@([K5GuestNative]::InteractiveSessions()).Count -ne 0) { throw 'Interactive session during pre-login recording' }
@@ -335,6 +377,7 @@ try {
             if ($matches.Count -ne 1) { throw 'Retained closed recording differs' }
         }
         $observationStage='new_closed_postboot_recording'
+        Write-EntryDiagnostic 'observer-stage-reboot.json' @{schema_version=1;phase=$phase;status='observing';stage=$observationStage;boot_id=$boot;observer_session=$guestWitnessSession}
         $auditWatch=[Diagnostics.Stopwatch]::StartNew();$postboot=@()
         do{
             if(@([K5GuestNative]::InteractiveSessions()).Count -ne 0){throw 'Interactive session before new recording closed'}
@@ -349,6 +392,7 @@ try {
         $receipt.postboot_clip_created_after_system_inventory=$true
         $receipt.reboot_observation_total_seconds=[Math]::Round($rebootWatch.Elapsed.TotalSeconds,3)
         $observationStage='final_boot_security_audit'
+        Write-EntryDiagnostic 'observer-stage-reboot.json' @{schema_version=1;phase=$phase;status='observing';stage=$observationStage;boot_id=$boot;observer_session=$guestWitnessSession}
         $audit=Security-RebootAudit $baseline.security_checkpoint $baseline.boot_id $boot
         $receipt.security_audit_checkpoint_retained=$audit.checkpoint_retained
         $receipt.security_no_clear_reset_wrap=$audit.no_clear_reset_wrap

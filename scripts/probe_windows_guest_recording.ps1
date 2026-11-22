@@ -146,6 +146,26 @@ function Bounded-Job($Job,[int]$Seconds){
         Remove-Job -Job $Job -Force -ErrorAction SilentlyContinue
     }
 }
+function Stop-OwnedDiagnosticVM {
+    $vm=Owned-VM
+    if([string]$vm.State -eq 'Off'){return}
+    $receipt.diagnostic_shutdown_requested_after_interval=$true
+    $job=$null
+    try{
+        $job=Stop-VM -VM $vm -AsJob -Confirm:$false -ErrorAction Stop
+        if($null -ne (Wait-Job -Job $job -Timeout 20)){Receive-Job -Job $job -ErrorAction Stop|Out-Null}
+    }catch{$receipt.graceful_shutdown_error_kind=$_.Exception.GetType().Name;$receipt.graceful_shutdown_hresult=$_.Exception.HResult}
+    finally{
+        if($null -ne $job){
+            if($job.State -in @('Running','NotStarted','Blocked')){Stop-Job -Job $job -ErrorAction SilentlyContinue}
+            Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+        }
+    }
+    $vm=Owned-VM
+    if([string]$vm.State -eq 'Off'){$receipt.diagnostic_shutdown_method='graceful';return}
+    $receipt.diagnostic_shutdown_method='force_fallback'
+    Bounded-Job (Stop-VM -VM $vm -TurnOff -Force -AsJob -Confirm:$false) 30|Out-Null
+}
 function Start-OwnedProcess([string]$Executable,[string]$Arguments){
     $info=[Diagnostics.ProcessStartInfo]::new($Executable,$Arguments)
     $info.UseShellExecute=$false; $info.CreateNoWindow=$true
@@ -412,6 +432,72 @@ function Read-SetupState([string]$WindowsVolume) {
     }
     return $facts
 }
+function Read-OwnedTaskDiagnostics([string]$WindowsVolume) {
+    $facts=@{tasks=@{};task_events=@();service_events=@{}}
+    foreach($role in @('observer','bootstrap')){
+        $name=if($role -ceq 'observer'){'K5GuestWitness-'+$transfer}else{'K5GuestBootstrap-'+$transfer}
+        $path=Join-Path $WindowsVolume ('Windows\System32\Tasks\'+$name)
+        $note=@{present=[bool](Test-Path -LiteralPath $path -PathType Leaf)};$facts.tasks[$role]=$note
+        if(-not $note.present){continue}
+        try{
+            $info=Get-Item -LiteralPath $path -Force
+            if($info.Length -gt 65536 -or ($info.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0){throw 'Task diagnostic bound refused'}
+            [xml]$document=[IO.File]::ReadAllText($path)
+            $ns=[Xml.XmlNamespaceManager]::new($document.NameTable);$ns.AddNamespace('t','http://schemas.microsoft.com/windows/2004/02/mit/task')
+            $note.boot_trigger_present=($null -ne $document.SelectSingleNode('/t:Task/t:Triggers/t:BootTrigger',$ns))
+            $note.logon_trigger_present=($null -ne $document.SelectSingleNode('/t:Task/t:Triggers/t:LogonTrigger',$ns))
+            $principal=$document.SelectSingleNode('/t:Task/t:Principals/t:Principal/t:UserId',$ns)
+            if($null -ne $principal){$note.system_principal=($principal.InnerText -in @('S-1-5-18','SYSTEM','NT AUTHORITY\SYSTEM'))}
+            foreach($field in @('Enabled','DisallowStartIfOnBatteries','StopIfGoingOnBatteries','RunOnlyIfNetworkAvailable','RunOnlyIfIdle','StartWhenAvailable','AllowStartOnDemand')){
+                $node=$document.SelectSingleNode('/t:Task/t:Settings/t:'+$field,$ns)
+                if($null -ne $node -and $node.InnerText -in @('true','false')){$note[$field]=($node.InnerText -ieq 'true')}
+            }
+            $node=$document.SelectSingleNode('/t:Task/t:Settings/t:MultipleInstancesPolicy',$ns)
+            if($null -ne $node){$note.multiple_instances=if($node.InnerText -in @('Parallel','Queue','IgnoreNew','StopExisting')){$node.InnerText}else{'other'}}
+            $node=$document.SelectSingleNode('/t:Task/t:Actions/t:Exec/t:Arguments',$ns)
+            if($role -ceq 'observer'){$note.expected_observer_action=($null -ne $node -and $node.InnerText -ceq '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File C:\K5GuestWitness\windows_guest_witness.ps1 -Mode Observe')}
+        }catch{$note.failure_kind=$_.Exception.GetType().Name;$note.failure_hresult=$_.Exception.HResult}
+    }
+    foreach($channel in @('task','system')){
+        $relative=if($channel -ceq 'task'){'Windows\System32\winevt\Logs\Microsoft-Windows-TaskScheduler%4Operational.evtx'}else{'Windows\System32\winevt\Logs\System.evtx'}
+        $path=Join-Path $WindowsVolume $relative
+        if(-not(Test-Path -LiteralPath $path -PathType Leaf)){continue}
+        $events=@()
+        try{
+            $info=Get-Item -LiteralPath $path -Force
+            if($info.Length -gt 67108864 -or ($info.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0){throw 'Event diagnostic bound refused'}
+            $xpath=if($channel -ceq 'task'){
+                '*[EventData[Data[@Name="TaskName"]="\K5GuestWitness-'+$transfer+'" or Data[@Name="TaskName"]="\K5GuestBootstrap-'+$transfer+'"]]'
+            }else{'*[System[Provider[@Name="Service Control Manager"]]]'}
+            try{$events=@(Get-WinEvent -Path $path -FilterXPath $xpath -MaxEvents 64 -ErrorAction Stop)}catch{if($_.FullyQualifiedErrorId -notlike 'NoMatchingEventsFound*'){throw}}
+            $safeEvents=@()
+            foreach($event in $events){
+                    [xml]$xml=$event.ToXml();$ns=[Xml.XmlNamespaceManager]::new($xml.NameTable);$ns.AddNamespace('e','http://schemas.microsoft.com/win/2004/08/events/event')
+                    $data=@($xml.SelectNodes('/e:Event/e:EventData/e:Data',$ns))
+                    $entry=@{event_id=[int]$event.Id;record_id=[long]$event.RecordId}
+                    if($channel -ceq 'task'){
+                        $taskName=@($data|Where-Object{$_.GetAttribute('Name') -ceq 'TaskName'})
+                        if($taskName.Count -ne 1){continue}
+                        if($taskName[0].InnerText -ceq ('\K5GuestWitness-'+$transfer)){$entry.role='observer'}
+                        elseif($taskName[0].InnerText -ceq ('\K5GuestBootstrap-'+$transfer)){$entry.role='bootstrap'}else{continue}
+                        foreach($item in $data|Where-Object{$_.GetAttribute('Name') -in @('ResultCode','ErrorCode','ErrorValue')}){
+                            $value=$item.InnerText
+                            if($value -match '^0x[0-9a-fA-F]{1,8}$'){$entry.result_code=[Convert]::ToUInt32($value.Substring(2),16)}
+                            elseif($value -match '^\d{1,10}$' -and [decimal]$value -le [uint32]::MaxValue){$entry.result_code=[long]$value}
+                        }
+                    }else{
+                        if($event.Id -notin @(7000,7001,7009,7011,7023,7024,7031,7034,7036)){continue}
+                        if(@($data|Where-Object{$_.InnerText -in @('K5VisionRecorder','K5 Vision Recorder')}).Count -eq 0){continue}
+                        foreach($item in $data){if($item.InnerText -match '^%%(\d{1,10})$'){$entry.win32_code=[long]$Matches[1]}}
+                    }
+                    $safeEvents+=@($entry)
+            }
+            if($channel -ceq 'task'){$facts.task_events=$safeEvents}else{$facts.service_events=$safeEvents}
+        }catch{$facts[($channel+'_event_failure')]=@{kind=$_.Exception.GetType().Name;hresult=$_.Exception.HResult}}
+        finally{foreach($event in $events){if($event -is [IDisposable]){$event.Dispose()}}}
+    }
+    return $facts
+}
 function Read-BootFailureOffline {
     Assert-Root
     $facts=@{read_only_mount=$false;known_files=@{};own_receipts=@{};setup_logs=@{};subphase='create_access_path';inspection_complete=$false}
@@ -445,19 +531,21 @@ function Read-BootFailureOffline {
           setup_task=('Windows\System32\Tasks\K5GuestWitness-'+$transfer);bootstrap_task=('Windows\System32\Tasks\K5GuestBootstrap-'+$transfer)
         }
         foreach($entry in $known.GetEnumerator()){$facts.known_files[$entry.Key]=[bool](Test-Path -LiteralPath (Join-Path $diagnosticMount $entry.Value) -PathType Leaf)}
+        $facts.subphase='owned_task_diagnostics'
+        $facts.task_diagnostics=Read-OwnedTaskDiagnostics $diagnosticMount
         $facts.subphase='own_receipts'
-        foreach($name in @('setup-entry.json','setup-failure.json','bootstrap-receipt.json','bootstrap-witness.json')){
+        foreach($name in @('public-config.json','setup-entry.json','setup-failure.json','setup-preflight-failure.json','bootstrap-receipt.json','bootstrap-witness.json','reboot-witness.json','observer-entry-bootstrap.json','observer-stage-bootstrap.json','observer-preflight-failure-bootstrap.json','observer-entry-reboot.json','observer-stage-reboot.json','observer-preflight-failure-reboot.json')){
             $path=Join-Path $diagnosticMount ('K5GuestWitness\'+$name)
             if(-not(Test-Path -LiteralPath $path -PathType Leaf)){continue}
             $info=Get-Item -LiteralPath $path
             if($info.Length -gt 65536 -or ($info.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0){continue}
             try{
                 $parsed=Get-Content -LiteralPath $path -Raw|ConvertFrom-Json;$safe=@{}
-                foreach($field in @('status','phase','stage','failure_stage','error_kind','failure_type','hresult','failure_hresult','native_code','http_status','mfa_enabled_before_reboot','mfa_confirmed_via_normal_api','gui_admin_setup','camera_source_enrolled','service_running','gui_client_closed','cleanup_credentials_removed','configuration_valid','system_account_verified','observer_session','setup_session_admitted')){
+                foreach($field in @('status','phase','stage','failure_stage','error_kind','failure_type','hresult','failure_hresult','native_code','http_status','mfa_enabled_before_reboot','mfa_confirmed_via_normal_api','gui_admin_setup','camera_source_enrolled','service_running','gui_client_closed','cleanup_credentials_removed','configuration_valid','system_account_verified','observer_session','setup_session_admitted','observer_session_admitted','logon_audit_enabled','startup_audit_enabled','security_policy_coverage_verified','security_tail_stable','boot_id','previous_boot_id')){
                     $property=$parsed.PSObject.Properties[$field]
                     if($null -eq $property){continue};$value=$property.Value
                     if($value -is [bool] -or $value -is [int] -or $value -is [long]){$safe[$field]=$value}
-                    elseif($value -is [string] -and $value -match '^[A-Za-z][A-Za-z0-9_.-]{0,79}$'){$safe[$field]=$value}
+                    elseif($value -is [string] -and (($field -in @('boot_id','previous_boot_id') -and $value -cmatch '^[a-f0-9-]{36}$') -or $value -match '^[A-Za-z][A-Za-z0-9_.-]{0,79}$')){$safe[$field]=$value}
                 }
                 $facts.own_receipts[$name]=$safe
             }catch{$facts.own_receipts[$name]=@{parse_failed=$true}}
@@ -762,11 +850,17 @@ try{
         param($boot)
         $path='C:\K5GuestWitness\public-config.json';$configuration=Get-Content -LiteralPath $path -Raw|ConvertFrom-Json
         $configuration.phase='reboot';$configuration.previous_boot_id=$boot
-        [IO.File]::WriteAllText($path,($configuration|ConvertTo-Json -Depth 5),[Text.UTF8Encoding]::new($false))
+        if(([IO.File]::GetAttributes($path) -band [IO.FileAttributes]::ReparsePoint) -ne 0){throw 'Owned phase file refused'}
+        $bytes=[Text.UTF8Encoding]::new($false).GetBytes(($configuration|ConvertTo-Json -Depth 5))
+        $stream=[IO.FileStream]::new($path,[IO.FileMode]::Open,[IO.FileAccess]::Write,[IO.FileShare]::Read,4096,[IO.FileOptions]::WriteThrough)
+        try{$stream.SetLength(0);$stream.Write($bytes,0,$bytes.Length);$stream.Flush($true)}finally{$stream.Dispose()}
+        $verified=Get-Content -LiteralPath $path -Raw|ConvertFrom-Json
+        if($verified.phase -cne 'reboot' -or $verified.previous_boot_id -cne $boot){throw 'Durable reboot phase verification failed'}
     } -ArgumentList $initial.boot_id -ErrorAction Stop
     Remove-PSSession -Session $direct;$direct=$null
     Bounded-Job (Restart-VM -VM (Owned-VM) -Force -AsJob -Confirm:$false) 40|Out-Null
     $rebootSeal=Kvp-Seal 'reboot' 240
+    $receipt.stage='reboot_receipt_read'
     $direct=Open-Direct
     $reboot=Read-GuestReceipt 'reboot' $rebootSeal;$receipt.reboot_witness=$reboot
     if($reboot.status -cne 'reboot_sealed' -or -not $reboot.startup_before_interactive_login -or -not $reboot.recording_after_reboot -or -not $reboot.retained_closed_hashes_unchanged -or $reboot.boot_id -ceq $initial.boot_id){throw 'Reboot recording witness failed'}
@@ -867,6 +961,10 @@ try{
     if($_.Exception -is [ComponentModel.Win32Exception]){$receipt.failure_native_code=$_.Exception.NativeErrorCode}
     if($null -ne $vmId -and $receipt.stage -ceq 'actual_guest_boot' -and -not $receipt.actual_guest_boot){
         try{$receipt.bootstrap_failure_live=Read-BootFailureLive}catch{$receipt.bootstrap_live_diagnostic_error=$_.Exception.GetType().Name}
+    }elseif($null -ne $vmId -and $receipt.stage -ceq 'real_guest_reboot'){
+        # No keyboard login or PowerShell Direct connection has occurred in
+        # this measured interval; capture only credential-free host-side data.
+        try{$receipt.reboot_failure_live=Read-BootFailureLive}catch{$receipt.reboot_live_diagnostic_error=$_.Exception.GetType().Name}
     }
 }finally{
     $password=$null
@@ -875,7 +973,10 @@ try{
         if($null -ne $direct){Remove-PSSession -Session $direct;$direct=$null}
         if($null -ne $vmId){
             $vm=Owned-VM
-            if([string]$vm.State -ne 'Off'){Bounded-Job (Stop-VM -VM $vm -TurnOff -Force -AsJob -Confirm:$false) 30|Out-Null}
+            if([string]$vm.State -ne 'Off'){
+                if($receipt.stage -in @('bootstrap_observation','actual_guest_boot','real_guest_reboot')){Stop-OwnedDiagnosticVM}
+                else{Bounded-Job (Stop-VM -VM $vm -TurnOff -Force -AsJob -Confirm:$false) 30|Out-Null}
+            }
             $vm=Owned-VM;if([string]$vm.State -ne 'Off'){throw 'Owned VM did not stop'}
             Bounded-Job (Remove-VM -VM $vm -Force -AsJob -Confirm:$false) 30|Out-Null
             if($null -ne (Get-VM -Id $vmId -ErrorAction SilentlyContinue)){throw 'Owned VM remains'}
@@ -883,6 +984,8 @@ try{
                 try{$receipt.bootstrap_observation_offline=Read-BootFailureOffline}catch{$receipt.bootstrap_offline_diagnostic_error=$_.Exception.GetType().Name}
             }elseif($receipt.stage -ceq 'actual_guest_boot' -and -not $receipt.actual_guest_boot){
                 try{$receipt.bootstrap_failure_offline=Read-BootFailureOffline}catch{$receipt.bootstrap_offline_diagnostic_error=$_.Exception.GetType().Name}
+            }elseif($receipt.stage -ceq 'real_guest_reboot'){
+                try{$receipt.reboot_failure_offline=Read-BootFailureOffline}catch{$receipt.reboot_offline_diagnostic_error=$_.Exception.GetType().Name}
             }
         }
         foreach($process in @($publisherProcess,$mediaProcess)){
