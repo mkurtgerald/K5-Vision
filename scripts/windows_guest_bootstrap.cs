@@ -60,7 +60,7 @@ internal static class WindowsGuestBootstrap
     private static void Require(bool condition)
     {
         if (!condition) throw new InvalidOperationException();
-        if (!WritingFailure && Elapsed.ElapsedMilliseconds >= 240000) throw new TimeoutException();
+        if (!WritingFailure && Elapsed.ElapsedMilliseconds >= 240000) throw new System.TimeoutException();
     }
 
     private static void Wait(Func<bool> condition, int milliseconds)
@@ -72,7 +72,7 @@ internal static class WindowsGuestBootstrap
             if (condition()) return;
             Thread.Sleep(100);
         }
-        throw new TimeoutException();
+        throw new System.TimeoutException();
     }
 
     private static string Text(Dictionary<string, object> value, string key)
