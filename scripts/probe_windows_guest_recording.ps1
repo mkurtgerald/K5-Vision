@@ -1,0 +1,393 @@
+# Diagnostic installer-specific guest proof. The outer runner never reboots.
+# Only public fixture data and a one-time guest setup credential enter the VM;
+# Actions credentials remain exclusively in the outer runner's environment.
+param(
+    [Parameter(Mandatory=$true)][string]$SetupPath,
+    [Parameter(Mandatory=$true)][ValidatePattern('^[a-f0-9]{40}$')][string]$ProductHead,
+    [Parameter(Mandatory=$true)][ValidatePattern('^[a-f0-9]{64}$')][string]$SetupSha256,
+    [Parameter(Mandatory=$true)][string]$BootstrapExe,
+    [Parameter(Mandatory=$true)][string]$MediaMTX,
+    [Parameter(Mandatory=$true)][string]$FFmpeg,
+    [Parameter(Mandatory=$true)][string]$FFprobe
+)
+Set-StrictMode -Version Latest
+$ErrorActionPreference='Stop'
+$ProgressPreference='SilentlyContinue'
+$VerbosePreference='SilentlyContinue'
+$WarningPreference='SilentlyContinue'
+$InformationPreference='SilentlyContinue'
+$imageSha='2d175924c8e647969a82e36f931b22397108bd94a030e0e947b7e66e47e0be9a'
+$imageBytes=[long]11686379520
+$transfer=[guid]::NewGuid().ToString()
+$receipt=[ordered]@{
+    schema_version=1; diagnostic_only=$true; product_qualification=$false;
+    status='diagnostic_complete'; outcome='unavailable'; transfer_id=$transfer;
+    product_head=$ProductHead; installer_sha256=$SetupSha256; image_sha256=$imageSha;
+    actual_guest_boot=$false; recording_after_reboot_before_login=$false;
+    recording_after_actual_signout=$false; retained_media_decoded=$false;
+    github_credentials_entered_guest=$false; cleanup_complete=$true; stage='host_guard'
+}
+$root=$null; $rootIdentity=$null; $image=$null; $mounted=$false; $diskNumber=$null; $diskId=$null
+$partitionNumber=$null; $accessPath=$null; $vmId=$null; $vmName=$null; $switchId=$null; $switchName=$null
+$hostInterface=$null; $hostIPAddress=$null; $firewallName=$null; $direct=$null; $password=$null; $credential=$null
+$mediaProcess=$null; $publisherProcess=$null
+function Private-Directory([string]$Path,[bool]$Guest=$false) {
+    $directory=New-Item -ItemType Directory -Path $Path
+    $security=[Security.AccessControl.DirectorySecurity]::new()
+    $security.SetAccessRuleProtection($true,$false)
+    $security.SetOwner([Security.Principal.SecurityIdentifier]::new('S-1-5-32-544'))
+    $sids=@('S-1-5-18','S-1-5-32-544')
+    if(-not $Guest){$sids += [Security.Principal.WindowsIdentity]::GetCurrent().User.Value}
+    foreach($sid in @($sids|Select-Object -Unique)){
+        $security.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new($sid),'FullControl','ContainerInherit,ObjectInherit','None','Allow'))
+    }
+    Set-Acl -LiteralPath $Path -AclObject $security
+    return $directory
+}
+function Assert-Root {
+    $current=Get-Item -LiteralPath $root -Force
+    if($current.FullName -cne $rootIdentity.FullName -or $current.CreationTimeUtc.Ticks -ne $rootIdentity.CreationTimeUtc.Ticks -or
+       ($current.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or $current.Name -cnotmatch '^K5GuestRecording-[a-f0-9]{32}$'){throw 'Owned guest root changed'}
+}
+function Owned-VM {
+    Assert-Root
+    $found=Get-VM -Id $vmId
+    if($found.Id -ne $vmId -or $found.Name -cne $vmName -or -not [IO.Path]::GetFullPath($found.ConfigurationLocation).StartsWith($root+'\',[StringComparison]::OrdinalIgnoreCase)){throw 'Owned VM changed'}
+    return $found
+}
+function Bounded-Job($Job,[int]$Seconds){
+    try{
+        if($null -eq (Wait-Job -Job $Job -Timeout $Seconds)){throw [TimeoutException]::new('Owned VM operation expired')}
+        Receive-Job -Job $Job -ErrorAction Stop
+    }finally{
+        if($Job.State -in @('Running','NotStarted','Blocked')){Stop-Job -Job $Job -ErrorAction SilentlyContinue}
+        Remove-Job -Job $Job -Force -ErrorAction SilentlyContinue
+    }
+}
+function Start-OwnedProcess([string]$Executable,[string]$Arguments){
+    $info=[Diagnostics.ProcessStartInfo]::new($Executable,$Arguments)
+    $info.UseShellExecute=$false; $info.CreateNoWindow=$true
+    $info.RedirectStandardOutput=$true; $info.RedirectStandardError=$true
+    $process=[Diagnostics.Process]::Start($info)
+    $process.BeginOutputReadLine(); $process.BeginErrorReadLine()
+    return $process
+}
+function Assert-Publisher {
+    if($null -eq $mediaProcess -or $null -eq $publisherProcess -or $mediaProcess.HasExited -or $publisherProcess.HasExited){throw 'Owned generated source ended'}
+}
+function Kvp-Seal([string]$Phase,[int]$Seconds){
+    $watch=[Diagnostics.Stopwatch]::StartNew()
+    do{
+        $vm=Owned-VM; Assert-Publisher
+        if([string]$vm.State -ne 'Running'){throw 'Owned VM stopped before witness'}
+        $computer=Get-CimInstance -Namespace root/virtualization/v2 -ClassName Msvm_ComputerSystem -Filter ("Name='"+$vmId.ToString()+"'")
+        $components=@(Get-CimAssociatedInstance -InputObject $computer -ResultClassName Msvm_KvpExchangeComponent)
+        if($components.Count -ne 1){throw 'Owned KVP component unavailable'}
+        foreach($raw in @($components[0].GuestExchangeItems)){
+            if($null -eq $raw -or $raw.Length -gt 8192){continue}
+            [xml]$item=$raw
+            $name=$item.SelectSingleNode('/INSTANCE/PROPERTY[@NAME="Name"]/VALUE')
+            if($null -eq $name -or $name.InnerText -cne ('K5GuestWitness-'+$transfer)){continue}
+            $value=$item.SelectSingleNode('/INSTANCE/PROPERTY[@NAME="Data"]/VALUE')
+            if($null -eq $value){continue}
+            $parts=$value.InnerText.Split('|')
+            if($parts.Count -eq 3 -and $parts[0] -ceq $Phase -and $parts[1] -match '^[a-f0-9-]{36}$' -and $parts[2] -match '^[a-f0-9]{64}$'){
+                return @{phase=$parts[0];boot_id=$parts[1];sha256=$parts[2]}
+            }
+            if($parts.Count -eq 3 -and $parts[0] -ceq 'failed'){throw 'Guest setup witness failed'}
+        }
+        Start-Sleep -Seconds 1
+    }while($watch.Elapsed.TotalSeconds -lt $Seconds)
+    throw [TimeoutException]::new('Sealed guest witness unavailable')
+}
+function Open-Direct {
+    # Called only AFTER the credential-free SYSTEM witness publishes its seal.
+    # No connection, logon or endpoint probe is attempted in the measured interval.
+    return New-PSSession -VMId $vmId -Credential $credential -ErrorAction Stop
+}
+function Read-GuestReceipt([string]$Phase,$Seal){
+    $raw=Invoke-Command -Session $direct -ScriptBlock {
+        param($phase)
+        if($phase -notin @('bootstrap','reboot','signout')){throw 'Unadmitted receipt'}
+        $path='C:\K5GuestWitness\'+$phase+'-witness.json'
+        if((Get-Item -LiteralPath $path).Length -gt 65536){throw 'Receipt length exceeded'}
+        [Convert]::ToBase64String([IO.File]::ReadAllBytes($path))
+    } -ArgumentList $Phase -ErrorAction Stop
+    $bytes=[Convert]::FromBase64String([string]$raw)
+    $sha=[Security.Cryptography.SHA256]::Create()
+    try{$digest=[BitConverter]::ToString($sha.ComputeHash($bytes)).Replace('-','').ToLowerInvariant()}finally{$sha.Dispose()}
+    if($digest -cne $Seal.sha256){throw 'Sealed witness bytes differ'}
+    $result=[Text.Encoding]::UTF8.GetString($bytes)|ConvertFrom-Json
+    if($result.transfer_id -cne $transfer -or $result.head_sha -cne $ProductHead -or $result.installer_sha256 -cne $SetupSha256 -or $result.boot_id -cne $Seal.boot_id){throw 'Sealed witness scope differs'}
+    return $result
+}
+function IPv4-Number([string]$Address){
+    $bytes=[Net.IPAddress]::Parse($Address).GetAddressBytes()
+    if($bytes.Length -ne 4){throw 'IPv4 required'}
+    if([BitConverter]::IsLittleEndian){[Array]::Reverse($bytes)}
+    return [BitConverter]::ToUInt32($bytes,0)
+}
+try{
+    if($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted' -or $env:RUNNER_OS -ne 'Windows'){throw 'Disposable Windows host required'}
+    foreach($file in @($SetupPath,$BootstrapExe,$MediaMTX,$FFmpeg,$FFprobe,(Join-Path $PSScriptRoot 'windows_guest_witness.ps1'))){
+        if(-not(Test-Path -LiteralPath $file -PathType Leaf) -or ((Get-Item -LiteralPath $file).Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0){throw 'Required pinned fixture unavailable'}
+    }
+    if((Get-FileHash -LiteralPath $SetupPath -Algorithm SHA256).Hash.ToLowerInvariant() -cne $SetupSha256){throw 'Installer bytes differ'}
+    $receipt.stage='resources'
+    $drives=@([IO.DriveInfo]::GetDrives()|Where-Object{$_.DriveType -eq 'Fixed' -and $_.IsReady -and $_.AvailableFreeSpace -ge 24GB}|Sort-Object AvailableFreeSpace -Descending)
+    if($drives.Count -eq 0 -or [long](Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory*1024 -lt 5GB){throw 'Guest resources unavailable'}
+    $receipt.available_bytes=[long]$drives[0].AvailableFreeSpace
+    $root=Join-Path $drives[0].RootDirectory.FullName ('K5GuestRecording-'+[guid]::NewGuid().ToString('N'))
+    $rootIdentity=Private-Directory $root
+    $image=Join-Path $root 'official-evaluation.vhdx'
+    $receipt.stage='official_pinned_image_download'
+    Add-Type -AssemblyName System.Net.Http
+    $handler=[Net.Http.HttpClientHandler]::new();$handler.AllowAutoRedirect=$false
+    $client=[Net.Http.HttpClient]::new($handler);$client.Timeout=[TimeSpan]::FromMinutes(12)
+    $cancel=[Threading.CancellationTokenSource]::new(720000)
+    $response=$null;$input=$null;$output=$null
+    try{
+        $url='https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/26100.1742.amd64fre.ge_release_svc_refresh.240906-0331_server_serverdatacentereval_en-us.vhdx'
+        $response=$client.GetAsync($url,[Net.Http.HttpCompletionOption]::ResponseHeadersRead,$cancel.Token).GetAwaiter().GetResult()
+        if([int]$response.StatusCode -ne 200 -or $response.Content.Headers.ContentLength -ne $imageBytes){throw 'Official image response differs'}
+        $input=$response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
+        $output=[IO.File]::Open($image,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+        $buffer=[byte[]]::new(1048576);[long]$downloaded=0
+        while(($count=$input.ReadAsync($buffer,0,$buffer.Length,$cancel.Token).GetAwaiter().GetResult()) -gt 0){
+            $downloaded+=$count;if($downloaded -gt $imageBytes){throw 'Image length exceeded'};$output.Write($buffer,0,$count)
+        }
+        $output.Flush($true)
+    }finally{
+        if($null -ne $output){$output.Dispose()};if($null -ne $input){$input.Dispose()};if($null -ne $response){$response.Dispose()}
+        $cancel.Dispose();$client.Dispose();$handler.Dispose()
+    }
+    if((Get-Item -LiteralPath $image).Length -ne $imageBytes -or (Get-FileHash -LiteralPath $image -Algorithm SHA256).Hash.ToLowerInvariant() -cne $imageSha){throw 'Pinned official image bytes differ'}
+    $receipt.stage='offline_image_and_generation'
+    $attached=Mount-VHD -Path $image -NoDriveLetter -PassThru;$mounted=$true;$diskNumber=[int]$attached.DiskNumber
+    $disk=Get-Disk -Number $diskNumber;$diskId=[string]$disk.UniqueId
+    $partitions=@(Get-Partition -DiskNumber $diskNumber)
+    $efi=@($partitions|Where-Object{$_.GptType -eq '{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}'})
+    if([string]$disk.PartitionStyle -eq 'GPT' -and $efi.Count -eq 1){$generation=2}
+    elseif([string]$disk.PartitionStyle -eq 'MBR' -and @($partitions|Where-Object{$_.IsActive}).Count -eq 1){$generation=1}
+    else{throw 'Official boot partition layout refused'}
+    $receipt.vm_generation=$generation;$receipt.disk_partition_style=[string]$disk.PartitionStyle;$receipt.disk_unique_id=$diskId
+    $accessPath=(Join-Path $root 'offline')+'\';New-Item -ItemType Directory -Path $accessPath|Out-Null
+    $windows=$null
+    foreach($partition in @($partitions|Where-Object{$_.Size -gt 1GB})){
+        $partitionNumber=[int]$partition.PartitionNumber
+        Add-PartitionAccessPath -DiskNumber $diskNumber -PartitionNumber $partitionNumber -AccessPath $accessPath
+        if(Test-Path -LiteralPath (Join-Path $accessPath 'Windows\explorer.exe') -PathType Leaf){$windows=$accessPath;break}
+        Remove-PartitionAccessPath -DiskNumber $diskNumber -PartitionNumber $partitionNumber -AccessPath $accessPath;$partitionNumber=$null
+    }
+    if($null -eq $windows){throw 'Pinned Desktop Experience image unavailable'}
+    $kernel=Get-AuthenticodeSignature -LiteralPath (Join-Path $windows 'Windows\System32\ntoskrnl.exe')
+    if($kernel.Status -ne 'Valid' -or $kernel.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation'){throw 'Pinned Windows kernel signature unavailable'}
+    $receipt.microsoft_kernel_verified=$true
+    $receipt.stage='isolated_camera_network'
+    $prefix=$null
+    foreach($octet in (Get-Random -InputObject (20..230) -Count 211)){
+        $candidate='172.29.'+$octet+'.0';$number=IPv4-Number $candidate;$conflict=$false
+        foreach($route in @(Get-NetRoute -AddressFamily IPv4|Where-Object{$_.DestinationPrefix -ne '0.0.0.0/0'})){
+            $parts=$route.DestinationPrefix.Split('/');$length=[Math]::Min(30,[int]$parts[1]);$mask=[uint32](([uint64]4294967295 -shl (32-$length)) -band [uint64]4294967295)
+            if(($number -band $mask) -eq ((IPv4-Number $parts[0]) -band $mask)){$conflict=$true;break}
+        }
+        if(-not $conflict){$prefix='172.29.'+$octet;break}
+    }
+    if($null -eq $prefix){throw 'Isolated fixture subnet unavailable'}
+    $hostIPAddress=$prefix+'.1';$guestIP=$prefix+'.2'
+    $switchName='K5Guest-'+$transfer.Substring(0,8)
+    $switch=New-VMSwitch -Name $switchName -SwitchType Internal;$switchId=$switch.Id
+    $hostAdapters=@(Get-NetAdapter -Name ('vEthernet ('+$switchName+')'))
+    if($hostAdapters.Count -ne 1){throw 'Owned internal adapter unavailable'};$hostInterface=[int]$hostAdapters[0].ifIndex
+    New-NetIPAddress -InterfaceIndex $hostInterface -IPAddress $hostIPAddress -PrefixLength 30 -AddressFamily IPv4|Out-Null
+    $firewallName='K5GuestCamera-'+$transfer
+    New-NetFirewallRule -Name $firewallName -DisplayName $firewallName -Direction Inbound -Action Allow -Protocol TCP -LocalAddress $hostIPAddress -RemoteAddress $guestIP -LocalPort 18554 -Program $MediaMTX|Out-Null
+    $configPath=Join-Path $root 'generated-camera.json'
+    $mediaConfig=@{logLevel='warn';rtspAddress=($hostIPAddress+':18554');rtspTransports=@('tcp');api=$false;rtmp=$false;hls=$false;webrtc=$false;srt=$false;paths=@{generated=@{source='publisher'}}}
+    [IO.File]::WriteAllText($configPath,($mediaConfig|ConvertTo-Json -Depth 8),[Text.UTF8Encoding]::new($false))
+    $mediaProcess=Start-OwnedProcess $MediaMTX $configPath
+    Start-Sleep -Seconds 1
+    $source='rtsp://'+$hostIPAddress+':18554/generated'
+    $publisherProcess=Start-OwnedProcess $FFmpeg ('-nostdin -hide_banner -loglevel error -re -f lavfi -i testsrc2=size=320x240:rate=10 -an -c:v libx264 -threads 1 -preset ultrafast -tune zerolatency -pix_fmt yuv420p -g 10 -f rtsp -rtsp_transport tcp '+$source)
+    Start-Sleep -Seconds 1;Assert-Publisher
+    $receipt.generated_source_isolated=$true
+    $receipt.stage='offline_guest_payload'
+    $guestRoot=Join-Path $windows 'K5GuestWitness';Private-Directory $guestRoot $true|Out-Null
+    $witness=Join-Path $PSScriptRoot 'windows_guest_witness.ps1'
+    Copy-Item -LiteralPath $witness -Destination (Join-Path $guestRoot 'windows_guest_witness.ps1')
+    Copy-Item -LiteralPath $BootstrapExe -Destination (Join-Path $guestRoot 'windows_guest_bootstrap.exe')
+    Copy-Item -LiteralPath $SetupPath -Destination (Join-Path $guestRoot 'K5VisionSetup.exe')
+    $mac='00155D'+([guid]::NewGuid().ToString('N').Substring(0,6)).ToUpperInvariant()
+    $public=@{schema_version=1;transfer_id=$transfer;head_sha=$ProductHead;setup_sha256=$SetupSha256;phase='bootstrap';previous_boot_id='';guest_mac=$mac;guest_ip=$guestIP;host_ip=$hostIPAddress}
+    $request=@{schema_version=1;head_sha=$ProductHead;setup_sha256=$SetupSha256;source_uri=$source;transfer_id=$transfer;receipt_path='C:\K5GuestWitness\bootstrap-receipt.json'}
+    [IO.File]::WriteAllText((Join-Path $guestRoot 'public-config.json'),($public|ConvertTo-Json -Depth 5),[Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText((Join-Path $guestRoot 'bootstrap-request.json'),($request|ConvertTo-Json -Depth 5),[Text.UTF8Encoding]::new($false))
+    $entropy=[byte[]]::new(32);$rng=[Security.Cryptography.RandomNumberGenerator]::Create();try{$rng.GetBytes($entropy)}finally{$rng.Dispose()}
+    $password='K5g!'+[Convert]::ToBase64String($entropy);[Array]::Clear($entropy,0,$entropy.Length)
+    $credential=[Management.Automation.PSCredential]::new('Administrator',(ConvertTo-SecureString $password -AsPlainText -Force))
+    $escaped=[Security.SecurityElement]::Escape($password)
+    $unattend=@"
+<?xml version="1.0" encoding="utf-8"?>
+<unattend xmlns="urn:schemas-microsoft-com:unattend">
+ <settings pass="specialize"><component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS"><ComputerName>K5GUEST</ComputerName><TimeZone>UTC</TimeZone></component></settings>
+ <settings pass="oobeSystem"><component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+ <OOBE><HideEULAPage>true</HideEULAPage><HideOnlineAccountScreens>true</HideOnlineAccountScreens><HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE><ProtectYourPC>3</ProtectYourPC></OOBE>
+ <UserAccounts><AdministratorPassword><Value>$escaped</Value><PlainText>true</PlainText></AdministratorPassword></UserAccounts>
+ <AutoLogon><Password><Value>$escaped</Value><PlainText>true</PlainText></Password><Enabled>true</Enabled><LogonCount>1</LogonCount><Username>Administrator</Username><Domain>.</Domain></AutoLogon>
+ </component></settings>
+</unattend>
+"@
+    $panther=Join-Path $windows 'Windows\Panther';if(-not(Test-Path -LiteralPath $panther)){New-Item -ItemType Directory -Path $panther|Out-Null}
+    $answerPath=Join-Path $panther 'Unattend.xml'
+    if(-not(Test-Path -LiteralPath $answerPath)){New-Item -ItemType File -Path $answerPath|Out-Null}
+    if(((Get-Item -LiteralPath $answerPath).Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0){throw 'Guest answer file is a reparse point'}
+    $answerAcl=[Security.AccessControl.FileSecurity]::new();$answerAcl.SetOwner([Security.Principal.SecurityIdentifier]::new('S-1-5-32-544'));$answerAcl.SetAccessRuleProtection($true,$false)
+    foreach($sid in @('S-1-5-18','S-1-5-32-544')){$answerAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new($sid),'FullControl','Allow'))}
+    Set-Acl -LiteralPath $answerPath -AclObject $answerAcl
+    [IO.File]::WriteAllText($answerPath,$unattend,[Text.UTF8Encoding]::new($false));$unattend=$null;$escaped=$null
+    $setupScripts=Join-Path $windows 'Windows\Setup\Scripts';if(-not(Test-Path -LiteralPath $setupScripts)){New-Item -ItemType Directory -Path $setupScripts|Out-Null}
+    $complete=Join-Path $setupScripts 'SetupComplete.cmd';$prior=''
+    if(Test-Path -LiteralPath $complete){Copy-Item -LiteralPath $complete -Destination (Join-Path $guestRoot 'SetupComplete.original.cmd');$prior='call C:\K5GuestWitness\SetupComplete.original.cmd'+"`r`n"}
+    [IO.File]::WriteAllText($complete,('@echo off'+"`r`n"+$prior+'%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File C:\K5GuestWitness\windows_guest_witness.ps1 -Mode Setup'+"`r`n"+'exit /b %errorlevel%'+"`r`n"),[Text.ASCIIEncoding]::new())
+    $security=(Get-Acl -LiteralPath $guestRoot)
+    foreach($file in @(Get-ChildItem -LiteralPath $guestRoot -File)){
+        $acl=[Security.AccessControl.FileSecurity]::new();$acl.SetOwner([Security.Principal.SecurityIdentifier]::new('S-1-5-32-544'));$acl.SetAccessRuleProtection($true,$false)
+        foreach($sid in @('S-1-5-18','S-1-5-32-544')){$acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new($sid),'FullControl','Allow'))}
+        Set-Acl -LiteralPath $file.FullName -AclObject $acl
+    }
+    if([string](Get-Disk -Number $diskNumber).UniqueId -cne $diskId){throw 'Owned disk identity changed'}
+    Remove-PartitionAccessPath -DiskNumber $diskNumber -PartitionNumber $partitionNumber -AccessPath $accessPath;$partitionNumber=$null
+    Dismount-VHD -Path $image;$mounted=$false
+    $receipt.stage='actual_guest_boot'
+    $vmName='K5Guest-'+$transfer.Substring(0,8)
+    $vm=New-VM -Name $vmName -Generation $generation -MemoryStartupBytes 4GB -Path (Join-Path $root 'vm') -VHDPath $image -SwitchName $switchName
+    $vmId=$vm.Id;Set-VMProcessor -VM $vm -Count 2;Set-VMMemory -VM $vm -DynamicMemoryEnabled $false
+    Set-VM -VM $vm -AutomaticCheckpointsEnabled $false
+    Set-VMNetworkAdapter -VM $vm -StaticMacAddress $mac
+    if($generation -eq 2){Set-VMFirmware -VM $vm -EnableSecureBoot On -SecureBootTemplate MicrosoftWindows}
+    $vmSid=([Security.Principal.NTAccount]::new('NT VIRTUAL MACHINE',$vmId.ToString())).Translate([Security.Principal.SecurityIdentifier])
+    # Hyper-V assigns the exact VM SID to its VHD/configuration itself. That VM
+    # may traverse only this private parent; it receives no inherited read
+    # access to the outer runner's files or credentials.
+    $rootAcl=Get-Acl -LiteralPath $root
+    $rootAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($vmSid,'Traverse','ContainerInherit','None','Allow'))
+    Set-Acl -LiteralPath $root -AclObject $rootAcl
+    Bounded-Job (Start-VM -VM (Owned-VM) -AsJob) 40|Out-Null
+    $firstSeal=Kvp-Seal 'bootstrap' 720
+    $direct=Open-Direct
+    $initial=Read-GuestReceipt 'bootstrap' $firstSeal
+    $receipt.bootstrap_witness=$initial
+    if($initial.status -cne 'bootstrap_sealed' -or -not $initial.cleanup_credentials_removed){throw 'Guest bootstrap not sealed'}
+    $receipt.actual_guest_boot=$true
+    $receipt.stage='real_guest_reboot'
+    Invoke-Command -Session $direct -ScriptBlock {
+        param($boot)
+        $path='C:\K5GuestWitness\public-config.json';$configuration=Get-Content -LiteralPath $path -Raw|ConvertFrom-Json
+        $configuration.phase='reboot';$configuration.previous_boot_id=$boot
+        [IO.File]::WriteAllText($path,($configuration|ConvertTo-Json -Depth 5),[Text.UTF8Encoding]::new($false))
+    } -ArgumentList $initial.boot_id -ErrorAction Stop
+    Remove-PSSession -Session $direct;$direct=$null
+    Bounded-Job (Restart-VM -VM (Owned-VM) -Force -AsJob -Confirm:$false) 40|Out-Null
+    $rebootSeal=Kvp-Seal 'reboot' 240
+    $direct=Open-Direct
+    $reboot=Read-GuestReceipt 'reboot' $rebootSeal;$receipt.reboot_witness=$reboot
+    if($reboot.status -cne 'reboot_sealed' -or -not $reboot.startup_before_interactive_login -or -not $reboot.recording_after_reboot -or -not $reboot.retained_closed_hashes_unchanged -or $reboot.boot_id -ceq $initial.boot_id){throw 'Reboot recording witness failed'}
+    $receipt.recording_after_reboot_before_login=$true
+    $receipt.stage='actual_console_logon'
+    # After the pre-login receipt has been sealed and verified, simulate an
+    # ordinary secure-attention/password login on the isolated guest keyboard.
+    # The password travels only as an in-memory CIM method argument.
+    $keyboard=@(Get-CimInstance -Namespace root/virtualization/v2 -ClassName Msvm_Keyboard -Filter ("SystemName='"+$vmId.ToString()+"'"))
+    if($keyboard.Count -ne 1){throw 'Owned guest keyboard unavailable'}
+    if((Invoke-CimMethod -InputObject $keyboard[0] -MethodName TypeCtrlAltDel).ReturnValue -ne 0){throw 'Guest secure attention failed'}
+    Start-Sleep -Seconds 2
+    if((Invoke-CimMethod -InputObject $keyboard[0] -MethodName TypeText -Arguments @{asciiText=$password}).ReturnValue -ne 0){throw 'Guest keyboard input failed'}
+    if((Invoke-CimMethod -InputObject $keyboard[0] -MethodName TypeKey -Arguments @{keyCode=[uint32]13}).ReturnValue -ne 0){throw 'Guest keyboard confirmation failed'}
+    $password=$null
+    $logonWatch=[Diagnostics.Stopwatch]::StartNew();$interactive=0
+    do{
+        $interactive=Invoke-Command -Session $direct -ScriptBlock {
+            @(Get-CimInstance Win32_Process -Filter "Name='explorer.exe'"|Where-Object{$_.SessionId -gt 0}).Count
+        } -ErrorAction Stop
+        if($interactive -gt 0){break};Start-Sleep -Seconds 1
+    }while($logonWatch.Elapsed.TotalSeconds -lt 60)
+    if($interactive -lt 1){throw 'Actual interactive guest login not observed'}
+    $receipt.stage='actual_guest_signout'
+    Invoke-Command -Session $direct -ScriptBlock {
+        param($boot,$transfer)
+        $path='C:\K5GuestWitness\public-config.json';$configuration=Get-Content -LiteralPath $path -Raw|ConvertFrom-Json
+        $configuration.phase='signout';$configuration.previous_boot_id=$boot
+        [IO.File]::WriteAllText($path,($configuration|ConvertTo-Json -Depth 5),[Text.UTF8Encoding]::new($false))
+        Start-ScheduledTask -TaskName ('K5GuestWitness-'+$transfer)
+    } -ArgumentList $reboot.boot_id,$transfer -ErrorAction Stop
+    Remove-PSSession -Session $direct;$direct=$null
+    $signoutSeal=Kvp-Seal 'signout' 120
+    $direct=Open-Direct
+    $signout=Read-GuestReceipt 'signout' $signoutSeal;$receipt.signout_witness=$signout
+    if($signout.status -cne 'signout_sealed' -or -not $signout.recording_after_signout -or $signout.boot_id -cne $reboot.boot_id){throw 'Signout recording witness failed'}
+    $receipt.recording_after_actual_signout=$true
+    $receipt.stage='retained_media_decode'
+    $relative=Invoke-Command -Session $direct -ScriptBlock {
+        $baseline=Get-Content -LiteralPath 'C:\K5GuestWitness\baseline.json' -Raw|ConvertFrom-Json
+        [string]$baseline.files[0].path
+    } -ErrorAction Stop
+    if($relative.Length -gt 512 -or $relative -notmatch '^[A-Za-z0-9_./\\+\-]+\.mp4$' -or $relative.Contains('..') -or [IO.Path]::IsPathRooted($relative)){throw 'Retained path refused'}
+    $retained=Join-Path $root 'retained.mp4'
+    Copy-Item -FromSession $direct -LiteralPath ('C:\ProgramData\K5Vision\recordings\'+$relative) -Destination $retained -ErrorAction Stop
+    $probeInfo=[Diagnostics.ProcessStartInfo]::new($FFprobe,('-v error -select_streams v:0 -count_frames -show_entries stream=codec_name,nb_read_frames -of json '+$retained))
+    $probeInfo.UseShellExecute=$false;$probeInfo.CreateNoWindow=$true;$probeInfo.RedirectStandardOutput=$true;$probeInfo.RedirectStandardError=$true
+    $probe=[Diagnostics.Process]::Start($probeInfo);$probe.BeginErrorReadLine();$probeOutput=$probe.StandardOutput.ReadToEndAsync()
+    try{
+        if(-not $probe.WaitForExit(30000) -or $probe.ExitCode -ne 0){throw 'Retained frame inspection failed'}
+        $probeJson=$probeOutput.GetAwaiter().GetResult()
+        if($probeJson.Length -gt 65536){throw 'Retained inspection output too large'}
+        $inspected=$probeJson|ConvertFrom-Json
+        if(@($inspected.streams).Count -ne 1 -or [string]$inspected.streams[0].nb_read_frames -notmatch '^\d+$' -or [long]$inspected.streams[0].nb_read_frames -lt 10){throw 'Retained clip has insufficient decoded frames'}
+        $receipt.retained_frames_inspected=[long]$inspected.streams[0].nb_read_frames
+    }finally{if(-not $probe.HasExited){$probe.Kill();$probe.WaitForExit(2000)|Out-Null};$probe.Dispose()}
+    $decode=Start-OwnedProcess $FFmpeg ('-nostdin -v error -i '+$retained+' -frames:v 10 -f null -')
+    try{if(-not $decode.WaitForExit(30000) -or $decode.ExitCode -ne 0){throw 'Retained media decode failed'}}finally{if(-not $decode.HasExited){$decode.Kill();$decode.WaitForExit(2000)|Out-Null};$decode.Dispose()}
+    $receipt.retained_media_decoded=$true;$receipt.retained_decoded_frames=10
+    $receipt.outcome='installer_guest_recording_observed';$receipt.stage='complete'
+}catch{
+    $receipt.failure_kind=$_.Exception.GetType().Name;$receipt.failure_hresult=$_.Exception.HResult
+    if($_.Exception -is [ComponentModel.Win32Exception]){$receipt.failure_native_code=$_.Exception.NativeErrorCode}
+}finally{
+    $password=$null
+    if($null -ne $credential){$credential.Password.Dispose();$credential=$null}
+    try{
+        if($null -ne $direct){Remove-PSSession -Session $direct;$direct=$null}
+        if($null -ne $vmId){
+            $vm=Owned-VM
+            if([string]$vm.State -ne 'Off'){Bounded-Job (Stop-VM -VM $vm -TurnOff -Force -AsJob -Confirm:$false) 30|Out-Null}
+            $vm=Owned-VM;if([string]$vm.State -ne 'Off'){throw 'Owned VM did not stop'}
+            Bounded-Job (Remove-VM -VM $vm -Force -AsJob -Confirm:$false) 30|Out-Null
+            if($null -ne (Get-VM -Id $vmId -ErrorAction SilentlyContinue)){throw 'Owned VM remains'}
+        }
+        foreach($process in @($publisherProcess,$mediaProcess)){
+            if($null -ne $process){if(-not $process.HasExited){$process.Kill();if(-not $process.WaitForExit(5000)){throw 'Owned source process remains'}};$process.Dispose()}
+        }
+        if($null -ne $firewallName){Remove-NetFirewallRule -Name $firewallName -ErrorAction Stop}
+        if($null -ne $switchId){
+            $switch=Get-VMSwitch -Id $switchId
+            if($switch.Name -cne $switchName -or [string]$switch.SwitchType -ne 'Internal'){throw 'Owned internal switch changed'}
+            if($null -ne $hostInterface){Get-NetIPAddress -InterfaceIndex $hostInterface -IPAddress $hostIPAddress -ErrorAction SilentlyContinue|Remove-NetIPAddress -Confirm:$false}
+            Remove-VMSwitch -VMSwitch $switch -Force -Confirm:$false
+        }
+        if($mounted){
+            $attached=Get-VHD -Path $image
+            if(-not $attached.Attached -or [int]$attached.DiskNumber -ne $diskNumber -or [string](Get-Disk -Number $diskNumber).UniqueId -cne $diskId){throw 'Owned disk mount changed'}
+            if($null -ne $partitionNumber){Remove-PartitionAccessPath -DiskNumber $diskNumber -PartitionNumber $partitionNumber -AccessPath $accessPath}
+            Dismount-VHD -Path $image;$mounted=$false
+        }
+        if($null -ne $root){
+            Assert-Root
+            if(@(Get-ChildItem -LiteralPath $root -Recurse -Force|Where-Object{($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0}).Count){throw 'Owned guest tree has reparse point'}
+            Remove-Item -LiteralPath $root -Recurse -Force
+            if(Test-Path -LiteralPath $root){throw 'Owned guest tree remains'}
+        }
+    }catch{$receipt.cleanup_complete=$false;$receipt.cleanup_hresult=$_.Exception.HResult}
+}
+$receipt|ConvertTo-Json -Depth 15 -Compress
+if(-not $receipt.cleanup_complete){exit 2}
+exit 0
