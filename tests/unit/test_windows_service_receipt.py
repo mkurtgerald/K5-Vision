@@ -16,6 +16,36 @@ _VERIFIER = runpy.run_path(
 _HEAD, _SETUP = "a" * 40, "b" * 64
 
 
+def _oidc_receipt(observations):
+    counters = {
+        "token_requests": 1,
+        "authenticated_token_requests": 0,
+        "client_auth_rejections": 1,
+        "pkce_verifications": 0,
+        "signed_tokens": 0,
+        "failed": False,
+    }
+    phases = {}
+    for phase in _VERIFIER["_OIDC_PHASES"]:
+        before = counters.copy()
+        for key in _VERIFIER["_OIDC_COUNTERS"] - {"client_auth_rejections"}:
+            counters[key] += 1
+        phases[phase] = {
+            **{key: observations[phase][key] for key in _VERIFIER["_OIDC_IDENTITY"]},
+            **dict.fromkeys(_VERIFIER["_OIDC_HASHES"], "a" * 64),
+            **dict.fromkeys(_VERIFIER["_OIDC_PHASE_TRUE"], True),
+            "before": before,
+            "after": counters.copy(),
+        }
+    for key in _VERIFIER["_OIDC_COUNTERS"] - {"client_auth_rejections"}:
+        counters[key] += 1
+    return {
+        **dict.fromkeys(_VERIFIER["_OIDC_TRUE"], True),
+        "phases": phases,
+        "final_provider_observations": counters,
+    }
+
+
 def _receipt():
     observations = {}
     for index, phase in enumerate(_VERIFIER["_PHASES"]):
@@ -66,6 +96,7 @@ def _receipt():
             "installed_executable_verified": True,
         },
         "observations": observations,
+        "oidc_restart": _oidc_receipt(observations),
         "standard_windows_user": {
             **dict.fromkeys(_VERIFIER["_STANDARD_TRUE"], True),
             **dict.fromkeys(_VERIFIER["_STANDARD_FALSE"], False),
@@ -130,6 +161,61 @@ def test_service_receipt_accepts_only_installer_bound_real_process_and_recording
 ):
     value = _receipt()
     assert _verify(_report(tmp_path, value)) == value
+
+
+@pytest.mark.parametrize("field", sorted(_VERIFIER["_OIDC_TRUE"]))
+@pytest.mark.parametrize("replacement", [False, 1, None])
+def test_service_receipt_requires_actual_confidential_oidc_negatives_and_cleanup(
+    tmp_path, field, replacement
+):
+    value = _receipt()
+    value["oidc_restart"][field] = replacement
+    with pytest.raises(ValueError):
+        _verify(_report(tmp_path, value))
+
+
+@pytest.mark.parametrize("phase", _VERIFIER["_OIDC_PHASES"])
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"service_pid": 999},
+        {"backend_created": 99.0},
+        {"protected_secret_sha256": "changed-not-retained"},
+        {"provider_revision_sha256": "f" * 64},
+        {"signed_pkce_secret_exchange": False},
+        {"linked_viewer_role_preserved": 1},
+        {"client_secret": "must-never-qualify"},
+    ],
+)
+def test_service_receipt_binds_confidential_exchanges_to_each_actual_recorder_generation(
+    tmp_path, phase, change
+):
+    value = _receipt()
+    value["oidc_restart"]["phases"][phase].update(change)
+    with pytest.raises(ValueError):
+        _verify(_report(tmp_path, value))
+
+
+@pytest.mark.parametrize("phase", _VERIFIER["_OIDC_PHASES"])
+@pytest.mark.parametrize("field", sorted(_VERIFIER["_OIDC_COUNTERS"]) + ["failed"])
+def test_service_receipt_requires_new_actual_token_pkce_signature_and_secret_use_per_restart(
+    tmp_path, phase, field
+):
+    value = _receipt()
+    current = value["oidc_restart"]["phases"][phase]
+    current["after"][field] = True if field == "failed" else current["before"][field]
+    if field == "client_auth_rejections":
+        current["after"][field] = 2
+    with pytest.raises(ValueError):
+        _verify(_report(tmp_path, value))
+
+
+@pytest.mark.parametrize("field", sorted(_VERIFIER["_OIDC_COUNTERS"]))
+def test_service_receipt_requires_actual_final_idp_exchange_even_after_unlink(tmp_path, field):
+    value = _receipt()
+    value["oidc_restart"]["final_provider_observations"][field] = False
+    with pytest.raises(ValueError):
+        _verify(_report(tmp_path, value))
 
 
 @pytest.mark.parametrize(

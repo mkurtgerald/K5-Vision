@@ -29,6 +29,7 @@ _TRUE = {
     "retained_users_roles",
     "retained_storage_policy",
     "service_token_mfa_decrypted_after_restart",
+    "service_token_oidc_secret_after_restart",
     "mfa_required_after_restart",
     "retained_playback_decoded",
     "retained_export_decoded",
@@ -41,7 +42,6 @@ _FALSE = {
     "actual_reboot_before_login",
     "actual_windows_logoff",
     "actual_clock_corrections",
-    "service_token_oidc_secret_after_restart",
     "physical_camera_acceptance",
     "capacity_acceptance",
     "endurance_acceptance",
@@ -80,6 +80,7 @@ _FIELDS = {
     "clock_health_after_restart",
     "standard_windows_user",
     "startup_shutdown",
+    "oidc_restart",
     "process_ownership",
 }
 _OWNERSHIP_TRUE = {
@@ -154,6 +155,83 @@ _STARTUP_FIELDS = {
     "observed_stage",
     "stop_seconds",
 }
+_OIDC_TRUE = {
+    "actual_gui_secret_configuration",
+    "secret_write_only",
+    "wrong_secret_callback_denied",
+    "wrong_secret_issued_session_denied",
+    "revoked_session_denied",
+    "unlinked_identity_callback_denied",
+    "provider_disabled_after_check",
+    "idp_owned_cleanup",
+}
+_OIDC_PHASES = ("initial", "backend_recovered", "wrapper_recovered")
+_OIDC_IDENTITY = {"service_pid", "service_created", "backend_pid", "backend_created"}
+_OIDC_HASHES = {"protected_secret_sha256", "provider_revision_sha256"}
+_OIDC_PHASE_TRUE = {"signed_pkce_secret_exchange", "linked_viewer_role_preserved"}
+_OIDC_COUNTERS = {
+    "token_requests",
+    "authenticated_token_requests",
+    "client_auth_rejections",
+    "pkce_verifications",
+    "signed_tokens",
+}
+
+
+def _oidc_observation(value):
+    _require(type(value) is dict and set(value) == _OIDC_COUNTERS | {"failed"})
+    _require(value["failed"] is False)
+    for key in _OIDC_COUNTERS:
+        _integer(value[key], 0, 16)
+
+
+def _oidc_restart(value, observations):
+    _require(
+        type(value) is dict and set(value) == _OIDC_TRUE | {"phases", "final_provider_observations"}
+    )
+    _require(all(value[key] is True for key in _OIDC_TRUE))
+    phases = value["phases"]
+    _require(type(phases) is dict and set(phases) == set(_OIDC_PHASES))
+    previous = {
+        "token_requests": 1,
+        "authenticated_token_requests": 0,
+        "client_auth_rejections": 1,
+        "pkce_verifications": 0,
+        "signed_tokens": 0,
+        "failed": False,
+    }
+    fingerprints = set()
+    for phase in _OIDC_PHASES:
+        current = phases[phase]
+        _require(
+            type(current) is dict
+            and set(current)
+            == _OIDC_IDENTITY | _OIDC_HASHES | _OIDC_PHASE_TRUE | {"before", "after"}
+        )
+        _require(all(current[key] is True for key in _OIDC_PHASE_TRUE))
+        for prefix in ("service", "backend"):
+            _integer(current[prefix + "_pid"], 1, 2**32 - 1)
+            _number(current[prefix + "_created"], 1, 2**53)
+        _require(all(current[key] == observations[phase][key] for key in _OIDC_IDENTITY))
+        for key in _OIDC_HASHES:
+            _require(type(current[key]) is str and _HASH.fullmatch(current[key]) is not None)
+        fingerprints.add(tuple(current[key] for key in sorted(_OIDC_HASHES)))
+        before, after = current["before"], current["after"]
+        _oidc_observation(before)
+        _oidc_observation(after)
+        _require(before == previous)
+        for key in _OIDC_COUNTERS - {"client_auth_rejections"}:
+            _require(after[key] == before[key] + 1)
+        _require(after["client_auth_rejections"] == 1)
+        previous = after
+    _require(len(fingerprints) == 1)
+    final = value["final_provider_observations"]
+    _oidc_observation(final)
+    _require(final["client_auth_rejections"] == 1)
+    # The final unlinked attempt authenticates to the generated IdP, whose
+    # signed token the installed recorder must refuse for lack of a link.
+    for key in _OIDC_COUNTERS - {"client_auth_rejections"}:
+        _require(final[key] == previous[key] + 1)
 
 
 def _require(value):
@@ -302,6 +380,7 @@ def verify(report: Path, *, expected_head: str, installer_sha256: str) -> dict:
         _require(identities["initial"] == identities["client_closed"])
         _require(identities["backend_recovered"] != identities["client_closed"])
         _require(identities["wrapper_recovered"] != identities["backend_recovered"])
+    _oidc_restart(value["oidc_restart"], phases)
     ordinary = value["standard_windows_user"]
     _require(
         type(ordinary) is dict

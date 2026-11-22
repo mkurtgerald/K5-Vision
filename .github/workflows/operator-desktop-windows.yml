@@ -18,6 +18,9 @@ on:
       - tests/integration/test_windows_desktop_app.py
       - tests/integration/test_windows_service*.py
       - tests/integration/windows_service_acceptance.py
+      - tests/integration/installed_service_oidc_acceptance.py
+      - tests/integration/installed_settings_acceptance.py
+      - tests/unit/test_installed_service_oidc_fixture.py
       - tests/integration/windows_standard_user_acceptance.py
       - tests/integration/windows_standard_user_probe.cs
       - tests/integration/windows_process_identity.py
@@ -778,14 +781,16 @@ jobs:
         run: |
           python -m pip install -e ".[dev]" "playwright==1.58.0"
           if ($LASTEXITCODE -ne 0) { throw "Cross-revision test dependency installation failed" }
-      - name: Provision immutable native worker build tools
-        uses: ./.github/actions/provision-operator-tools
       - name: Checkout previously qualified immutable baseline revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: b21cdfb1bb5b8605c77f7dac0957cc6651bd0bd5
           path: baseline-source
           persist-credentials: false
+      - name: Provision the exact historical baseline's pinned native worker build tools
+        uses: ./.github/actions/provision-operator-tools
+        with:
+          manifest-root: baseline-source
       - name: Build complete native baseline package from pinned source
         shell: pwsh
         timeout-minutes: 12
@@ -1018,7 +1023,7 @@ jobs:
       - name: Verify fail-closed native service receipt admission
         shell: pwsh
         run: |
-          python -m pytest tests/unit/test_windows_service_receipt.py tests/unit/test_windows_service_workflow.py tests/unit/test_windows_service_failure_diagnostic.py -o addopts= --no-cov --tb=short
+          python -m pytest tests/unit/test_windows_service_receipt.py tests/unit/test_windows_service_workflow.py tests/unit/test_windows_service_failure_diagnostic.py tests/unit/test_installed_service_oidc_fixture.py -o addopts= --no-cov --tb=short
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Exercise independent recording and actual SCM failure recovery
         timeout-minutes: 8

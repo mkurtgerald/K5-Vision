@@ -103,6 +103,12 @@ Windows acceptance receipt that establishes:
   recording hashes.
 - Authorized login, camera administration, decoded retained playback, and an
   exported MP4 that exists and opens after recovery.
+- A confidential OIDC provider configured through authenticated graphical
+  administration, with actual signed PKCE/client-secret exchanges before and
+  after each recorder replacement. Unchanged protected-secret fingerprints,
+  wrong-secret denial, linked local roles, and unlink/session revocation must
+  accompany the exchanges. Provider readback alone is insufficient. The
+  generated loopback IdP does not qualify an external identity tenant.
 - Recording after a real Windows sign-out and after a real reboot before an
   interactive sign-in. Configuration readback does not establish either.
 - Matching native camera, administration, motion, storage, and clock gates,

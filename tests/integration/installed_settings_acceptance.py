@@ -18,7 +18,7 @@ import threading
 import time
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlencode, urlsplit
+from urllib.parse import parse_qs, quote, urlencode, urlsplit
 from uuid import UUID, uuid4
 
 import jwt
@@ -168,14 +168,19 @@ def _totp(secret):
 class _SignedIdentityProvider:
     """Temporary real OIDC HTTP server; no external tenant or private identity."""
 
-    def __init__(self, callback):
+    def __init__(self, callback, *, client_secret=None):
         self.key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
         self.callback = callback
         self.subject = "generated-installed-subject-" + secrets.token_hex(8)
         self.client_id = "generated-installed-client"
+        self.client_secret = client_secret
         self.group = "generated-k5-operators"
         self.codes, self.lock = {}, threading.Lock()
         self.token_requests = 0
+        self.authenticated_token_requests = 0
+        self.client_auth_rejections = 0
+        self.pkce_verifications = 0
+        self.signed_tokens = 0
         self.pkce_verified = False
         self.failed = False
         outer = self
@@ -206,7 +211,9 @@ class _SignedIdentityProvider:
                                 "response_types_supported": ["code"],
                                 "code_challenge_methods_supported": ["S256"],
                                 "id_token_signing_alg_values_supported": ["RS256"],
-                                "token_endpoint_auth_methods_supported": ["none"],
+                                "token_endpoint_auth_methods_supported": [
+                                    "client_secret_basic" if outer.client_secret else "none"
+                                ],
                             }
                         )
                     elif parts.path == "/keys":
@@ -266,16 +273,26 @@ class _SignedIdentityProvider:
             def do_POST(self):
                 try:
                     count = int(self.headers.get("Content-Length", "0"))
-                    if (
-                        self.path != "/token"
-                        or not 1 <= count <= 16384
-                        or self.headers.get("Authorization")
-                    ):
+                    if self.path != "/token" or not 1 <= count <= 16384:
                         raise ValueError
                     values = parse_qs(self.rfile.read(count).decode())
                     with outer.lock:
                         authorization = outer.codes.pop(values["code"][0])
                         outer.token_requests += 1
+                    if outer.client_secret:
+                        basic = (
+                            quote(outer.client_id, safe="")
+                            + ":"
+                            + quote(outer.client_secret, safe="")
+                        )
+                        expected = "Basic " + base64.b64encode(basic.encode()).decode()
+                        if not hmac.compare_digest(self.headers.get("Authorization", ""), expected):
+                            with outer.lock:
+                                outer.client_auth_rejections += 1
+                            self.respond({"error": "invalid_client"}, 401)
+                            return
+                    elif self.headers.get("Authorization"):
+                        raise ValueError
                     verifier = values["code_verifier"][0]
                     challenge = (
                         base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest())
@@ -288,7 +305,11 @@ class _SignedIdentityProvider:
                         or challenge != authorization["code_challenge"][0]
                     ):
                         raise ValueError
-                    outer.pkce_verified = True
+                    with outer.lock:
+                        outer.pkce_verified = True
+                        outer.pkce_verifications += 1
+                        if outer.client_secret:
+                            outer.authenticated_token_requests += 1
                     now = int(time.time())
                     claims = {
                         "iss": outer.issuer,
@@ -306,6 +327,8 @@ class _SignedIdentityProvider:
                         algorithm="RS256",
                         headers={"kid": "generated-installed-key"},
                     )
+                    with outer.lock:
+                        outer.signed_tokens += 1
                     self.respond(
                         {
                             "id_token": token,
@@ -322,6 +345,18 @@ class _SignedIdentityProvider:
         self.issuer = f"http://127.0.0.1:{self.server.server_port}"
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
+
+    def observations(self):
+        """Only finite outcomes leave the generated provider's private memory."""
+        with self.lock:
+            return {
+                "token_requests": self.token_requests,
+                "authenticated_token_requests": self.authenticated_token_requests,
+                "client_auth_rejections": self.client_auth_rejections,
+                "pkce_verifications": self.pkce_verifications,
+                "signed_tokens": self.signed_tokens,
+                "failed": self.failed,
+            }
 
     def close(self):
         self.server.shutdown()

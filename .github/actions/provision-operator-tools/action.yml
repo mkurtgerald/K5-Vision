@@ -1,21 +1,29 @@
 name: Prepare pinned native operator acceptance tools
-description: Admit official MediaMTX/Caddy archives and development-only FFmpeg by immutable hashes.
+description: Admit pinned MediaMTX/Caddy archives and development-only FFmpeg by immutable hashes.
+inputs:
+  manifest-root:
+    description: Checked-out source directory containing the exact donor manifests to provision.
+    required: false
+    default: .
 runs:
   using: composite
   steps:
     - name: Verify and provision pinned native development tools
       shell: pwsh
+      env:
+        K5_TOOL_MANIFEST_ROOT: ${{ inputs.manifest-root }}
       run: |
         $ErrorActionPreference = "Stop"
-        $mediaManifest = Get-Content -LiteralPath src/k5vision/data/mediamtx-donor-manifest.json -Raw | ConvertFrom-Json
+        $manifestRoot = (Resolve-Path -LiteralPath (Join-Path $env:GITHUB_WORKSPACE $env:K5_TOOL_MANIFEST_ROOT)).Path
+        $mediaManifest = Get-Content -LiteralPath (Join-Path $manifestRoot 'src/k5vision/data/mediamtx-donor-manifest.json') -Raw | ConvertFrom-Json
         $mediaArtifacts = @($mediaManifest.artifacts | Where-Object { $_.platform -eq "windows_amd64" })
         if ($mediaArtifacts.Count -ne 1) { throw "Expected one pinned native Windows MediaMTX archive" }
         $mediaArtifact = $mediaArtifacts[0]
-        $caddyManifest = Get-Content -LiteralPath src/k5vision/data/caddy-donor-manifest.json -Raw | ConvertFrom-Json
+        $caddyManifest = Get-Content -LiteralPath (Join-Path $manifestRoot 'src/k5vision/data/caddy-donor-manifest.json') -Raw | ConvertFrom-Json
         $caddyArtifacts = @($caddyManifest.artifacts | Where-Object { $_.platform -eq "windows_amd64" })
         if ($caddyArtifacts.Count -ne 1) { throw "Expected one pinned native Windows Caddy archive" }
         $caddyArtifact = $caddyArtifacts[0]
-        $testTools = Get-Content -LiteralPath src/k5vision/data/mediamtx-donor-test-tools.json -Raw | ConvertFrom-Json
+        $testTools = Get-Content -LiteralPath (Join-Path $manifestRoot 'src/k5vision/data/mediamtx-donor-test-tools.json') -Raw | ConvertFrom-Json
         foreach ($field in @("url", "sha256", "version", "license", "source")) {
           if ([string]::IsNullOrWhiteSpace([string]$testTools.$field)) {
             throw "Development tool manifest is incomplete"

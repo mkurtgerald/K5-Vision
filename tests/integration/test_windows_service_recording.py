@@ -137,6 +137,7 @@ def _failure_note(error, diagnostic, service):
         "test_operator_product_runtime.py",
         "test_operator_beta_browser.py",
         "installed_settings_acceptance.py",
+        "installed_service_oidc_acceptance.py",
     }
     frames, trace = [], error.__traceback__
     while trace is not None:
@@ -390,7 +391,7 @@ def test_native_windows_unattended_service_recording_and_recovery(record_testsui
         )
     )
     processes, reservations = [], []
-    service = camera = app = form = playwright = browser = context = None
+    service = camera = app = form = playwright = browser = context = oidc = None
     failed = cleanup_failed = False
     diagnostic, receipt, observations = {"stage": "graphical_install"}, {}, {}
     try:
@@ -500,6 +501,20 @@ def test_native_windows_unattended_service_recording_and_recovery(record_testsui
                 "retention_seconds": 86400,
             },
         )
+        oidc = _helpers("installed_service_oidc_acceptance").ServiceOIDCProof(
+            settings=settings,
+            runtime=runtime,
+            origin=client.origin,
+            profile=profile,
+            diagnostic=diagnostic,
+        )
+        receipt["oidc_restart"] = oidc.evidence
+        oidc.prepare(
+            page=page,
+            administrator=client,
+            camera_id=camera_id,
+            service_observation=service.observe(),
+        )
         enrollment = client.json(
             "/api/v1/operator/security/mfa/enroll",
             method="POST",
@@ -604,6 +619,7 @@ def test_native_windows_unattended_service_recording_and_recovery(record_testsui
         )
         _factor_login(client, username, password, recovery[1])
         observations["backend_recovered"] = _growth(service, desktop, profile, client, camera_id)
+        oidc.exchange("backend_recovered", observations["backend_recovered"])
         receipt["backend_failure_scm_recovery"] = True
         diagnostic["stage"] = "scm_wrapper_failure"
         service.kill_owned(observations["backend_recovered"], backend=False)
@@ -623,10 +639,13 @@ def test_native_windows_unattended_service_recording_and_recovery(record_testsui
         )
         _factor_login(client, username, password, settings._totp(secret))
         observations["wrapper_recovered"] = _growth(service, desktop, profile, client, camera_id)
+        oidc.exchange("wrapper_recovered", observations["wrapper_recovered"])
+        oidc.revoke(client)
         receipt.update(
             wrapper_failure_scm_recovery=True,
             mfa_required_after_restart=True,
             service_token_mfa_decrypted_after_restart=True,
+            service_token_oidc_secret_after_restart=True,
             observations=observations,
         )
         after = _retained_state(client, profile)
@@ -752,6 +771,7 @@ def test_native_windows_unattended_service_recording_and_recovery(record_testsui
             ("browser_context", context),
             ("browser", browser),
             ("playwright", playwright),
+            ("generated_oidc_provider", oidc),
         ):
             if resource is not None:
                 try:
@@ -833,7 +853,6 @@ def test_native_windows_unattended_service_recording_and_recovery(record_testsui
         "actual_reboot_before_login",
         "actual_windows_logoff",
         "actual_clock_corrections",
-        "service_token_oidc_secret_after_restart",
         "physical_camera_acceptance",
         "capacity_acceptance",
         "endurance_acceptance",
