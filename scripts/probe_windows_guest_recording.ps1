@@ -240,7 +240,14 @@ function Read-BootFailureLive {
             $facts.thumbnail_subphase='byte_geometry'
             $pixels=[byte[]]$thumbnail.ImageData
             $facts.thumbnail_byte_count=[int]$pixels.Length
-            if($pixels.Length -ne 640*480*2){throw 'Thumbnail byte geometry differs'}
+            if($pixels.Length -ne 640*480*2){
+                if($pixels.Length -gt 0 -and $pixels.Length -le 614416){
+                    # Preserve the exact bounded native output for offline
+                    # diagnosis; do not guess whether extra bytes are a header.
+                    $facts.thumbnail_rgb565_base64=[Convert]::ToBase64String($pixels)
+                }
+                throw 'Thumbnail byte geometry differs'
+            }
             $facts.thumbnail_subphase='bitmap_allocation'
             Add-Type -AssemblyName System.Drawing
             $bitmap=[Drawing.Bitmap]::new(640,480,[Drawing.Imaging.PixelFormat]::Format16bppRgb565)
@@ -279,11 +286,17 @@ function Read-SetupState([string]$WindowsVolume) {
         try{
             foreach($suffix in @('','.LOG1','.LOG2')){
                 $note.subphase='snapshot_metadata';$note.suffix=if($suffix -ceq ''){'main'}elseif($suffix -ceq '.LOG1'){'log1'}else{'log2'}
-                $candidate=$source+$suffix
-                if(-not(Test-Path -LiteralPath $candidate -PathType Leaf)){continue}
-                $info=Get-Item -LiteralPath $candidate
-                if($info.Length -gt 268435456 -or ($info.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0){throw 'Setup hive copy bound refused'}
-                $note.subphase='snapshot_copy';Copy-Item -LiteralPath $candidate -Destination ($copy+$suffix)
+                try{
+                    $candidate=$source+$suffix
+                    if(-not(Test-Path -LiteralPath $candidate -PathType Leaf)){continue}
+                    $info=Get-Item -LiteralPath $candidate
+                    if($info.Length -gt 268435456 -or ($info.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0){throw 'Setup hive copy bound refused'}
+                    $note.subphase='snapshot_copy';Copy-Item -LiteralPath $candidate -Destination ($copy+$suffix)
+                }catch{
+                    if($suffix -ceq ''){throw}
+                    if(-not $note.ContainsKey('sidecar_errors')){$note.sidecar_errors=@()}
+                    $note.sidecar_errors+=@{subphase=$note.subphase;suffix=$note.suffix;failure_kind=$_.Exception.GetType().Name;hresult=$_.Exception.HResult}
+                }
             }
             $note.subphase='hive_load';$note.suffix='none'
             & (Join-Path $env:SystemRoot 'System32\reg.exe') load ('HKLM\'+$hiveName) $copy 2>&1|Out-Null
@@ -569,8 +582,11 @@ try{
     $escaped=[Security.SecurityElement]::Escape($password)
     $unattend=@"
 <?xml version="1.0" encoding="utf-8"?>
-<unattend xmlns="urn:schemas-microsoft-com:unattend">
- <settings pass="specialize"><component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS"><ComputerName>K5GUEST</ComputerName><TimeZone>UTC</TimeZone></component></settings>
+<unattend xmlns="urn:schemas-microsoft-com:unattend" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+ <settings pass="specialize">
+ <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS"><ComputerName>K5GUEST</ComputerName><TimeZone>UTC</TimeZone></component>
+ <component name="Microsoft-Windows-Deployment" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS"><RunSynchronous><RunSynchronousCommand wcm:action="add"><Order>1</Order><Path>C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File C:\K5GuestWitness\windows_guest_witness.ps1 -Mode Setup</Path><WillReboot>Never</WillReboot></RunSynchronousCommand></RunSynchronous></component>
+ </settings>
  <settings pass="oobeSystem"><component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
  <OOBE><HideEULAPage>true</HideEULAPage><HideOnlineAccountScreens>true</HideOnlineAccountScreens><HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE><ProtectYourPC>3</ProtectYourPC></OOBE>
  <UserAccounts><AdministratorPassword><Value>$escaped</Value><PlainText>true</PlainText></AdministratorPassword></UserAccounts>
@@ -586,10 +602,6 @@ try{
     foreach($sid in @('S-1-5-18','S-1-5-32-544')){$answerAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new($sid),'FullControl','Allow'))}
     Set-Acl -LiteralPath $answerPath -AclObject $answerAcl
     [IO.File]::WriteAllText($answerPath,$unattend,[Text.UTF8Encoding]::new($false));$unattend=$null;$escaped=$null
-    $setupScripts=Join-Path $windows 'Windows\Setup\Scripts';if(-not(Test-Path -LiteralPath $setupScripts)){New-Item -ItemType Directory -Path $setupScripts|Out-Null}
-    $complete=Join-Path $setupScripts 'SetupComplete.cmd';$prior=''
-    if(Test-Path -LiteralPath $complete){Copy-Item -LiteralPath $complete -Destination (Join-Path $guestRoot 'SetupComplete.original.cmd');$prior='call C:\K5GuestWitness\SetupComplete.original.cmd'+"`r`n"}
-    [IO.File]::WriteAllText($complete,('@echo off'+"`r`n"+$prior+'%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File C:\K5GuestWitness\windows_guest_witness.ps1 -Mode Setup'+"`r`n"+'exit /b %errorlevel%'+"`r`n"),[Text.ASCIIEncoding]::new())
     $security=(Get-Acl -LiteralPath $guestRoot)
     foreach($file in @(Get-ChildItem -LiteralPath $guestRoot -File)){
         $acl=[Security.AccessControl.FileSecurity]::new();$acl.SetOwner([Security.Principal.SecurityIdentifier]::new('S-1-5-32-544'));$acl.SetAccessRuleProtection($true,$false)
