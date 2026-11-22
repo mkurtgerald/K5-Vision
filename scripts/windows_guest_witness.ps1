@@ -233,67 +233,153 @@ function Security-Checkpoint([string]$Boot,[long]$Sequence) {
         return @{boot_id=$Boot;boot_sequence=$Sequence;record_id=[long]$newest[0].RecordId;oldest_record_id=[long]$oldest[0].RecordId;xml_sha256=(Security-EventHash $newest[0])}
     }finally{foreach($event in (@($newest)+@($oldest))){if($event -is [IDisposable]){$event.Dispose()}}}
 }
+function Add-SecurityPolicyDiagnostic($Event,[hashtable]$Diagnostic) {
+    # Optional details on an event that already causes refusal. Export only
+    # native audit-family category IDs and recognized enable/disable bit roles.
+    try {
+        [xml]$policy=$Event.ToXml()
+        $guidFields=@($policy.Event.EventData.Data|Where-Object{$_.Name -ieq 'SubcategoryGuid'})
+        if($guidFields.Count -eq 1){
+            $guid=[guid]::Empty
+            if([guid]::TryParse([string]$guidFields[0].'#text',[ref]$guid)){
+                $value=$guid.ToString()
+                if($value -cmatch '^0cce92[1-7][0-9a-f]-69ae-11d9-bed3-505054503030$'){$Diagnostic.policy_subcategory_guid=$value}
+            }
+        }
+        $changes=@($policy.Event.EventData.Data|Where-Object{$_.Name -ceq 'AuditPolicyChanges'})
+        if($changes.Count -eq 1){
+            $parts=@(([string]$changes[0].'#text') -split '[,\s]+'|Where-Object{$_ -ne ''})
+            if($parts.Count -ge 1 -and $parts.Count -le 4 -and @($parts|Where-Object{$_ -cnotmatch '^%%(?:8448|8449|8450|8451)$'}).Count -eq 0){
+                $Diagnostic.policy_change_tokens_recognized=$true
+                $Diagnostic.policy_success_removed=('%%8448' -cin $parts);$Diagnostic.policy_success_added=('%%8449' -cin $parts)
+                $Diagnostic.policy_failure_removed=('%%8450' -cin $parts);$Diagnostic.policy_failure_added=('%%8451' -cin $parts)
+            }else{$Diagnostic.policy_change_tokens_recognized=$false}
+        }
+    }catch{$Diagnostic.policy_detail_unavailable=$true}
+}
+function Save-SecurityAuditFailure([hashtable]$Diagnostic,$Failure) {
+    $allowedStages=@('checkpoint_admission','oldest_newest_query','checkpoint_query','event_range_query','event_range_validation','startup_validation','logon_validation','retained_anchor_query','native_policy_wts_context','native_logon_policy','native_startup_policy','native_wts_sessions','tail_query','tail_hash','boundary_anchor_query','boundary_tail_query','boundary_tail_hash','tail_stability')
+    $allowedReasons=@('unspecified','sequence_gate','checkpoint_identity','oldest_reset_or_wrap','anchor_not_retained','range_bound','range_gap','record_order','audit_continuity_event','startup_count','logging_shutdown_after_startup','logon_type_unavailable','interactive_logon','anchor_changed','logon_policy_disabled','startup_policy_disabled','interactive_wts_session','stability_deadline','tail_reset','tail_id_reused','context_anchor_changed','final_tail_reset','final_boundary_deadline','final_tail_id_reused','final_hash_deadline','tail_never_stable','event_query_no_matches','native_call_failed')
+    if($null -ne $Failure){
+        $Diagnostic.error_kind=$Failure.Exception.GetType().Name;$Diagnostic.hresult=[long]$Failure.Exception.HResult
+        if($Diagnostic.reason -ceq 'unspecified'){$Diagnostic.reason=if($Failure.FullyQualifiedErrorId -like 'NoMatchingEventsFound,*'){'event_query_no_matches'}else{'native_call_failed'}}
+        $native=$Failure.Exception
+        for($depth=0;$null -ne $native -and $depth -lt 8;$depth++){
+            if($native -is [ComponentModel.Win32Exception]){$Diagnostic.native_code=[long]$native.NativeErrorCode;break}
+            if($native.GetType().FullName -like 'System.Diagnostics.Eventing.Reader.*' -and $native.PSObject.Properties.Name -contains 'ErrorCode'){$Diagnostic.native_code=[long]$native.ErrorCode;break}
+            $native=$native.InnerException
+        }
+    }
+    $copy=@{schema_version=1;stage='checkpoint_admission';reason='unspecified'}
+    if($Diagnostic.stage -cin $allowedStages){$copy.stage=$Diagnostic.stage}
+    if($Diagnostic.reason -cin $allowedReasons){$copy.reason=$Diagnostic.reason}
+    foreach($name in @('stability_attempt','elapsed_ms','checkpoint_record_id','checkpoint_oldest_record_id','oldest_record_id','newest_record_id','range_expected','range_actual','startup_events','startup_record_id','offending_event_id','offending_record_id','offending_logon_type','interactive_logons','interactive_sessions','tail_record_id','hresult','native_code')){
+        if($Diagnostic.ContainsKey($name)){
+            $value=$Diagnostic[$name]
+            if($value -is [long] -or $value -is [int] -or $value -is [uint32] -or $value -is [uint16]){$copy[$name]=[long]$value}
+        }
+    }
+    foreach($name in @('startup_scan_complete','logon_policy_enabled','startup_policy_enabled','policy_detail_unavailable','policy_change_tokens_recognized','policy_success_removed','policy_success_added','policy_failure_removed','policy_failure_added')){
+        if($Diagnostic.ContainsKey($name) -and $Diagnostic[$name] -is [bool]){$copy[$name]=$Diagnostic[$name]}
+    }
+    if($Diagnostic.ContainsKey('policy_subcategory_guid') -and $Diagnostic.policy_subcategory_guid -cmatch '^0cce92[1-7][0-9a-f]-69ae-11d9-bed3-505054503030$'){$copy.policy_subcategory_guid=$Diagnostic.policy_subcategory_guid}
+    if($Diagnostic.ContainsKey('error_kind') -and $Diagnostic.error_kind -cmatch '^[A-Za-z][A-Za-z0-9]{0,63}$'){$copy.error_kind=$Diagnostic.error_kind}
+    $first=Get-Variable -Name securityAuditFirstFailure -Scope Script -ErrorAction SilentlyContinue
+    if($null -eq $first -or $null -eq $first.Value){$script:securityAuditFirstFailure=$copy.Clone()}
+    $script:securityAuditLastFailure=$copy.Clone()
+}
 function Assert-SecurityAuditContext {
-    if(-not [K5GuestNative]::LogonAuditEnabled() -or -not [K5GuestNative]::StartupAuditEnabled()){throw 'Native audit policy coverage unavailable'}
-    if(@([K5GuestNative]::InteractiveSessions()).Count -ne 0){throw 'Interactive session during audit boundary'}
+    $script:securityAuditActiveDiagnostic.stage='native_logon_policy'
+    $script:securityAuditActiveDiagnostic.logon_policy_enabled=[K5GuestNative]::LogonAuditEnabled()
+    if(-not $script:securityAuditActiveDiagnostic.logon_policy_enabled){$script:securityAuditActiveDiagnostic.reason='logon_policy_disabled';throw 'Native audit policy coverage unavailable'}
+    $script:securityAuditActiveDiagnostic.stage='native_startup_policy'
+    $script:securityAuditActiveDiagnostic.startup_policy_enabled=[K5GuestNative]::StartupAuditEnabled()
+    if(-not $script:securityAuditActiveDiagnostic.startup_policy_enabled){$script:securityAuditActiveDiagnostic.reason='startup_policy_disabled';throw 'Native audit policy coverage unavailable'}
+    $script:securityAuditActiveDiagnostic.stage='native_wts_sessions'
+    $script:securityAuditActiveDiagnostic.interactive_sessions=@([K5GuestNative]::InteractiveSessions()).Count
+    if($script:securityAuditActiveDiagnostic.interactive_sessions -ne 0){$script:securityAuditActiveDiagnostic.reason='interactive_wts_session';throw 'Interactive session during audit boundary'}
 }
 function Security-RebootAudit($Checkpoint,[string]$PreviousBoot,[string]$CurrentBoot,[long]$PreviousSequence,[long]$CurrentSequence) {
     $stability=[Diagnostics.Stopwatch]::StartNew()
     for($attempt=0;$attempt -lt 8;$attempt++){
         $oldest=@();$newest=@();$anchor=@();$events=@();$oldestAfter=@();$anchorAfter=@();$tailAfter=@();$boundaryOldest=@();$boundaryAnchor=@();$boundaryTail=@()
+        $diagnostic=@{stage='checkpoint_admission';reason='sequence_gate';stability_attempt=($attempt+1);startup_events=0;startup_scan_complete=$false}
+        $script:securityAuditActiveDiagnostic=$diagnostic
         try{
             Assert-NextBootSequence $PreviousSequence $CurrentSequence
-            if($Checkpoint.boot_id -cne $PreviousBoot -or $CurrentBoot -cne $PreviousBoot -or $Checkpoint.boot_sequence -ne $PreviousSequence -or $Checkpoint.record_id -lt 1 -or $Checkpoint.oldest_record_id -lt 1 -or $Checkpoint.xml_sha256 -cnotmatch '^[a-f0-9]{64}$'){throw 'Security reboot checkpoint differs'}
+            $diagnostic.reason='unspecified'
+            if($Checkpoint.boot_id -cne $PreviousBoot -or $CurrentBoot -cne $PreviousBoot -or $Checkpoint.boot_sequence -ne $PreviousSequence -or $Checkpoint.record_id -lt 1 -or $Checkpoint.oldest_record_id -lt 1 -or $Checkpoint.xml_sha256 -cnotmatch '^[a-f0-9]{64}$'){$diagnostic.reason='checkpoint_identity';throw 'Security reboot checkpoint differs'}
+            $diagnostic.checkpoint_record_id=[long]$Checkpoint.record_id;$diagnostic.checkpoint_oldest_record_id=[long]$Checkpoint.oldest_record_id
+            $diagnostic.stage='oldest_newest_query'
             $oldest=@(Get-WinEvent -LogName Security -MaxEvents 1 -Oldest -ErrorAction Stop)
             $newest=@(Get-WinEvent -LogName Security -MaxEvents 1 -ErrorAction Stop)
-            if($oldest.Count -ne 1 -or $newest.Count -ne 1 -or $oldest[0].RecordId -ne $Checkpoint.oldest_record_id -or $newest[0].RecordId -le $Checkpoint.record_id){throw 'Security log cleared reset or wrapped'}
+            if($oldest.Count -eq 1){$diagnostic.oldest_record_id=[long]$oldest[0].RecordId};if($newest.Count -eq 1){$diagnostic.newest_record_id=[long]$newest[0].RecordId}
+            if($oldest.Count -ne 1 -or $newest.Count -ne 1 -or $oldest[0].RecordId -ne $Checkpoint.oldest_record_id -or $newest[0].RecordId -le $Checkpoint.record_id){$diagnostic.reason='oldest_reset_or_wrap';throw 'Security log cleared reset or wrapped'}
+            $diagnostic.stage='checkpoint_query'
             $anchor=@(Get-WinEvent -LogName Security -FilterXPath ('*[System[EventRecordID={0}]]' -f [long]$Checkpoint.record_id) -MaxEvents 2 -ErrorAction Stop)
-            if($anchor.Count -ne 1 -or (Security-EventHash $anchor[0]) -cne $Checkpoint.xml_sha256){throw 'Security checkpoint was not retained'}
-            $through=[long]$newest[0].RecordId;$count=$through-[long]$Checkpoint.record_id
-            if($count -lt 1 -or $count -gt 4096){throw 'Security event range bound exceeded'}
+            if($anchor.Count -ne 1 -or (Security-EventHash $anchor[0]) -cne $Checkpoint.xml_sha256){$diagnostic.reason='anchor_not_retained';throw 'Security checkpoint was not retained'}
+            $through=[long]$newest[0].RecordId;$count=$through-[long]$Checkpoint.record_id;$diagnostic.range_expected=$count
+            if($count -lt 1 -or $count -gt 4096){$diagnostic.reason='range_bound';throw 'Security event range bound exceeded'}
             $xpath='*[System[EventRecordID>{0} and EventRecordID<={1}]]' -f [long]$Checkpoint.record_id,$through
+            $diagnostic.stage='event_range_query'
             $events=@(Get-WinEvent -LogName Security -FilterXPath $xpath -Oldest -MaxEvents 4097 -ErrorAction Stop)
-            if($events.Count -ne $count){throw 'Security event record range has a gap'}
+            $diagnostic.range_actual=$events.Count
+            if($events.Count -ne $count){$diagnostic.reason='range_gap';throw 'Security event record range has a gap'}
+            $diagnostic.stage='event_range_validation'
             $expected=[long]$Checkpoint.record_id+1;$startup=@()
             foreach($event in $events){
-                if([long]$event.RecordId -ne $expected){throw 'Security event record range changed'};$expected++
-                if($event.Id -in @(1101,1102,1104,1105,4612,4719,4912)){throw 'Security log or audit policy continuity changed'}
-                if($event.Id -eq 4608){$startup+=@($event)}
+                if([long]$event.RecordId -ne $expected){$diagnostic.offending_event_id=[int]$event.Id;$diagnostic.offending_record_id=[long]$event.RecordId;$diagnostic.reason='record_order';throw 'Security event record range changed'};$expected++
+                if($event.Id -in @(1101,1102,1104,1105,4612,4719,4912)){$diagnostic.offending_event_id=[int]$event.Id;$diagnostic.offending_record_id=[long]$event.RecordId;Add-SecurityPolicyDiagnostic $event $diagnostic;$diagnostic.reason='audit_continuity_event';throw 'Security log or audit policy continuity changed'}
+                if($event.Id -eq 4608){$startup+=@($event);$diagnostic.startup_events=$startup.Count;if($startup.Count -eq 1){$diagnostic.startup_record_id=[long]$event.RecordId}}
             }
-            if($startup.Count -ne 1){throw 'Exact new startup audit event unavailable'}
-            [long]$startupId=$startup[0].RecordId;$interactive=0
+            $diagnostic.startup_events=$startup.Count;$diagnostic.startup_scan_complete=$true
+            if($startup.Count -ne 1){$diagnostic.reason='startup_count';throw 'Exact new startup audit event unavailable'}
+            $diagnostic.stage='startup_validation'
+            [long]$startupId=$startup[0].RecordId;$interactive=0;$diagnostic.startup_record_id=$startupId;$diagnostic.stage='logon_validation'
             foreach($event in $events){
-                if($event.Id -eq 1100 -and [long]$event.RecordId -gt $startupId){throw 'Event logging stopped after startup'}
+                if($event.Id -eq 1100 -and [long]$event.RecordId -gt $startupId){$diagnostic.offending_event_id=[int]$event.Id;$diagnostic.offending_record_id=[long]$event.RecordId;$diagnostic.reason='logging_shutdown_after_startup';throw 'Event logging stopped after startup'}
                 if($event.Id -ne 4624 -or [long]$event.RecordId -le $startupId){continue}
                 [xml]$xml=$event.ToXml();$types=@($xml.Event.EventData.Data|Where-Object{$_.Name -ceq 'LogonType'})
-                if($types.Count -ne 1 -or [string]$types[0].'#text' -notmatch '^\d{1,2}$'){throw 'Logon audit type unavailable'}
-                if([string]$types[0].'#text' -in @('2','7','10','11','12','13')){$interactive++}
+                if($types.Count -ne 1 -or [string]$types[0].'#text' -notmatch '^\d{1,2}$'){$diagnostic.offending_event_id=[int]$event.Id;$diagnostic.offending_record_id=[long]$event.RecordId;$diagnostic.reason='logon_type_unavailable';throw 'Logon audit type unavailable'}
+                if([string]$types[0].'#text' -in @('2','7','10','11','12','13')){$interactive++;if(-not $diagnostic.ContainsKey('offending_event_id')){$diagnostic.offending_event_id=[int]$event.Id;$diagnostic.offending_record_id=[long]$event.RecordId;$diagnostic.offending_logon_type=[int]([string]$types[0].'#text')}}
             }
-            if($interactive -ne 0){throw 'Interactive logon preceded boot witness'}
+            $diagnostic.interactive_logons=$interactive
+            if($interactive -ne 0){$diagnostic.reason='interactive_logon';throw 'Interactive logon preceded boot witness'}
+            $diagnostic.stage='retained_anchor_query'
             $oldestAfter=@(Get-WinEvent -LogName Security -MaxEvents 1 -Oldest -ErrorAction Stop)
             $anchorAfter=@(Get-WinEvent -LogName Security -FilterXPath ('*[System[EventRecordID={0}]]' -f [long]$Checkpoint.record_id) -MaxEvents 2 -ErrorAction Stop)
-            if($oldestAfter.Count -ne 1 -or $oldestAfter[0].RecordId -ne $Checkpoint.oldest_record_id -or $anchorAfter.Count -ne 1 -or (Security-EventHash $anchorAfter[0]) -cne $Checkpoint.xml_sha256){throw 'Security log changed during observation'}
+            if($oldestAfter.Count -ne 1 -or $oldestAfter[0].RecordId -ne $Checkpoint.oldest_record_id -or $anchorAfter.Count -ne 1 -or (Security-EventHash $anchorAfter[0]) -cne $Checkpoint.xml_sha256){$diagnostic.reason='anchor_changed';throw 'Security log changed during observation'}
             # Policy and WTS checks are native in production. Then extend the
             # record range if anything arrived while that boundary was sampled.
+            $diagnostic.stage='native_policy_wts_context'
             Assert-SecurityAuditContext
+            $diagnostic.stage='tail_query'
             $tailAfter=@(Get-WinEvent -LogName Security -MaxEvents 1 -ErrorAction Stop)
-            if($stability.Elapsed.TotalSeconds -ge 5){throw [TimeoutException]::new('Security audit stability budget expired')}
-            if($tailAfter.Count -ne 1 -or $tailAfter[0].RecordId -lt $through){throw 'Security tail reset during observation'}
+            if($stability.Elapsed.TotalSeconds -ge 5){$diagnostic.reason='stability_deadline';throw [TimeoutException]::new('Security audit stability budget expired')}
+            if($tailAfter.Count -eq 1){$diagnostic.tail_record_id=[long]$tailAfter[0].RecordId}
+            if($tailAfter.Count -ne 1 -or $tailAfter[0].RecordId -lt $through){$diagnostic.reason='tail_reset';throw 'Security tail reset during observation'}
             if($tailAfter[0].RecordId -gt $through){continue}
+            $diagnostic.stage='tail_hash'
             $tailHash=Security-EventHash $newest[0]
-            if((Security-EventHash $tailAfter[0]) -cne $tailHash){throw 'Security tail record ID was reused'}
+            if((Security-EventHash $tailAfter[0]) -cne $tailHash){$diagnostic.reason='tail_id_reused';throw 'Security tail record ID was reused'}
+            $diagnostic.stage='boundary_anchor_query'
             $boundaryOldest=@(Get-WinEvent -LogName Security -MaxEvents 1 -Oldest -ErrorAction Stop)
             $boundaryAnchor=@(Get-WinEvent -LogName Security -FilterXPath ('*[System[EventRecordID={0}]]' -f [long]$Checkpoint.record_id) -MaxEvents 2 -ErrorAction Stop)
-            if($boundaryOldest.Count -ne 1 -or $boundaryOldest[0].RecordId -ne $Checkpoint.oldest_record_id -or $boundaryAnchor.Count -ne 1 -or (Security-EventHash $boundaryAnchor[0]) -cne $Checkpoint.xml_sha256){throw 'Security log reset during native context'}
+            if($boundaryOldest.Count -ne 1 -or $boundaryOldest[0].RecordId -ne $Checkpoint.oldest_record_id -or $boundaryAnchor.Count -ne 1 -or (Security-EventHash $boundaryAnchor[0]) -cne $Checkpoint.xml_sha256){$diagnostic.reason='context_anchor_changed';throw 'Security log reset during native context'}
+            $diagnostic.stage='boundary_tail_query'
             $boundaryTail=@(Get-WinEvent -LogName Security -MaxEvents 1 -ErrorAction Stop)
-            if($boundaryTail.Count -ne 1 -or $boundaryTail[0].RecordId -lt $through){throw 'Security final tail reset'}
-            if($stability.Elapsed.TotalSeconds -ge 5){throw [TimeoutException]::new('Security audit final boundary expired')}
+            if($boundaryTail.Count -eq 1){$diagnostic.tail_record_id=[long]$boundaryTail[0].RecordId}
+            if($boundaryTail.Count -ne 1 -or $boundaryTail[0].RecordId -lt $through){$diagnostic.reason='final_tail_reset';throw 'Security final tail reset'}
+            if($stability.Elapsed.TotalSeconds -ge 5){$diagnostic.reason='final_boundary_deadline';throw [TimeoutException]::new('Security audit final boundary expired')}
             if($boundaryTail[0].RecordId -gt $through){continue}
-            if((Security-EventHash $boundaryTail[0]) -cne $tailHash){throw 'Security final tail ID was reused'}
-            if($stability.Elapsed.TotalSeconds -ge 5){throw [TimeoutException]::new('Security audit final hash exceeded budget')}
+            $diagnostic.stage='boundary_tail_hash'
+            if((Security-EventHash $boundaryTail[0]) -cne $tailHash){$diagnostic.reason='final_tail_id_reused';throw 'Security final tail ID was reused'}
+            if($stability.Elapsed.TotalSeconds -ge 5){$diagnostic.reason='final_hash_deadline';throw [TimeoutException]::new('Security audit final hash exceeded budget')}
             return @{checkpoint_retained=$true;no_clear_reset_wrap=$true;policy_coverage_verified=$true;tail_stable=$true;startup_event_id=4608;startup_record_id=$startupId;through_record_id=$through;interactive_logons=0;stability_attempts=($attempt+1)}
-        }finally{foreach($event in (@($oldest)+@($newest)+@($anchor)+@($events)+@($oldestAfter)+@($anchorAfter)+@($tailAfter)+@($boundaryOldest)+@($boundaryAnchor)+@($boundaryTail))){if($event -is [IDisposable]){$event.Dispose()}}}
+        }catch{$diagnostic.elapsed_ms=$stability.ElapsedMilliseconds;Save-SecurityAuditFailure $diagnostic $_;throw}finally{foreach($event in (@($oldest)+@($newest)+@($anchor)+@($events)+@($oldestAfter)+@($anchorAfter)+@($tailAfter)+@($boundaryOldest)+@($boundaryAnchor)+@($boundaryTail))){if($event -is [IDisposable]){$event.Dispose()}}}
     }
+    $diagnostic.stage='tail_stability';$diagnostic.reason='tail_never_stable';$diagnostic.elapsed_ms=$stability.ElapsedMilliseconds;$diagnostic.error_kind='TimeoutException'
+    Save-SecurityAuditFailure $diagnostic $null
     throw [TimeoutException]::new('Security audit tail did not stabilize')
 }
 
@@ -396,6 +482,7 @@ try {
         $receipt.closed_recording_count = $closed.Count
         $receipt.status = 'bootstrap_sealed'
     } elseif ($phase -eq 'reboot') {
+        $script:securityAuditFirstFailure=$null;$script:securityAuditLastFailure=$null
         $observationStage='reboot_identity'
         Write-EntryDiagnostic 'observer-stage-reboot.json' @{schema_version=1;phase=$phase;status='observing';stage=$observationStage;boot_id=$boot;observer_session=$guestWitnessSession}
         $rebootWatch=[Diagnostics.Stopwatch]::StartNew()
@@ -510,6 +597,7 @@ try {
     $receipt.error_kind = $_.Exception.GetType().Name
     $receipt.hresult = $_.Exception.HResult
     $receipt.failure_stage=$observationStage
+    if($phase -ceq 'reboot' -and $null -ne $script:securityAuditLastFailure){$receipt.security_audit_diagnostic=@{first_failure=$script:securityAuditFirstFailure;last_failure=$script:securityAuditLastFailure}}
 }
 $hash = Write-PrivateJson ($phase + '-witness.json') $receipt
 Publish-Seal $phase $boot $hash
