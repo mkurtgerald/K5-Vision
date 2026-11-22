@@ -238,3 +238,265 @@ jobs:
           path: windows-owner-facts.json
           if-no-files-found: error
           retention-days: 7
+      - name: Observe actual Framework JSON array and both legacy consumers
+        shell: pwsh
+        timeout-minutes: 2
+        run: |
+          $ErrorActionPreference = "Stop"
+          $probe = @'
+          import hashlib
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+          import tempfile
+          from pathlib import Path
+
+          PINS = {
+              "windows/desktop/K5Vision.cs": "a4d81d0094eeccdd05df705c450ab6842f3729df063407b4e1037446975e3a7a",
+              "windows/desktop/K5RecorderHost.cs": "fac4362089d8006c4a53ddfc987257261d460bbfd73d1a70997a310e35e6f816",
+              "windows/desktop/K5ServiceInstallation.cs": "2e600cd2da486148bc6b5113ef7822806a644f1adb8765b7e6deb8f4ee2fa756",
+          }
+          TOKENS = re.compile(r'//[^\n]*|/\*.*?\*/|@"(?:""|[^"])*"|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|[{}]', re.S)
+
+
+          def digest(text):
+              return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+          def extract(text, anchor):
+              if text.count(anchor) != 1:
+                  raise ValueError()
+              start = text.index(anchor)
+              opening = text.index("{", start)
+              depth = 0
+              for token in TOKENS.finditer(text, opening):
+                  if token.group() == "{":
+                      depth += 1
+                  elif token.group() == "}":
+                      depth -= 1
+                      if depth == 0:
+                          return text[start:token.end()]
+              raise ValueError()
+
+
+          def replace_exact(text, old, new, count=1):
+              if text.count(old) != count:
+                  raise ValueError()
+              return text.replace(old, new)
+
+
+          def materialize(root):
+              sources = {}
+              for name, expected in PINS.items():
+                  text = (root / name).read_text(encoding="utf-8")
+                  if digest(text) != expected:
+                      raise ValueError()
+                  sources[name] = text
+              parser = extract(sources["windows/desktop/K5Vision.cs"], "internal static class Json")
+              owners = extract(sources["windows/desktop/K5RecorderHost.cs"], "private static HashSet<string> Owners(string data)")
+              mark = extract(sources["windows/desktop/K5ServiceInstallation.cs"], "private static void MarkLegacyProfiles()")
+              # Only the existing validation tail is exercised; filesystem/ACL admission
+              # is outside this serializer diagnostic and is never replaced in product.
+              tail_anchor = "Dictionary<string, object> value = Json.Parse(File.ReadAllText(marker, Encoding.UTF8));"
+              if owners.count(tail_anchor) != 1:
+                  raise ValueError()
+              tail = owners[owners.index(tail_anchor):owners.rindex("}")].rstrip()
+              before = replace_exact(tail, "File.ReadAllText(marker, Encoding.UTF8)", "text")
+              after = replace_exact(before, '!(value["profiles"] is object[])', '!(value["profiles"] is IList)')
+              after = replace_exact(after, 'object[] profiles = (object[])value["profiles"];', 'IList profiles = (IList)value["profiles"];')
+              after = replace_exact(after, "profiles.Length", "profiles.Count", 2)
+              traversal_start = 'foreach (object sid in (object[])previous["profiles"])'
+              traversal_end = 'if (!found.Contains((string)sid)) found.Add((string)sid);'
+              if mark.count(traversal_start) != 1 or mark.count(traversal_end) != 1:
+                  raise ValueError()
+              traversal = mark[mark.index(traversal_start):mark.index(traversal_end) + len(traversal_end)]
+              traversal_after = replace_exact(traversal, '(object[])previous["profiles"]', '(IList)previous["profiles"]')
+              generated = CS.replace("@@JSON@@", parser).replace("@@BEFORE@@", before).replace("@@AFTER@@", after).replace("@@MARK_BEFORE@@", traversal).replace("@@MARK_AFTER@@", traversal_after)
+              if "@@" in generated:
+                  raise ValueError()
+              binding = {
+                  "product_source_head": "f354dc3c4412ef6e074545ee523dea0cf2a888f9",
+                  "normalized_source_sha256": PINS,
+                  "json_class_sha256": digest(parser),
+                  "owners_method_sha256": digest(owners),
+                  "mark_method_sha256": digest(mark),
+                  "original_owners_validation_sha256": digest(tail),
+                  "original_mark_traversal_sha256": digest(traversal),
+                  "compiled_probe_sha256": digest(generated),
+                  "source_bound_to_product": True,
+                  "filesystem_and_acl_admission_exercised": False,
+                  "product_modified": False,
+                  "profile_or_service_written": False,
+              }
+              return generated, binding
+
+
+          CS = r'''
+          using System;
+          using System.Collections;
+          using System.Collections.Generic;
+          using System.Security.Principal;
+          using System.Web.Script.Serialization;
+          namespace K5VisionDesktop {
+          @@JSON@@
+          internal static class LegacyArrayProbe {
+              private static HashSet<string> Before(string text) { @@BEFORE@@ }
+              private static HashSet<string> After(string text) { @@AFTER@@ }
+              private static int MarkBefore(string text) {
+                  Dictionary<string, object> previous = Json.Parse(text);
+                  List<string> found = new List<string>();
+                  @@MARK_BEFORE@@
+                  return found.Count;
+              }
+              private static int MarkAfter(string text) {
+                  Dictionary<string, object> previous = Json.Parse(text);
+                  List<string> found = new List<string>();
+                  @@MARK_AFTER@@
+                  return found.Count;
+              }
+              private static bool Refuses(Func<string, HashSet<string>> admission, string text) {
+                  try { admission(text); return false; } catch (Exception) { return true; }
+              }
+              private static string Marker(int count) {
+                  List<string> values = new List<string>();
+                  for (int i = 0; i < count; i++) values.Add("S-1-5-21-100-200-300-" + (1000 + i));
+                  return Json.Serializer.Serialize(new Dictionary<string, object> {
+                      {"schema_version", 1}, {"profiles", values.ToArray()} });
+              }
+              public static int Main() {
+                  Dictionary<string, object> proof = new Dictionary<string, object>();
+                  int exit = 1;
+                  try {
+                      string valid = Marker(1);
+                      object array = Json.Parse(valid)["profiles"];
+                      proof["native_framework_v4"] = Environment.Version.Major == 4;
+                      proof["profiles_runtime_arraylist"] = array.GetType() == typeof(ArrayList);
+                      proof["profiles_runtime_object_array"] = array is object[];
+                      proof["profiles_runtime_ilist"] = array is IList;
+                      proof["original_owners_rejects_valid"] = Refuses(Before, valid);
+                      bool markRejected = false;
+                      try { MarkBefore(valid); } catch (InvalidCastException) { markRejected = true; }
+                      proof["original_mark_cast_rejects_valid"] = markRejected;
+                      // The diagnostic alternative runs only AFTER the actual runtime
+                      // type and both unchanged original consumers established the bug.
+                      if (!(Environment.Version.Major == 4 && array.GetType() == typeof(ArrayList) &&
+                            !(array is object[]) && array is IList && Refuses(Before, valid) && markRejected))
+                          throw new InvalidOperationException();
+                      proof["comparison_only_after_runtime_confirmation"] = true;
+                      string sid = "S-1-5-21-100-200-300-1000";
+                      string profiles = "\"profiles\":[\"" + sid + "\"]";
+                      bool single = After(valid).SetEquals(new[] { sid });
+                      bool cap = After(Marker(256)).Count == 256;
+                      bool mark = MarkAfter(valid) == 1 && MarkAfter(Marker(256)) == 256;
+                      List<string> negatives = new List<string> {
+                          Marker(0), Marker(257),
+                          "{\"schema_version\":1,\"profiles\":[\"" + sid + "\",\"" + sid + "\"]}",
+                          "{\"schema_version\":1,\"profiles\":[1]}",
+                          "{\"schema_version\":1,\"profiles\":[null]}",
+                          "{\"schema_version\":1,\"profiles\":[\"not-a-sid\"]}",
+                          "{\"schema_version\":1,\"profiles\":[\"s-1-5-21-100-200-300-1000\"]}",
+                          "{\"schema_version\":1,\"profiles\":\"" + sid + "\"}",
+                          "{\"schema_version\":1,\"profiles\":{}}", "{\"schema_version\":1,\"profiles\":null}",
+                          "{\"schema_version\":1}", "{\"profiles\":[]}",
+                          "{\"schema_version\":1," + profiles + ",\"extra\":true}",
+                          "{\"schema_version\":1.0," + profiles + "}",
+                          "{\"schema_version\":true," + profiles + "}",
+                          "{\"schema_version\":2," + profiles + "}", "{"
+                      };
+                      bool refused = true;
+                      foreach (string text in negatives) refused &= Refuses(After, text);
+                      proof["ilist_valid_single_admitted"] = single;
+                      proof["ilist_valid_256_admitted"] = cap;
+                      proof["ilist_existing_marker_traversal_preserved"] = mark;
+                      proof["ilist_negative_case_count"] = negatives.Count;
+                      proof["ilist_all_negatives_refused"] = refused;
+                      if (!(single && cap && mark && refused)) throw new InvalidOperationException();
+                      proof["status"] = "observed";
+                      exit = 0;
+                  } catch (Exception) { proof["status"] = "refused"; }
+                  Console.WriteLine(Json.Serializer.Serialize(proof));
+                  return exit;
+              }
+          }
+          }
+          '''
+
+
+          def main():
+              proof = {"schema_version": 1, "status": "refused", "phase": "environment"}
+              status = 1
+              temporary_path = None
+              try:
+                  if (os.name != "nt" or os.environ.get("GITHUB_ACTIONS") != "true" or
+                          os.environ.get("RUNNER_ENVIRONMENT") != "github-hosted"):
+                      raise ValueError()
+                  proof["head_sha"] = os.environ["GITHUB_SHA"]
+                  proof["phase"] = "source_binding"
+                  generated, binding = materialize(Path.cwd())
+                  proof.update(binding)
+                  compiler = Path(os.environ["WINDIR"]) / "Microsoft.NET/Framework64/v4.0.30319/csc.exe"
+                  with tempfile.TemporaryDirectory(prefix="k5-legacy-array-", dir=os.environ["RUNNER_TEMP"]) as temporary:
+                      directory = Path(temporary)
+                      temporary_path = directory
+                      source, output = directory / "probe.cs", directory / "probe.exe"
+                      source.write_text(generated, encoding="utf-8", newline="\n")
+                      proof["phase"] = "native_compile"
+                      result = subprocess.run([str(compiler), "/nologo", "/target:exe", "/platform:x64",
+                          "/optimize+", "/warn:4", "/warnaserror+", "/codepage:65001",
+                          "/reference:System.dll", "/reference:System.Core.dll",
+                          "/reference:System.Web.Extensions.dll", "/out:" + str(output), str(source)],
+                          capture_output=True, timeout=60, check=False)
+                      if result.returncode:
+                          raise ValueError()
+                      proof["phase"] = "native_execution"
+                      result = subprocess.run([str(output)], capture_output=True, timeout=15, check=False)
+                      if len(result.stdout) > 65536 or result.stderr:
+                          raise ValueError()
+                      actual = json.loads(result.stdout.decode("utf-8"), parse_constant=lambda _: (_ for _ in ()).throw(ValueError()))
+                      if type(actual) is not dict or any(type(v) not in (bool, int, str) for v in actual.values()):
+                          raise ValueError()
+                      proof.update(actual)
+                      if result.returncode or proof.get("status") != "observed":
+                          raise ValueError()
+                  proof["phase"] = "complete"
+                  status = 0
+              except Exception as error:
+                  proof["status"] = "refused"
+                  proof["failure_type"] = type(error).__name__ if type(error).__name__ in {"ValueError", "TimeoutExpired", "OSError"} else "Other"
+              proof["owned_cleanup"] = temporary_path is None or not temporary_path.exists()
+              if not proof["owned_cleanup"]:
+                  proof["status"] = "refused"
+                  status = 1
+              Path("windows-legacy-array-facts.json").write_text(json.dumps(proof, sort_keys=True, allow_nan=False) + "\n", encoding="utf-8")
+              print(json.dumps({"status": proof["status"], "phase": proof["phase"]}))
+              return status
+
+
+          if __name__ == "__main__":
+              sys.exit(main())
+          '@
+          $path = Join-Path $env:RUNNER_TEMP ("k5-array-probe-" + [guid]::NewGuid().ToString("N") + ".py")
+          $ownedScript = $false
+          try {
+            $stream = [System.IO.File]::Open($path, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+            $ownedScript = $true
+            try {
+              $bytes = [System.Text.UTF8Encoding]::new($false).GetBytes($probe)
+              $stream.Write($bytes, 0, $bytes.Length)
+              $stream.Flush($true)
+            } finally { $stream.Dispose() }
+            & python -I $path
+            if ($LASTEXITCODE -ne 0) { throw "Native legacy array observation was refused" }
+          } finally {
+            if ($ownedScript) { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue }
+          }
+      - name: Preserve only bounded source-bound native legacy array facts
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: windows-legacy-array-facts-${{ github.run_id }}
+          path: windows-legacy-array-facts.json
+          if-no-files-found: error
+          retention-days: 7
