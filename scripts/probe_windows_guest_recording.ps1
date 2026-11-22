@@ -140,6 +140,51 @@ try{
     $root=Join-Path $drives[0].RootDirectory.FullName ('K5GuestRecording-'+[guid]::NewGuid().ToString('N'))
     $rootIdentity=Private-Directory $root
     $image=Join-Path $root 'official-evaluation.vhdx'
+    $receipt.stage='isolated_camera_network'
+    $receipt.network_subphase='select_conflict_free_subnet'
+    $receipt.subnet_candidates_tested=0
+    $receipt.overlapping_fixture_prefixes=@()
+    $prefix=$null
+    foreach($octet in (Get-Random -InputObject (20..230) -Count 211)){
+        $receipt.subnet_candidates_tested++
+        $candidate='172.29.'+$octet+'.0';$number=IPv4-Number $candidate;$conflict=$false
+        foreach($route in @(Get-NetRoute -AddressFamily IPv4|Where-Object{$_.DestinationPrefix -ne '0.0.0.0/0'})){
+            $parts=$route.DestinationPrefix.Split('/');$length=[Math]::Min(30,[int]$parts[1]);$mask=[uint32](([uint64]4294967295 -shl (32-$length)) -band [uint64]4294967295)
+            if(($number -band $mask) -eq ((IPv4-Number $parts[0]) -band $mask)){
+                $conflict=$true
+                if($receipt.overlapping_fixture_prefixes.Count -lt 16 -and $route.DestinationPrefix -notin $receipt.overlapping_fixture_prefixes){$receipt.overlapping_fixture_prefixes+=([string]$route.DestinationPrefix)}
+                break
+            }
+        }
+        if(-not $conflict){$prefix='172.29.'+$octet;break}
+    }
+    if($null -eq $prefix){throw 'Isolated fixture subnet unavailable'}
+    $hostIPAddress=$prefix+'.1';$guestIP=$prefix+'.2'
+    $switchName='K5Guest-'+$transfer.Substring(0,8)
+    $receipt.network_subphase='create_owned_internal_switch'
+    $switch=New-VMSwitch -Name $switchName -SwitchType Internal;$switchId=$switch.Id
+    $receipt.network_subphase='find_owned_internal_adapter'
+    $hostAdapters=@(Get-NetAdapter -Name ('vEthernet ('+$switchName+')'))
+    if($hostAdapters.Count -ne 1){throw 'Owned internal adapter unavailable'};$hostInterface=[int]$hostAdapters[0].ifIndex
+    $receipt.network_subphase='assign_private_host_address'
+    New-NetIPAddress -InterfaceIndex $hostInterface -IPAddress $hostIPAddress -PrefixLength 30 -AddressFamily IPv4|Out-Null
+    $firewallName='K5GuestCamera-'+$transfer
+    $receipt.network_subphase='create_narrow_owned_firewall_rule'
+    New-NetFirewallRule -Name $firewallName -DisplayName $firewallName -Direction Inbound -Action Allow -Protocol TCP -LocalAddress $hostIPAddress -RemoteAddress $guestIP -LocalPort 18554 -Program $MediaMTX|Out-Null
+    $configPath=Join-Path $root 'generated-camera.json'
+    $mediaConfig=@{logLevel='warn';rtspAddress=($hostIPAddress+':18554');rtspTransports=@('tcp');api=$false;rtmp=$false;hls=$false;webrtc=$false;srt=$false;paths=@{generated=@{source='publisher'}}}
+    [IO.File]::WriteAllText($configPath,($mediaConfig|ConvertTo-Json -Depth 8),[Text.UTF8Encoding]::new($false))
+    $receipt.network_subphase='start_generated_relay'
+    $mediaProcess=Start-OwnedProcess $MediaMTX $configPath
+    Start-Sleep -Seconds 1
+    $source='rtsp://'+$hostIPAddress+':18554/generated'
+    $receipt.network_subphase='start_generated_publisher'
+    $publisherProcess=Start-OwnedProcess $FFmpeg ('-nostdin -hide_banner -loglevel error -re -f lavfi -i testsrc2=size=320x240:rate=10 -an -c:v libx264 -threads 1 -preset ultrafast -tune zerolatency -pix_fmt yuv420p -g 10 -f rtsp -rtsp_transport tcp '+$source)
+    Start-Sleep -Seconds 1
+    $receipt.network_subphase='verify_owned_source_processes'
+    Assert-Publisher
+    $receipt.network_preflight_complete=$true
+    $receipt.generated_source_isolated=$true
     $receipt.stage='official_pinned_image_download'
     Add-Type -AssemblyName System.Net.Http
     $handler=[Net.Http.HttpClientHandler]::new();$handler.AllowAutoRedirect=$false
@@ -183,34 +228,6 @@ try{
     $kernel=Get-AuthenticodeSignature -LiteralPath (Join-Path $windows 'Windows\System32\ntoskrnl.exe')
     if($kernel.Status -ne 'Valid' -or $kernel.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation'){throw 'Pinned Windows kernel signature unavailable'}
     $receipt.microsoft_kernel_verified=$true
-    $receipt.stage='isolated_camera_network'
-    $prefix=$null
-    foreach($octet in (Get-Random -InputObject (20..230) -Count 211)){
-        $candidate='172.29.'+$octet+'.0';$number=IPv4-Number $candidate;$conflict=$false
-        foreach($route in @(Get-NetRoute -AddressFamily IPv4|Where-Object{$_.DestinationPrefix -ne '0.0.0.0/0'})){
-            $parts=$route.DestinationPrefix.Split('/');$length=[Math]::Min(30,[int]$parts[1]);$mask=[uint32](([uint64]4294967295 -shl (32-$length)) -band [uint64]4294967295)
-            if(($number -band $mask) -eq ((IPv4-Number $parts[0]) -band $mask)){$conflict=$true;break}
-        }
-        if(-not $conflict){$prefix='172.29.'+$octet;break}
-    }
-    if($null -eq $prefix){throw 'Isolated fixture subnet unavailable'}
-    $hostIPAddress=$prefix+'.1';$guestIP=$prefix+'.2'
-    $switchName='K5Guest-'+$transfer.Substring(0,8)
-    $switch=New-VMSwitch -Name $switchName -SwitchType Internal;$switchId=$switch.Id
-    $hostAdapters=@(Get-NetAdapter -Name ('vEthernet ('+$switchName+')'))
-    if($hostAdapters.Count -ne 1){throw 'Owned internal adapter unavailable'};$hostInterface=[int]$hostAdapters[0].ifIndex
-    New-NetIPAddress -InterfaceIndex $hostInterface -IPAddress $hostIPAddress -PrefixLength 30 -AddressFamily IPv4|Out-Null
-    $firewallName='K5GuestCamera-'+$transfer
-    New-NetFirewallRule -Name $firewallName -DisplayName $firewallName -Direction Inbound -Action Allow -Protocol TCP -LocalAddress $hostIPAddress -RemoteAddress $guestIP -LocalPort 18554 -Program $MediaMTX|Out-Null
-    $configPath=Join-Path $root 'generated-camera.json'
-    $mediaConfig=@{logLevel='warn';rtspAddress=($hostIPAddress+':18554');rtspTransports=@('tcp');api=$false;rtmp=$false;hls=$false;webrtc=$false;srt=$false;paths=@{generated=@{source='publisher'}}}
-    [IO.File]::WriteAllText($configPath,($mediaConfig|ConvertTo-Json -Depth 8),[Text.UTF8Encoding]::new($false))
-    $mediaProcess=Start-OwnedProcess $MediaMTX $configPath
-    Start-Sleep -Seconds 1
-    $source='rtsp://'+$hostIPAddress+':18554/generated'
-    $publisherProcess=Start-OwnedProcess $FFmpeg ('-nostdin -hide_banner -loglevel error -re -f lavfi -i testsrc2=size=320x240:rate=10 -an -c:v libx264 -threads 1 -preset ultrafast -tune zerolatency -pix_fmt yuv420p -g 10 -f rtsp -rtsp_transport tcp '+$source)
-    Start-Sleep -Seconds 1;Assert-Publisher
-    $receipt.generated_source_isolated=$true
     $receipt.stage='offline_guest_payload'
     $guestRoot=Join-Path $windows 'K5GuestWitness';Private-Directory $guestRoot $true|Out-Null
     $witness=Join-Path $PSScriptRoot 'windows_guest_witness.ps1'
@@ -351,6 +368,15 @@ try{
     $receipt.outcome='installer_guest_recording_observed';$receipt.stage='complete'
 }catch{
     $receipt.failure_kind=$_.Exception.GetType().Name;$receipt.failure_hresult=$_.Exception.HResult
+    $knownReasons=@{'Isolated fixture subnet unavailable'='fixture_subnet_unavailable';'Owned internal adapter unavailable'='owned_internal_adapter_unavailable';'Owned generated source ended'='owned_generated_source_ended';'IPv4 required'='invalid_route_address_family'}
+    $receipt.failure_reason='other'
+    if($knownReasons.ContainsKey($_.Exception.Message)){$receipt.failure_reason=$knownReasons[$_.Exception.Message]}
+    foreach($entry in @(@{name='relay';process=$mediaProcess},@{name='publisher';process=$publisherProcess})){
+        if($null -ne $entry.process){
+            $exited=$entry.process.HasExited;$receipt[($entry.name+'_exited_at_failure')]=$exited
+            if($exited){$receipt[($entry.name+'_exit_code_at_failure')]=$entry.process.ExitCode}
+        }
+    }
     if($_.Exception -is [ComponentModel.Win32Exception]){$receipt.failure_native_code=$_.Exception.NativeErrorCode}
 }finally{
     $password=$null
