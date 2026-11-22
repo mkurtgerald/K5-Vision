@@ -137,8 +137,16 @@ class TargetBinding:
             raise ValueError
 
 
-def _directory(path, expected=None):
-    identity_state._checked_path(path)
+def _directory(path, expected=None, *, service_root=False):
+    # A service root's private boundary begins at K5Vision, not the shared
+    # ProgramData container. Admit it as the immediate private parent of the
+    # fixed identity child, then retain the same private leaf and FileID checks.
+    identity_state._checked_path(path / "identity" if service_root else path)
+    return _directory_leaf(path, expected)
+
+
+def _directory_leaf(path, expected=None):
+    """Private leaf check after the caller has admitted the full ancestor chain."""
     info = path.lstat()
     if not stat.S_ISDIR(info.st_mode):
         raise ValueError
@@ -252,7 +260,10 @@ def _binding_document(path, binding):
 def _rename_new(source, destination):
     """Publish directories without POSIX rename's empty-directory replacement."""
     _directory(source)
-    _directory(destination.parent)
+    # Admit the exact child: its parent is private, while the parent's
+    # container retains ancestor-only checks, including shared ProgramData.
+    identity_state._checked_path(destination)
+    _directory_leaf(destination.parent)
     if destination.exists() or destination.is_symlink():
         raise ValueError
     if os.name == "nt":
@@ -412,9 +423,9 @@ class TargetMigration:
             binding = TargetBinding(**binding)
         if type(binding) is not TargetBinding:
             raise ValueError
-        self.root = identity_state._checked_path(root)
+        self.root = Path(root)
         self.binding, self.admission = binding, admission
-        self._root_id = _id(_directory(self.root))
+        self._root_id = _id(_directory(self.root, service_root=True))
         self.parent = self.root / ".migration"
         self.stage = self.parent / binding.transfer_id
         self._lock = threading.RLock()
@@ -435,7 +446,7 @@ class TargetMigration:
             raise ValueError
 
     def _owned(self):
-        _directory(self.root, self._root_id)
+        _directory(self.root, self._root_id, service_root=True)
         if self._descriptor is None:
             raise ValueError
         _same_file(self._descriptor, self.parent / "target.lock")
@@ -520,7 +531,7 @@ class TargetMigration:
     def _begin(self):
         with self._lock:
             self._assert_admission()
-            _directory(self.root, self._root_id)
+            _directory(self.root, self._root_id, service_root=True)
             if self._descriptor is not None:
                 self._guard()
                 return self._paths()
@@ -1568,8 +1579,8 @@ class TargetMigration:
 @_safe
 def inspect_target(root: Path):
     """Read-only startup guard; a half-published identity never implies ready."""
-    root = identity_state._checked_path(root)
-    _directory(root)
+    root = Path(root)
+    _directory(root, service_root=True)
     parent = root / ".migration"
     if not parent.exists():
         return {"status": "none"}
@@ -1621,8 +1632,8 @@ def recover_pending(root: Path, binding: TargetBinding, admission):
         binding = TargetBinding(**binding)
     if type(binding) is not TargetBinding or admission.assert_authenticated(binding) is not None:
         raise ValueError
-    root = identity_state._checked_path(root)
-    _directory(root)
+    root = Path(root)
+    _directory(root, service_root=True)
     parent = root / ".migration"
     if not parent.exists():
         if (root / "identity").exists() or (root / "identity").is_symlink():
