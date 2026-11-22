@@ -43,7 +43,21 @@ def admit_checkout(path, expected):
     observed = run(["git", "rev-parse", "HEAD"], cwd=path).decode().strip()
     if observed != expected or run(["git", "status", "--porcelain"], cwd=path).strip():
         raise ValueError("Donor checkout identity or clean state differs")
-    archive = run(["git", "archive", "--format=tar", "HEAD"], cwd=path)
+    # git archive also applies core.autocrlf; explicitly retain committed LF
+    # source bytes independently of the Windows host's checkout preferences.
+    archive = run(
+        [
+            "git",
+            "-c",
+            "core.autocrlf=false",
+            "-c",
+            "core.eol=lf",
+            "archive",
+            "--format=tar",
+            "HEAD",
+        ],
+        cwd=path,
+    )
     return archive, hashlib.sha256(archive).hexdigest()
 
 
