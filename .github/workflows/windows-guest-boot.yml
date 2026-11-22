@@ -5,7 +5,7 @@ on:
       scope:
         type: choice
         default: recording
-        options: [recording, image-discovery]
+        options: [recording, image-discovery, bootstrap-observation]
   push:
     branches: [codex/windows-guest-20261122]
     paths:
@@ -62,8 +62,10 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
   guest-recording:
-    if: github.event_name == 'push' || inputs.scope == 'recording'
-    name: DIAGNOSTIC ONLY - actual 65 Windows guest reboot and sign-out recording
+    if: github.event_name == 'push' || inputs.scope == 'recording' || inputs.scope == 'bootstrap-observation'
+    # Branch pushes diagnose initialization for four minutes. A manual recording
+    # dispatch retains the original complete qualification criteria and budgets.
+    name: ${{ (github.event_name == 'push' || inputs.scope == 'bootstrap-observation') && 'DIAGNOSTIC ONLY - 4-minute Windows initialization observation (no qualification)' || 'DIAGNOSTIC ONLY - actual 65 Windows guest reboot and sign-out recording' }}
     runs-on: windows-2025
     timeout-minutes: 38
     permissions:
@@ -72,6 +74,7 @@ jobs:
     env:
       K5_GUEST_PRODUCT_HEAD: 65bd2f75750ead425a0ecb54d01cc6d40e6f1404
       K5_GUEST_SETUP_SHA256: 72a7c6e16c97916e14b8f2eb6e9791dfb5846eebb19946e94cc0e2d1565348f6
+      K5_GUEST_BOOTSTRAP_OBSERVATION: ${{ (github.event_name == 'push' || inputs.scope == 'bootstrap-observation') && 'true' || 'false' }}
     steps:
       - name: Checkout the separately identified guest controller and helper
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -181,7 +184,7 @@ jobs:
               $manifest.files.path -notcontains 'K5VisionRecorder.xml') { throw 'Original guest candidate bytes differ' }
       - name: Provision original pinned generated-video development tools
         uses: ./.github/actions/provision-operator-tools
-      - name: Boot the actual Windows guest and observe recording across reboot and logoff
+      - name: ${{ (github.event_name == 'push' || inputs.scope == 'bootstrap-observation') && 'DIAGNOSTIC ONLY - observe initialization for four minutes without qualification' || 'Observe actual guest recording across reboot and logoff' }}
         timeout-minutes: 33
         shell: pwsh
         run: |
@@ -189,7 +192,9 @@ jobs:
           $controller=(Resolve-Path guest-native-build/probe_windows_guest_recording.ps1).Path
           $setup=(Resolve-Path guest-product-input/K5VisionSetup.exe).Path
           $helper=(Resolve-Path guest-native-build/windows_guest_bootstrap.exe).Path
-          & (Join-Path $env:SYSTEMROOT 'System32/WindowsPowerShell/v1.0/powershell.exe') -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $controller -SetupPath $setup -ProductHead $env:K5_GUEST_PRODUCT_HEAD -SetupSha256 $env:K5_GUEST_SETUP_SHA256 -BootstrapExe $helper -MediaMTX $env:K5_MEDIAMTX_DONOR_EXE -FFmpeg $env:K5_DONOR_FFMPEG -FFprobe $env:K5_DONOR_FFPROBE |
+          $observationArguments=@()
+          if ($env:K5_GUEST_BOOTSTRAP_OBSERVATION -eq 'true') { $observationArguments=@('-BootstrapObservation') }
+          & (Join-Path $env:SYSTEMROOT 'System32/WindowsPowerShell/v1.0/powershell.exe') -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $controller -SetupPath $setup -ProductHead $env:K5_GUEST_PRODUCT_HEAD -SetupSha256 $env:K5_GUEST_SETUP_SHA256 -BootstrapExe $helper -MediaMTX $env:K5_MEDIAMTX_DONOR_EXE -FFmpeg $env:K5_DONOR_FFMPEG -FFprobe $env:K5_DONOR_FFPROBE @observationArguments |
             Tee-Object -FilePath windows-guest-recording.json
           if ($LASTEXITCODE -ne 0) { throw 'Guest recording diagnostic could not retire its exact resources' }
           $evidence=Get-Content -LiteralPath windows-guest-recording.json -Raw | ConvertFrom-Json
@@ -198,7 +203,19 @@ jobs:
               $evidence.github_credentials_entered_guest -ne $false -or
               $evidence.product_head -ne $env:K5_GUEST_PRODUCT_HEAD -or
               $evidence.installer_sha256 -ne $env:K5_GUEST_SETUP_SHA256) { throw 'Guest recording diagnostic scope differs' }
-          if ($evidence.outcome -ne 'installer_guest_recording_observed' -or
+          if ($env:K5_GUEST_BOOTSTRAP_OBSERVATION -eq 'true') {
+            if ($evidence.bootstrap_observation_only -ne $true -or
+                $evidence.outcome -ne 'guest_initialization_diagnostic_observed' -or
+                $evidence.stage -ne 'bootstrap_observation' -or $evidence.bootstrap_observation_limit_seconds -ne 240 -or
+                $evidence.actual_guest_boot -ne $false -or $evidence.recording_after_reboot_before_login -ne $false -or
+                $evidence.recording_after_actual_signout -ne $false -or $evidence.retained_media_decoded -ne $false -or
+                $null -eq $evidence.original_image_setup_state -or $null -eq $evidence.bootstrap_observation_live -or
+                $evidence.bootstrap_observation_offline.read_only_mount -ne $true -or
+                $evidence.bootstrap_observation_offline.setup_state.hives_unloaded -ne $true) {
+              throw 'Initialization diagnostic is incomplete or attempted qualification'
+            }
+          } elseif ($evidence.bootstrap_observation_only -ne $false -or
+              $evidence.outcome -ne 'installer_guest_recording_observed' -or
               $evidence.actual_guest_boot -ne $true -or
               $evidence.recording_after_reboot_before_login -ne $true -or
               $evidence.recording_after_actual_signout -ne $true -or

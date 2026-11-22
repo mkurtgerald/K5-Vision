@@ -8,7 +8,8 @@ param(
     [Parameter(Mandatory=$true)][string]$BootstrapExe,
     [Parameter(Mandatory=$true)][string]$MediaMTX,
     [Parameter(Mandatory=$true)][string]$FFmpeg,
-    [Parameter(Mandatory=$true)][string]$FFprobe
+    [Parameter(Mandatory=$true)][string]$FFprobe,
+    [switch]$BootstrapObservation
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference='Stop'
@@ -25,7 +26,8 @@ $receipt=[ordered]@{
     product_head=$ProductHead; installer_sha256=$SetupSha256; image_sha256=$imageSha;
     actual_guest_boot=$false; recording_after_reboot_before_login=$false;
     recording_after_actual_signout=$false; retained_media_decoded=$false;
-    github_credentials_entered_guest=$false; cleanup_complete=$true; stage='host_guard'
+    github_credentials_entered_guest=$false; cleanup_complete=$true; stage='host_guard';
+    bootstrap_observation_only=$BootstrapObservation.IsPresent
 }
 $root=$null; $rootIdentity=$null; $image=$null; $mounted=$false; $diskNumber=$null; $diskId=$null
 $partitionNumber=$null; $accessPath=$null; $vmId=$null; $vmName=$null; $switchId=$null; $switchName=$null
@@ -226,6 +228,7 @@ function Read-BootFailureLive {
     # Initial-bootstrap failure only: no keyboard password has been sent and
     # the first-admin fields use native password controls. No raw log is copied.
     try{
+        $facts.thumbnail_subphase='native_request'
         $settings=@($computer.GetRelated('Msvm_VirtualSystemSettingData')|Where-Object{$_.VirtualSystemType -ceq 'Microsoft:Hyper-V:System:Realized'})
         $manager=Get-WmiObject -Namespace root\virtualization\v2 -Class Msvm_VirtualSystemManagementService
         if($settings.Count -ne 1){throw 'Actual VM settings unavailable'}
@@ -234,22 +237,98 @@ function Read-BootFailureLive {
         $thumbnail=$manager.InvokeMethod('GetVirtualSystemThumbnailImage',$arguments,$null)
         $facts.thumbnail_return_code=[int]$thumbnail.ReturnValue
         if($thumbnail.ReturnValue -eq 0){
+            $facts.thumbnail_subphase='byte_geometry'
             $pixels=[byte[]]$thumbnail.ImageData
+            $facts.thumbnail_byte_count=[int]$pixels.Length
             if($pixels.Length -ne 640*480*2){throw 'Thumbnail byte geometry differs'}
+            $facts.thumbnail_subphase='bitmap_allocation'
             Add-Type -AssemblyName System.Drawing
             $bitmap=[Drawing.Bitmap]::new(640,480,[Drawing.Imaging.PixelFormat]::Format16bppRgb565)
             $buffer=$null;$png=[IO.MemoryStream]::new()
             try{
+                $facts.thumbnail_subphase='bitmap_lock'
                 $buffer=$bitmap.LockBits([Drawing.Rectangle]::new(0,0,640,480),[Drawing.Imaging.ImageLockMode]::WriteOnly,[Drawing.Imaging.PixelFormat]::Format16bppRgb565)
+                $facts.thumbnail_stride=[int]$buffer.Stride
                 if($buffer.Stride -ne 1280){throw 'Thumbnail stride differs'}
                 [Runtime.InteropServices.Marshal]::Copy($pixels,0,$buffer.Scan0,$pixels.Length)
                 $bitmap.UnlockBits($buffer);$buffer=$null
+                $facts.thumbnail_subphase='png_encode'
                 $bitmap.Save($png,[Drawing.Imaging.ImageFormat]::Png)
                 if($png.Length -gt 1048576){throw 'Thumbnail PNG bound exceeded'}
                 $facts.thumbnail_png_base64=[Convert]::ToBase64String($png.ToArray())
+                $facts.thumbnail_subphase='complete'
             }finally{if($null -ne $buffer){$bitmap.UnlockBits($buffer)};$bitmap.Dispose();$png.Dispose()}
         }
     }catch{$facts.thumbnail_failure_kind=$_.Exception.GetType().Name;$facts.thumbnail_failure_hresult=$_.Exception.HResult}
+    return $facts
+}
+function Read-SetupState([string]$WindowsVolume) {
+    # Only allowlisted values leave copied hives. Recovery never writes to the
+    # mounted source hive, and passwords/answer-file contents are never emitted.
+    Assert-Root
+    $facts=@{hives_unloaded=$true;answer_candidates=@{};locale=@{};winlogon=@{}}
+    foreach($entry in @(@{name='panther_cached';path='Windows\Panther\Unattend.xml'},@{name='panther_explicit';path='Windows\Panther\Unattend\Unattend.xml'},@{name='sysprep';path='Windows\System32\Sysprep\Unattend.xml'})){
+        $facts.answer_candidates[$entry.name]=[bool](Test-Path -LiteralPath (Join-Path $WindowsVolume $entry.path) -PathType Leaf)
+    }
+    foreach($kind in @('SOFTWARE','SYSTEM')){
+        $hiveName='K5GuestSetup_'+[guid]::NewGuid().ToString('N');$loaded=$false
+        $source=Join-Path $WindowsVolume ('Windows\System32\config\'+$kind)
+        $copy=Join-Path $root ($hiveName+'.hiv')
+        try{
+            foreach($suffix in @('','.LOG1','.LOG2')){
+                $candidate=$source+$suffix
+                if(-not(Test-Path -LiteralPath $candidate -PathType Leaf)){continue}
+                $info=Get-Item -LiteralPath $candidate
+                if($info.Length -gt 268435456 -or ($info.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0){throw 'Setup hive copy bound refused'}
+                Copy-Item -LiteralPath $candidate -Destination ($copy+$suffix)
+            }
+            & (Join-Path $env:SystemRoot 'System32\reg.exe') load ('HKLM\'+$hiveName) $copy 2>&1|Out-Null
+            if($LASTEXITCODE -ne 0){throw 'Setup hive copy unavailable'};$loaded=$true
+            if($kind -ceq 'SOFTWARE'){
+                $key=[Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($hiveName+'\Microsoft\Windows\CurrentVersion\Setup\State')
+                try{
+                    if($null -ne $key){
+                        $value=[string]$key.GetValue('ImageState','')
+                        $facts.image_state=if($value -in @('IMAGE_STATE_COMPLETE','IMAGE_STATE_UNDEPLOYABLE','IMAGE_STATE_GENERALIZE_RESEAL_TO_AUDIT','IMAGE_STATE_GENERALIZE_RESEAL_TO_OOBE','IMAGE_STATE_SPECIALIZE_RESEAL_TO_AUDIT','IMAGE_STATE_SPECIALIZE_RESEAL_TO_OOBE')){$value}elseif($value.Length -eq 0){'absent'}else{'other'}
+                    }
+                }finally{if($null -ne $key){$key.Dispose()}}
+                $key=[Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($hiveName+'\Microsoft\Windows NT\CurrentVersion\Winlogon')
+                try{
+                    if($null -ne $key){
+                        $auto=[string]$key.GetValue('AutoAdminLogon','')
+                        $facts.winlogon.auto_admin_logon=if($auto -in @('0','1')){$auto}elseif($auto.Length -eq 0){'absent'}else{'other'}
+                        $facts.winlogon.default_password_present=($key.GetValueNames() -contains 'DefaultPassword')
+                        $facts.winlogon.administrator_selected=([string]$key.GetValue('DefaultUserName','') -ieq 'Administrator')
+                    }
+                }finally{if($null -ne $key){$key.Dispose()}}
+            }else{
+                $key=[Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($hiveName+'\Setup')
+                try{
+                    if($null -ne $key){
+                        foreach($name in @('OOBEInProgress','SystemSetupInProgress','SetupType','SetupPhase')){
+                            $value=$key.GetValue($name,$null)
+                            if($value -is [int] -and $value -ge 0 -and $value -le 255){$facts[$name]=[int]$value}
+                        }
+                        $value=[string]$key.GetValue('UnattendFile','')
+                        $facts.unattend_pointer=if($value.Length -eq 0){'absent'}elseif($value -imatch '^(?:C:|%SystemDrive%)\\Windows\\Panther\\Unattend\.xml$' -or $value -imatch '^%windir%\\Panther\\Unattend\.xml$'){'our_cached_path'}elseif($value -imatch '\\Panther\\Unattend\\Unattend\.xml$'){'higher_precedence_panther'}elseif($value -imatch '\\Sysprep\\Unattend\.xml$'){'sysprep'}else{'other'}
+                        $value=[string]$key.GetValue('CmdLine','')
+                        $facts.setup_command=if($value.Length -eq 0){'empty'}elseif($value -imatch '(?:windeploy|msoobe|oobe)'){'oobe'}else{'other'}
+                    }
+                }finally{if($null -ne $key){$key.Dispose()}}
+                $select=[Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($hiveName+'\Select')
+                try{$control=if($null -ne $select){$select.GetValue('Current',1)}else{1}}finally{if($null -ne $select){$select.Dispose()}}
+                if($control -isnot [int] -or $control -lt 1 -or $control -gt 999){throw 'Setup control set refused'}
+                $key=[Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($hiveName+('\ControlSet{0:D3}\Control\Nls\Language' -f $control))
+                try{if($null -ne $key){foreach($name in @('Default','InstallLanguage')){$value=[string]$key.GetValue($name,'');$facts.locale[$name]=if($value -match '^[0-9a-fA-F]{4}$'){$value.ToLowerInvariant()}elseif($value.Length -eq 0){'absent'}else{'other'}}}}finally{if($null -ne $key){$key.Dispose()}}
+            }
+        }finally{
+            if($loaded){
+                & (Join-Path $env:SystemRoot 'System32\reg.exe') unload ('HKLM\'+$hiveName) 2>&1|Out-Null
+                if($LASTEXITCODE -ne 0){$facts.hives_unloaded=$false;throw 'Owned setup hive remains loaded'}
+            }
+            foreach($suffix in @('','.LOG1','.LOG2')){if(Test-Path -LiteralPath ($copy+$suffix)){Remove-Item -LiteralPath ($copy+$suffix) -Force}}
+        }
+    }
     return $facts
 }
 function Read-BootFailureOffline {
@@ -270,6 +349,7 @@ function Read-BootFailureOffline {
             Remove-PartitionAccessPath -DiskNumber $diagnosticDisk -PartitionNumber $diagnosticPartition -AccessPath $diagnosticMount;$diagnosticPartition=$null
         }
         if($null -eq $diagnosticPartition){throw 'Diagnostic Windows volume unavailable'}
+        $facts.setup_state=Read-SetupState $diagnosticMount
         $known=@{
           installed_launcher='Program Files\K5 Vision\K5Vision.exe';identity='ProgramData\K5Vision\identity\identity.json';
           answer_file='Windows\Panther\Unattend.xml';setup_complete='Windows\Setup\Scripts\SetupComplete.cmd';
@@ -300,6 +380,8 @@ function Read-BootFailureOffline {
             $text=[IO.File]::ReadAllText($path)
             $flags=@{bytes=$info.Length;unattend_error=($text -match '(?is)(?:could not parse|failed[^\r\n]{0,120}unattend|unattend[^\r\n]{0,120}(?:error|fail))');oobe_seen=($text -match '(?i)(?:oobeSystem|windeploy|oobe)');setup_complete_seen=($text -match '(?i)SetupComplete\.cmd');setup_complete_error=($text -match '(?i)(?:SetupComplete[^\r\n]{0,120}(?:fail|error)|(?:fail|error)[^\r\n]{0,120}SetupComplete)')}
             $codes=@([regex]::Matches($text,'(?i)(?:HRESULT|\bhr|error(?:\s+code)?)\s*[:= ]\s*(0x[0-9a-f]{8})')|ForEach-Object{$_.Groups[1].Value.ToLowerInvariant()}|Select-Object -Unique -First 16)
+            $flags.specialize_seen=($text -match '(?i)\bspecialize\b');$flags.oobe_system_seen=($text -match '(?i)\boobeSystem\b')
+            $flags.our_computer_name_seen=($text -match '(?i)\bK5GUEST\b');$flags.our_cached_answer_path_seen=($text -match '(?i)\\Panther\\Unattend\.xml\b')
             $flags.error_codes=$codes;$facts.setup_logs[$relative]=$flags;$text=$null
         }
     }finally{
@@ -443,6 +525,7 @@ try{
     $kernel=Get-AuthenticodeSignature -LiteralPath (Join-Path $windows 'Windows\System32\ntoskrnl.exe')
     if($kernel.Status -ne 'Valid' -or $kernel.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation'){throw 'Pinned Windows kernel signature unavailable'}
     $receipt.microsoft_kernel_verified=$true
+    if($BootstrapObservation){$receipt.original_image_setup_state=Read-SetupState $windows}
     $receipt.stage='offline_guest_payload'
     $guestRoot=Join-Path $windows 'K5GuestWitness';Private-Directory $guestRoot $true|Out-Null
     $witness=Join-Path $PSScriptRoot 'windows_guest_witness.ps1'
@@ -505,6 +588,22 @@ try{
     $rootAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($vmSid,'Traverse','ContainerInherit','None','Allow'))
     Set-Acl -LiteralPath $root -AclObject $rootAcl
     Bounded-Job (Start-VM -VM (Owned-VM) -AsJob) 40|Out-Null
+    if($BootstrapObservation){
+        # Separate infrastructure diagnosis: no bootstrap seal is accepted, no
+        # credential is typed, and no PowerShell Direct session is opened.
+        $receipt.stage='bootstrap_observation'
+        $receipt.bootstrap_observation_limit_seconds=240
+        $observe=[Diagnostics.Stopwatch]::StartNew()
+        do{
+            $observedVM=Owned-VM;Assert-Publisher
+            if([string]$observedVM.State -ne 'Running'){throw 'Owned VM stopped during initialization observation'}
+            if($observedVM.Uptime.TotalSeconds -ge 240 -or $observe.Elapsed.TotalSeconds -ge 240){break}
+            Start-Sleep -Milliseconds 250
+        }while($true)
+        $receipt.bootstrap_observation_elapsed_seconds=[Math]::Round($observe.Elapsed.TotalSeconds,3)
+        $receipt.bootstrap_observation_live=Read-BootFailureLive
+        $receipt.outcome='guest_initialization_diagnostic_observed'
+    }else{
     $firstSeal=Kvp-Seal 'bootstrap' 720
     $direct=Open-Direct
     $initial=Read-GuestReceipt 'bootstrap' $firstSeal
@@ -581,6 +680,7 @@ try{
     try{if(-not $decode.WaitForExit(30000) -or $decode.ExitCode -ne 0){throw 'Retained media decode failed'}}finally{if(-not $decode.HasExited){$decode.Kill();$decode.WaitForExit(2000)|Out-Null};$decode.Dispose()}
     $receipt.retained_media_decoded=$true;$receipt.retained_decoded_frames=10
     $receipt.outcome='installer_guest_recording_observed';$receipt.stage='complete'
+    }
 }catch{
     $receipt.failure_kind=$_.Exception.GetType().Name;$receipt.failure_hresult=$_.Exception.HResult
     $receipt.failure_exception_chain=@()
@@ -626,7 +726,9 @@ try{
             $vm=Owned-VM;if([string]$vm.State -ne 'Off'){throw 'Owned VM did not stop'}
             Bounded-Job (Remove-VM -VM $vm -Force -AsJob -Confirm:$false) 30|Out-Null
             if($null -ne (Get-VM -Id $vmId -ErrorAction SilentlyContinue)){throw 'Owned VM remains'}
-            if($receipt.stage -ceq 'actual_guest_boot' -and -not $receipt.actual_guest_boot){
+            if($receipt.stage -ceq 'bootstrap_observation'){
+                try{$receipt.bootstrap_observation_offline=Read-BootFailureOffline}catch{$receipt.bootstrap_offline_diagnostic_error=$_.Exception.GetType().Name}
+            }elseif($receipt.stage -ceq 'actual_guest_boot' -and -not $receipt.actual_guest_boot){
                 try{$receipt.bootstrap_failure_offline=Read-BootFailureOffline}catch{$receipt.bootstrap_offline_diagnostic_error=$_.Exception.GetType().Name}
             }
         }
