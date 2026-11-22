@@ -420,6 +420,7 @@ def _permission_journey(page, client, camera, browser_helpers, *, diagnostic=Non
                 "elapsed_seconds": round(time.monotonic() - preview_started, 4),
                 "http_status": client.last_http_status,
                 "transport_failure": client.transport_failure,
+                "api_error_code": client.last_api_error_code,
                 "request_budget_seconds": 7
                 if "request_deadline_seconds" in preview_arguments
                 else 3,
@@ -1035,6 +1036,7 @@ def test_native_windows_motion_recording_and_zones(record_testsuite_property):
         if "client" in locals():
             diagnostic["client_last_http_status"] = client.last_http_status
             diagnostic["client_transport_failure"] = client.transport_failure
+            diagnostic["client_api_error_code"] = client.last_api_error_code
         diagnostic["failure_kind"] = (
             type(error).__name__
             if type(error).__name__
@@ -1045,11 +1047,30 @@ def test_native_windows_motion_recording_and_zones(record_testsuite_property):
                 "RuntimeError",
                 "Error",
                 "TimeoutExpired",
+                "OSError",
+                "PermissionError",
+                "KeyError",
+                "ValueError",
+                "TypeError",
+                "AttributeError",
+                "ArgumentError",
+                "OverflowError",
             }
             else "other"
         )
+        for field in ("winerror", "errno", "hresult"):
+            value = getattr(error, field, None)
+            if type(value) is int:
+                diagnostic["failure_" + field] = value
         trace = error.__traceback__
         while trace is not None:
+            if Path(trace.tb_frame.f_code.co_filename).name in {
+                "test_windows_desktop_app.py",
+                "test_operator_product_runtime.py",
+                Path(__file__).name,
+            }:
+                diagnostic["failure_origin_function"] = trace.tb_frame.f_code.co_name
+                diagnostic["failure_origin_line"] = trace.tb_lineno
             if (
                 Path(trace.tb_frame.f_code.co_filename).name == Path(__file__).name
                 and trace.tb_frame.f_code.co_name != "_require"
@@ -1126,6 +1147,15 @@ def test_native_windows_motion_recording_and_zones(record_testsuite_property):
                     "failure_kind",
                     "failure_function",
                     "failure_line",
+                    "failure_origin_function",
+                    "failure_origin_line",
+                    "failure_winerror",
+                    "failure_errno",
+                    "failure_hresult",
+                    "client_last_http_status",
+                    "client_transport_failure",
+                    "client_api_error_code",
+                    "permission_preview_request",
                     "motion_save_http_status",
                     "motion_saved_policy",
                     "motion_saved_zone_counts",
