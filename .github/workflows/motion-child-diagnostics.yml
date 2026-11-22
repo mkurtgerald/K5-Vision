@@ -1,0 +1,172 @@
+name: Exact 0bc Motion child diagnostic
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [codex/motion-child-diagnostics-20261122]
+    paths:
+      - .github/workflows/motion-child-diagnostics.yml
+      - tests/integration/test_windows_motion_child_diagnostic.py
+      - tests/integration/windows_service_image_observer.py
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: motion-child-diagnostic-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  motion-child-diagnostic:
+    name: DIAGNOSTIC ONLY - exact 0bc Motion child image
+    runs-on: windows-2025
+    timeout-minutes: 12
+    env:
+      K5_DESKTOP_HEAD_SHA: 0bc10f5aacaa45903b33d9f2dfb23c9d8d197868
+      K5_DESKTOP_SETUP_SHA256: e39800706dad04edaa52a3f87578ec046553f82c2cf438976eb2a8730342d901
+      K5_OPERATOR_BROWSER_ACCEPTANCE: "1"
+      K5_OPERATOR_BROWSER_CHANNEL: msedge
+      K5_NATIVE_MOTION_ACCEPTANCE: "1"
+      K5_VM_CLOCK_ACCEPTANCE: "1"
+      K5_MOTION_DIAGNOSTIC_ONLY: "1"
+      K5_MOTION_DIAGNOSTIC_HARNESS_SHA: ${{ github.sha }}
+      K5_NATIVE_MOTION_CHILD_DIAGNOSTIC_ONLY: "1"
+      K5_DIAGNOSTIC_HARNESS_HEAD_SHA: ${{ github.sha }}
+      K5_MOTION_CHILD_WRAPPER_SHA256: c7e43560887f5e8a598abde282f747f1da6d2ac8dda569455859c95c82094209
+    steps:
+      - name: Checkout exact original installer runtime and all original Motion criteria
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: 0bc10f5aacaa45903b33d9f2dfb23c9d8d197868
+          persist-credentials: false
+      - name: Checkout separately identified diagnostic observer source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          path: diagnostic-source
+          persist-credentials: false
+      - name: Admit immutable original candidate and successful GUI producer
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $headers = @{ Authorization="Bearer $env:GH_TOKEN"; Accept='application/vnd.github+json'; 'X-GitHub-Api-Version'='2022-11-28' }
+          $api = "https://api.github.com/repos/$env:GITHUB_REPOSITORY/actions"
+          $meta = Invoke-RestMethod -Uri "$api/artifacts/14742725690" -Headers $headers
+          $attempt = Invoke-RestMethod -Uri "$api/runs/44992781948/attempts/1" -Headers $headers
+          $jobs = Invoke-RestMethod -Uri "$api/runs/44992781948/attempts/1/jobs?per_page=100" -Headers $headers
+          $producer = @($jobs.jobs | Where-Object { $_.id -eq 137117284062 })
+          if ($meta.id -ne 14742725690 -or $meta.expired -ne $false -or
+              $meta.name -ne "k5-vision-windows-upgrade-candidate-$($env:K5_DESKTOP_HEAD_SHA)-44992781948-attempt-1" -or
+              $meta.size_in_bytes -ne 285141808 -or
+              $meta.digest -ne 'sha256:7eb4089675a4c41706f513b6d13488768d12eeb4804554153351c34e88131f05' -or
+              $meta.workflow_run.id -ne 44992781948 -or $meta.workflow_run.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or
+              $attempt.id -ne 44992781948 -or $attempt.run_attempt -ne 1 -or $attempt.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or
+              $producer.Count -ne 1 -or $producer[0].conclusion -ne 'success') {
+            throw 'Original Motion candidate or GUI producer identity mismatch'
+          }
+      - name: Download exact admitted original candidate by fixed artifact ID
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          artifact-ids: 14742725690
+          github-token: ${{ github.token }}
+          run-id: 44992781948
+          path: motion-child-input
+          merge-multiple: true
+      - name: Bind original installer bytes and exact read-only observer Git blobs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $harnessHead = (& git -C diagnostic-source rev-parse HEAD).Trim()
+          $productHead = (& git rev-parse HEAD).Trim()
+          if ($harnessHead -ne $env:K5_DIAGNOSTIC_HARNESS_HEAD_SHA -or
+              $productHead -ne $env:K5_DESKTOP_HEAD_SHA -or $harnessHead -eq $productHead) {
+            throw 'Motion product and diagnostic source identities differ from admission'
+          }
+          $setup = Get-Item -LiteralPath motion-child-input/K5VisionSetup.exe
+          $setupSha = (Get-FileHash -LiteralPath $setup.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          $package = Get-Content -LiteralPath motion-child-input/desktop-package.json -Raw | ConvertFrom-Json
+          $manifest = Get-Content -LiteralPath motion-child-input/payload-manifest.json -Raw | ConvertFrom-Json
+          $manifestSha = (Get-FileHash -LiteralPath motion-child-input/payload-manifest.json -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($setup.Length -ne 286580017 -or $setupSha -ne $env:K5_DESKTOP_SETUP_SHA256 -or
+              $package.setup_sha256 -ne $setupSha -or $package.setup_bytes -ne $setup.Length -or
+              $package.head_sha -ne $productHead -or $manifest.head_sha -ne $productHead -or
+              $package.run_id -ne 44992781948 -or $package.run_attempt -ne 1 -or
+              $package.qualification_status -ne 'unqualified' -or
+              $manifestSha -ne '2e2f35f6bfaf5e7c3b5204fe429e641c705a0f085ec513cad1544018ca4cd557' -or
+              $package.payload_manifest_sha256 -ne $manifestSha -or
+              $package.launcher_sha256 -ne '152bcd8965690ac5d8145c770f1158b3096b9ed9c899eced52b71dddca9634ad' -or
+              $manifest.files.path -notcontains 'K5VisionRecorder.exe' -or $manifest.files.path -notcontains 'K5VisionRecorder.xml') {
+            throw 'Original Motion installer or manifest byte identity mismatch'
+          }
+          # Exact Git blobs avoid Windows checkout EOL conversion. Original Motion/cohort files are not overlaid.
+          & (Join-Path $env:SYSTEMROOT 'System32/cmd.exe') /d /c 'git -C diagnostic-source cat-file blob HEAD:tests/integration/windows_service_image_observer.py > motion-child-observer-admitted.py'
+          if ($LASTEXITCODE -ne 0 -or (Get-FileHash -LiteralPath motion-child-observer-admitted.py -Algorithm SHA256).Hash.ToLowerInvariant() -ne '5bf5140835d7b466b5e719ceba248bfe8a20e82c9237ff5240f7e108cf1541a1') {
+            throw 'Reviewed read-only image observer Git blob identity mismatch'
+          }
+          & (Join-Path $env:SYSTEMROOT 'System32/cmd.exe') /d /c 'git -C diagnostic-source cat-file blob HEAD:tests/integration/test_windows_motion_child_diagnostic.py > motion-child-wrapper-admitted.py'
+          if ($LASTEXITCODE -ne 0 -or (Get-FileHash -LiteralPath motion-child-wrapper-admitted.py -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:K5_MOTION_CHILD_WRAPPER_SHA256) {
+            throw 'Diagnostic-only Motion wrapper Git blob identity mismatch'
+          }
+          Copy-Item -LiteralPath motion-child-observer-admitted.py -Destination tests/integration/windows_service_image_observer.py -Force
+          Copy-Item -LiteralPath motion-child-wrapper-admitted.py -Destination tests/integration/test_windows_motion_child_diagnostic.py -Force
+          "K5_DESKTOP_SETUP=$($setup.FullName)" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+          @{ schema_version=1; diagnostic_only=$true; product_qualification=$false;
+             installer_head=$productHead; harness_head=$harnessHead; installer_sha256=$setupSha; installer_bytes=$setup.Length;
+             candidate_artifact_id=14742725690; candidate_run_id=44992781948; candidate_run_attempt=1; candidate_producer_job_id=137117284062;
+             candidate_api_sha256='7eb4089675a4c41706f513b6d13488768d12eeb4804554153351c34e88131f05';
+             observer_sha256='5bf5140835d7b466b5e719ceba248bfe8a20e82c9237ff5240f7e108cf1541a1'; wrapper_sha256=$env:K5_MOTION_CHILD_WRAPPER_SHA256;
+             replay_run_id=$env:GITHUB_RUN_ID; replay_run_attempt=$env:GITHUB_RUN_ATTEMPT } |
+            ConvertTo-Json | Set-Content -LiteralPath motion-child-replay-provenance.json -Encoding utf8
+      - name: Prepare only the disposable Windows CI user's default browser
+        uses: ./.github/actions/prepare-windows-browser
+      - name: Set up exact development Python for diagnostic controller
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install original acceptance controller dependencies before changing time
+        shell: pwsh
+        run: |
+          python -m pip install -e ".[dev]" "playwright==1.58.0"
+          if ($LASTEXITCODE -ne 0) { throw 'Motion child controller dependencies failed' }
+      - name: Provision exact original manifest's generated-media tools before changing time
+        uses: ./.github/actions/provision-operator-tools
+      - name: Replay every original installed Motion criterion without promoting observations
+        timeout-minutes: 8
+        shell: pwsh
+        run: |
+          python -m pytest tests/integration/test_windows_motion_child_diagnostic.py -o addopts= --no-cov -s --tb=short -o faulthandler_timeout=460 --junitxml=motion-child-diagnostic.xml
+          $testResult = $LASTEXITCODE
+          [xml]$report = Get-Content -LiteralPath motion-child-diagnostic.xml -Raw
+          $properties = @($report.SelectNodes('//property'))
+          $bindingNodes = @($report.SelectNodes('//property[@name="diagnostic_only_motion_child_binding"]'))
+          $observationNodes = @($report.SelectNodes('//property[@name="diagnostic_only_motion_child_observations"]'))
+          if (@($properties | Where-Object { $_.name -notlike 'diagnostic_only_motion_child_*' }).Count -ne 0 -or
+              $bindingNodes.Count -ne 1 -or $observationNodes.Count -ne 1) {
+            throw 'Motion child replay emitted an invalid qualification scope'
+          }
+          $binding = $bindingNodes[0].value | ConvertFrom-Json
+          $observed = $observationNodes[0].value | ConvertFrom-Json
+          if ($binding.diagnostic_only -ne $true -or $binding.product_qualification -ne $false -or
+              $binding.installer_head -ne $env:K5_DESKTOP_HEAD_SHA -or $binding.harness_head -ne $env:K5_DIAGNOSTIC_HARNESS_HEAD_SHA -or
+              $binding.installer_sha256 -ne $env:K5_DESKTOP_SETUP_SHA256 -or
+              $binding.observer_sha256 -ne '5bf5140835d7b466b5e719ceba248bfe8a20e82c9237ff5240f7e108cf1541a1' -or
+              $binding.wrapper_sha256 -ne $env:K5_MOTION_CHILD_WRAPPER_SHA256 -or $binding.normal_admission_changed -ne $false -or
+              $observed.diagnostic_only -ne $true -or $observed.product_qualification -ne $false -or
+              $observed.observer_count -ne 1 -or @($observed.cohorts).Count -ne 1) {
+            throw 'Motion child product, harness or observer binding mismatch'
+          }
+          if ($testResult -ne 0) { throw 'Diagnostic-only Motion replay reproduced a failing original criterion' }
+      - name: Retain only explicitly diagnostic read-only observations
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: diagnostic-only-0bc-motion-child-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            motion-child-diagnostic.xml
+            motion-child-replay-provenance.json
+          if-no-files-found: warn
+          retention-days: 14
