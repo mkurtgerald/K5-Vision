@@ -475,7 +475,7 @@ def test_native_windows_legacy_service_migration_and_manual_reversal(record_test
     began = time.monotonic()
     copy_witness = None
     try:
-        d._install_gui(baseline, old_installed, api)
+        d._install_gui(baseline, old_installed, api, diagnostic=diagnostic)
         _assert_installed(
             old_installed, old_head, os.environ["K5_DESKTOP_BASELINE_LAUNCHER_SHA256"]
         )
@@ -617,7 +617,7 @@ def test_native_windows_legacy_service_migration_and_manual_reversal(record_test
             "site_id"
         ]
         diagnostic["phase"] = "candidate_install"
-        d._install_gui(candidate, installed, api)
+        d._install_gui(candidate, installed, api, diagnostic=diagnostic)
         _assert_installed(installed, new_head, os.environ["K5_DESKTOP_LAUNCHER_SHA256"])
         assert _installed_payload_check(installed) == 0
         owned_trees[machine_profile] = (
@@ -860,7 +860,7 @@ def test_native_windows_legacy_service_migration_and_manual_reversal(record_test
         assert _security(profile)["cipher_hash"] == old_security["cipher_hash"]
         assert sorted(value.hex() for value in d._closed_hashes(profile).values()) == closed_hashes
         diagnostic["phase"] = "manual_reversal_old_gui"
-        d._install_gui(baseline, old_installed, api)
+        d._install_gui(baseline, old_installed, api, diagnostic=diagnostic)
         _assert_installed(
             old_installed, old_head, os.environ["K5_DESKTOP_BASELINE_LAUNCHER_SHA256"]
         )

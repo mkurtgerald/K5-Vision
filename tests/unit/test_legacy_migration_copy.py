@@ -13,6 +13,7 @@ import test_operator_time_admin as time_helpers
 
 from k5vision import identity_state
 from k5vision import legacy_migration_copy as copy
+from k5vision import windows_identity_security as windows_security
 from k5vision.windows_identity_security import (
     _OWNER_RIGHTS,
     AccessEntry,
@@ -476,3 +477,138 @@ def test_public_entry_requires_native_elevated_owner_and_hides_private_failure(m
         copy.copy_to_service_stage(Path("PRIVATE"), {}, str(uuid4()))
     assert str(error.value) == "Legacy migration copy is unavailable"
     assert error.value.__context__ is None and error.value.__cause__ is None
+
+
+@pytest.fixture
+def native_stage_constructor(private_profile, monkeypatch):
+    """Exercise the real constructor/policy with explicitly mocked Win32 queries."""
+    current_user = "S-1-5-21-1001"
+    local_data = private_profile / "native-local-appdata"
+    identity = local_data / "K5VisionOperatorState" / "identity"
+    identity.mkdir(mode=0o700, parents=True)
+    identity.parent.chmod(0o700)
+    local_data.chmod(0o700)
+    state = SimpleNamespace(
+        owner=copy._BA,
+        entries=_python_private_acl(),
+        parent_entries=_python_private_acl(),
+        elevated=True,
+        administrator=True,
+        descriptors=[],
+        known_folders=[],
+        identity=identity,
+        current_user=current_user,
+    )
+
+    class Function:
+        def __init__(self, callback=lambda *_args: 1):
+            self.callback = callback
+
+        def __call__(self, *args):
+            return self.callback(*args)
+
+    class Library:
+        def __getattr__(self, name):
+            value = Function()
+            setattr(self, name, value)
+            return value
+
+    kernel, security, shell = Library(), Library(), Library()
+
+    def token_information(_token, kind, output, _size, _returned):
+        assert kind == 20
+        copy.ctypes.cast(output, copy.ctypes.POINTER(copy.ctypes.c_uint32))[0] = int(state.elevated)
+        return 1
+
+    security.GetTokenInformation = Function(token_information)
+    shell.IsUserAnAdmin = Function(lambda: int(state.administrator))
+
+    def descriptor(path):
+        # Same WCHAR ABI contract as the actual _NativeSecurity adapter.
+        assert type(path) is str
+        state.descriptors.append(path)
+        if path == str(identity):
+            return state.owner, state.entries
+        return copy._BA, state.parent_entries
+
+    native = SimpleNamespace(
+        kernel=kernel,
+        security=security,
+        current_user=lambda: current_user,
+        sid=lambda _pointer: _SERVICE,
+        descriptor=descriptor,
+        trusted_installer=lambda: False,
+    )
+
+    def known_folder(identifier):
+        state.known_folders.append(identifier)
+        assert identifier in {copy._LOCAL_DATA, copy._PROGRAM_DATA}
+        return local_data if identifier == copy._LOCAL_DATA else private_profile / "ProgramData"
+
+    libraries = {"kernel32": kernel, "advapi32": security, "shell32": shell}
+    monkeypatch.setattr(
+        copy.ctypes, "WinDLL", lambda name, **_kwargs: libraries[name], raising=False
+    )
+    monkeypatch.setattr(copy, "os", SimpleNamespace(name="nt", fspath=os.fspath))
+    monkeypatch.setattr(copy, "_native_security", lambda: native)
+    monkeypatch.setattr(copy, "_known_folder", known_folder)
+    monkeypatch.setattr(windows_security, "_native_security", lambda: native)
+    monkeypatch.setattr(identity_state, "_WINDOWS", True)
+    monkeypatch.setattr(identity_state, "check_windows_volume", lambda _path: None)
+    return state
+
+
+@pytest.mark.parametrize("owner", ["current_user", copy._BA, copy._SY])
+def test_constructor_admits_only_fixed_current_profile_with_generic_private_owner_policy(
+    native_stage_constructor, monkeypatch, owner
+):
+    state = native_stage_constructor
+    state.owner = state.current_user if owner == "current_user" else owner
+    # Environment/caller-selected profile paths never select the admitted source.
+    monkeypatch.setenv("LOCALAPPDATA", "untrusted-other-user-profile")
+    stage = copy._WindowsStage()
+    assert stage.service == _SERVICE
+    assert state.known_folders == [copy._LOCAL_DATA, copy._PROGRAM_DATA]
+    assert str(state.identity) in state.descriptors
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "foreign_owner",
+        "foreign_read",
+        "foreign_write",
+        "users_read",
+        "missing_inheritance",
+        "mutable_parent",
+        "reparse_leaf",
+        "not_elevated",
+        "not_administrator",
+    ],
+)
+def test_constructor_still_refuses_foreign_profiles_unsafe_acls_links_and_tokens(
+    native_stage_constructor, change
+):
+    state = native_stage_constructor
+    if change == "foreign_owner":
+        state.owner = _FOREIGN
+    elif change in {"foreign_read", "foreign_write", "users_read"}:
+        sid = "S-1-5-32-545" if change == "users_read" else _FOREIGN
+        mask = 0x40000000 if change == "foreign_write" else 0x80000000
+        state.entries += (AccessEntry(0, 0, mask, sid),)
+    elif change == "missing_inheritance":
+        state.entries = tuple(AccessEntry(0, 0, entry.mask, entry.sid) for entry in state.entries)
+    elif change == "mutable_parent":
+        state.parent_entries += (AccessEntry(0, 0, 0x40000000, _FOREIGN),)
+    elif change == "reparse_leaf":
+        target = state.identity.with_name("other-identity")
+        target.mkdir(mode=0o700)
+        state.identity.rmdir()
+        state.identity.symlink_to(target, target_is_directory=True)
+    elif change == "not_elevated":
+        state.elevated = False
+    elif change == "not_administrator":
+        state.administrator = False
+    with pytest.raises((ValueError, identity_state.IdentityStateError)):
+        copy._WindowsStage()
+    assert copy._PROGRAM_DATA not in state.known_folders

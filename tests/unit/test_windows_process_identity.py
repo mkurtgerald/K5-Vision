@@ -65,9 +65,14 @@ def test_native_process_tree_binds_an_actual_owned_child():
         handle = native.api.OpenProcess(0x00101000, False, child.pid)
         assert handle
         pinned_child = _NATIVE.PinnedConsoleHost(native, identity, handle, {})
+        assert native._handle_creation(handle) == identity[1]
         assert not pinned_child.exited()
         child.stdin.close()
         child.wait(timeout=5)
+        assert native._handle_birth(handle) is None
+        assert native._handle_creation(handle) == identity[1]
+        assert native.parent_creation(child.pid) == identity[1]
+        assert native._live_parent_birth(handle) is None
         assert pinned_child.exited() and pinned_child.cached_exit["exit_code"] == 0
         pinned_child.close()
         assert pinned_child.handle is None and pinned_child.exited()
@@ -144,6 +149,61 @@ def test_missing_child_and_unrelated_parent_never_become_owned():
     ) == ((11, _BASE),)
 
 
+@pytest.mark.parametrize("correction", [-_STEP, _STEP], ids=["backward48h", "forward48h"])
+def test_completed_snapshot_publishes_exact_edges_without_chronological_order(correction):
+    births = {11: _BASE, 12: _BASE + correction, 13: _BASE - correction}
+    parents = {12: 11, 13: 12}
+    edges = {}
+    assert set(
+        _NATIVE.descendant_identities(
+            (11, _BASE), parents, births.get, lambda: dict(parents), edge_sink=edges
+        )
+    ) == set(births.items())
+    assert edges == {
+        (12, births[12]): (11, births[11]),
+        (13, births[13]): (12, births[12]),
+    }
+
+
+@pytest.mark.parametrize("fault", ["root_reuse", "changed_edge", "query_failure"])
+def test_unstable_or_incomplete_snapshot_cannot_publish_nominated_edges(fault):
+    births = {11: _BASE, 12: _BASE - _STEP, 13: _BASE + _STEP}
+    parents = {12: 11, 13: 12}
+    edges = {}
+
+    def final_topology():
+        if fault == "query_failure":
+            raise OSError("unretained native query detail")
+        if fault == "root_reuse":
+            births[11] += 1
+            return parents
+        return {12: 99, 13: 12}
+
+    if fault == "query_failure":
+        with pytest.raises(OSError):
+            _NATIVE.descendant_identities(
+                (11, _BASE), parents, births.get, final_topology, edge_sink=edges
+            )
+    else:
+        result = _NATIVE.descendant_identities(
+            (11, _BASE), parents, births.get, final_topology, edge_sink=edges
+        )
+        assert result == (() if fault == "root_reuse" else ((11, _BASE),))
+    assert edges == {}
+
+
+def test_native_descendants_replace_previous_snapshot_edges_after_root_reuse():
+    native = _NATIVE.NativeProcessTree.__new__(_NATIVE.NativeProcessTree)
+    births, parents = {11: _BASE, 12: _BASE - _STEP}, {12: 11}
+    native.parents = lambda: dict(parents)
+    native.birth = births.get
+    assert native.descendants((11, _BASE)) == tuple(births.items())
+    assert native.last_identity_edges == {(12, births[12]): (11, _BASE)}
+    births[11] += 1
+    assert native.descendants((11, _BASE)) == ()
+    assert native.last_identity_edges == {}
+
+
 _INSTALL = PureWindowsPath(r"C:\Program Files\K5 Vision")
 _SERVICE_SID = b"native service TokenUser"
 
@@ -185,12 +245,28 @@ def _cohort(monkeypatch, births, parents, details=None):
     class Native:
         def __init__(self):
             self.last_parents = parents
+            self.last_identity_edges = {}
 
         def birth(self, pid, **_kwargs):
             return births.get(pid)
 
         def descendants(self, root):
-            return _NATIVE.descendant_identities(root, parents, births.get, lambda: dict(parents))
+            self.last_identity_edges = {}
+            return _NATIVE.descendant_identities(
+                root,
+                parents,
+                births.get,
+                lambda: dict(parents),
+                edge_sink=self.last_identity_edges,
+            )
+
+        def pin_service_parent(self, identity, kind, service_sid, expected_image):
+            assert kind in {"python", "mediamtx", "caddy"}
+            assert service_sid == _SERVICE_SID
+            assert PureWindowsPath(self.details(identity)["image"]) == PureWindowsPath(
+                expected_image
+            )
+            return SimpleNamespace(identity=identity, kind=kind, handle=None, close=lambda: None)
 
         def service_sid(self):
             return _SERVICE_SID
@@ -220,6 +296,7 @@ def _cohort(monkeypatch, births, parents, details=None):
     cohort.roots, cohort.processes, cohort.native_identities = [], {}, {}
     cohort.root_roles, cohort.ownership_records = {}, {}
     cohort.console_pins = {}
+    cohort.parent_pins = {}
     cohort.console_individual_termination_used = False
     cohort.failed = False
     cohort.first_failure = None
@@ -558,31 +635,60 @@ def _console_cohort(monkeypatch, *, parent_kind="python", fault=None):
     class Kernel:
         def __init__(self):
             self.objects, self.closed = {}, []
+            self.query_handles, self.query_closed = set(), []
+            self.originals = {}
 
         def OpenProcess(self, rights, inherited, pid):
-            assert rights == 0x00101000 and not rights & 1 and not inherited
+            assert rights in {0x00101000, 0x1000} and not rights & 1 and not inherited
+            if pid not in births:
+                return 0
+            identity = pid, births[pid]
+            process = self.originals.setdefault(identity, {"identity": identity, "running": True})
             handle = 100 + len(self.objects)
-            self.objects[handle] = {"identity": (pid, births[pid]), "running": True}
+            self.objects[handle] = process
+            if rights == 0x1000:
+                self.query_handles.add(handle)
             return handle
+
+        def GetProcessTimes(self, handle, created, exited, kernel, user):
+            assert isinstance(created._obj, _NATIVE._FileTime)
+            birth = self.objects[handle]["identity"][1]
+            created._obj.low, created._obj.high = birth & 0xFFFFFFFF, birth >> 32
+            for value in (exited, kernel, user):
+                value._obj.low = value._obj.high = 0
+            return True
 
         def WaitForSingleObject(self, handle, timeout):
             assert timeout == 0
             return 258 if self.objects[handle]["running"] else 0
 
         def GetExitCodeProcess(self, handle, output):
+            assert isinstance(output._obj, _NATIVE.wintypes.DWORD)
             output._obj.value = 259 if self.objects[handle]["running"] else 1
             return True
 
         def CloseHandle(self, handle):
-            self.closed.append(handle)
+            (self.query_closed if handle in self.query_handles else self.closed).append(handle)
             return True
 
     kernel = Kernel()
+    monkeypatch.setattr(_NATIVE.ctypes, "get_last_error", lambda: 87, raising=False)
     cohort.native.api = kernel
-    cohort.native._handle_birth = lambda handle: (
-        kernel.objects[handle]["identity"][1] if kernel.objects[handle]["running"] else None
+    cohort.native._handle_creation = _NATIVE.NativeProcessTree._handle_creation.__get__(
+        cohort.native
+    )
+    cohort.native._handle_birth = _NATIVE.NativeProcessTree._handle_birth.__get__(cohort.native)
+    cohort.native._live_parent_birth = _NATIVE.NativeProcessTree._live_parent_birth.__get__(
+        cohort.native
+    )
+    cohort.native.parent_creation = _NATIVE.NativeProcessTree.parent_creation.__get__(cohort.native)
+    cohort.native.pin_service_parent = _NATIVE.NativeProcessTree.pin_service_parent.__get__(
+        cohort.native
     )
     cohort.native.admit_console_host = _NATIVE.NativeProcessTree.admit_console_host.__get__(
+        cohort.native
+    )
+    cohort.native._verify_console_parent = _NATIVE.NativeProcessTree._verify_console_parent.__get__(
         cohort.native
     )
 
@@ -622,7 +728,8 @@ def test_console_nomination_never_waives_image_session_or_os_custody(monkeypatch
 def test_foreign_token_console_host_is_excluded_before_any_handle_pin(monkeypatch):
     cohort, kernel, _ = _console_cohort(monkeypatch, fault="sid")
     assert {p.pid for p in cohort.snapshot()} == {11, 12}
-    assert not kernel.objects and not cohort.console_pins
+    assert {row["identity"][0] for row in kernel.objects.values()} == {12}
+    assert not cohort.console_pins
 
 
 def test_console_host_under_host_wrapper_cannot_borrow_an_allowed_parent_role(monkeypatch):
@@ -630,6 +737,206 @@ def test_console_host_under_host_wrapper_cannot_borrow_an_allowed_parent_role(mo
     with pytest.raises(RuntimeError):
         cohort.snapshot()
     assert cohort.failed and not kernel.objects
+
+
+@pytest.mark.parametrize("phase", ["before_child_query", "during_os_custody"])
+def test_exact_pinned_parent_exit_after_stable_snapshot_does_not_disown_console(monkeypatch, phase):
+    cohort, kernel, births = _console_cohort(monkeypatch)
+    original_details = cohort.native.details
+    original_custody = _NATIVE.admit_system_console_file
+    parent_identity = 12, births[12]
+    child_identity = 13, births[13]
+    expired = []
+
+    def expire_original_parent():
+        if expired:
+            return
+        assert cohort.native.last_identity_edges[child_identity] == parent_identity
+        parent_pin = cohort.parent_pins[parent_identity]
+        assert parent_pin.identity == parent_identity
+        kernel.objects[parent_pin.handle]["running"] = False
+        births.pop(parent_identity[0])
+        assert cohort.native._handle_birth(parent_pin.handle) is None
+        assert cohort.native._handle_creation(parent_pin.handle) == parent_identity[1]
+        expired.append(parent_pin)
+
+    def details(identity):
+        if identity == child_identity and phase == "before_child_query":
+            expire_original_parent()
+        return original_details(identity)
+
+    def custody(image, system):
+        result = original_custody(image, system)
+        if phase == "during_os_custody":
+            expire_original_parent()
+        return result
+
+    cohort.native.details = details
+    monkeypatch.setattr(_NATIVE, "admit_system_console_file", custody)
+    assert {process.pid for process in cohort.snapshot()} == {11, 12, 13}
+    assert len(expired) == 1 and not cohort.failed
+    parent_pin, child_pin = expired[0], cohort.console_pins[child_identity]
+    assert child_pin.facts["parent_created_100ns"] == parent_identity[1] > 2**53
+    assert child_pin.facts["admitted_parent_identity_verified"] is True
+    assert parent_pin.exited() and parent_pin.cached_exit == {"exited": True, "exit_code": 1}
+    parent_handle, child_handle = parent_pin.handle, child_pin.handle
+    assert not kernel.closed  # Retained original parent still backs the admitted child.
+    kernel.objects[child_handle]["running"] = False
+    births.clear()
+    _finish_ready(cohort)
+    cohort.finish()
+    assert not cohort.failed
+    assert kernel.closed == [child_handle, parent_handle]
+    assert child_pin.handle is parent_pin.handle is None
+    assert not cohort.console_individual_termination_used
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "parent_pid_reused",
+        "missing_edge",
+        "wrong_edge_birth",
+        "changed_current_topology",
+        "missing_parent_pin",
+        "closed_parent_pin",
+        "foreign_pin_kind",
+        "foreign_pin_sid",
+        "foreign_pin_native",
+        "wrong_pin_identity",
+        "changed_handle_creation",
+        "parent_query_failure",
+        "current_parent_query_failure",
+        "unavailable_live_parent",
+    ],
+)
+def test_pinned_parent_exit_exception_never_waives_exact_edge_or_native_proof(monkeypatch, fault):
+    cohort, kernel, births = _console_cohort(monkeypatch)
+    original_details = cohort.native.details
+    parent_identity, child_identity = (12, births[12]), (13, births[13])
+    changed = []
+
+    def details(identity):
+        if identity == child_identity and not changed:
+            changed.append(True)
+            parent_pin = cohort.parent_pins[parent_identity]
+            if fault == "parent_pid_reused":
+                kernel.objects[parent_pin.handle]["running"] = False
+                births[12] += 1
+            elif fault == "missing_edge":
+                cohort.native.last_identity_edges.pop(child_identity)
+            elif fault == "wrong_edge_birth":
+                cohort.native.last_identity_edges[child_identity] = (12, parent_identity[1] + 1)
+            elif fault == "changed_current_topology":
+                cohort.native.last_parents[13] = 99
+            elif fault == "missing_parent_pin":
+                cohort.parent_pins.pop(parent_identity).close()
+            elif fault == "closed_parent_pin":
+                parent_pin.close()
+            elif fault == "foreign_pin_kind":
+                parent_pin.kind = "host"
+            elif fault == "foreign_pin_sid":
+                parent_pin.service_sid = b"foreign TokenUser"
+            elif fault == "foreign_pin_native":
+                parent_pin.native = object()
+            elif fault == "wrong_pin_identity":
+                parent_pin.identity = (12, parent_identity[1] + 1)
+            elif fault == "changed_handle_creation":
+                kernel.objects[parent_pin.handle]["identity"] = (12, parent_identity[1] + 1)
+            elif fault == "parent_query_failure":
+                original_query = kernel.GetProcessTimes
+                kernel.GetProcessTimes = lambda handle, *values: (
+                    False if handle == parent_pin.handle else original_query(handle, *values)
+                )
+            elif fault == "current_parent_query_failure":
+
+                def unavailable_birth(pid):
+                    raise OSError("unretained original parent query detail")
+
+                cohort.native.parent_creation = unavailable_birth
+            elif fault == "unavailable_live_parent":
+                # Fresh PID lookup is absent while retained original is live.
+                cohort.native.parent_creation = lambda pid: None
+        return original_details(identity)
+
+    cohort.native.details = details
+    with pytest.raises(RuntimeError):
+        cohort.snapshot()
+    assert changed and cohort.failed and not cohort.console_pins
+    assert child_identity not in cohort.processes
+    assert all(
+        handle in kernel.closed
+        for handle, process in kernel.objects.items()
+        if process["identity"] == child_identity
+    )
+    note = cohort.ownership_records[child_identity]
+    assert note["accepted"] is False and note["outcome"] == "proof_unavailable"
+
+
+@pytest.mark.parametrize("changed", ["exact_edge", "current_topology"])
+def test_parent_edge_is_rechecked_after_console_os_custody(monkeypatch, changed):
+    cohort, kernel, births = _console_cohort(monkeypatch)
+    child_identity = 13, births[13]
+    original_custody = _NATIVE.admit_system_console_file
+
+    def custody(image, system):
+        result = original_custody(image, system)
+        if changed == "exact_edge":
+            cohort.native.last_identity_edges[child_identity] = (12, births[12] + 1)
+        else:
+            cohort.native.last_parents[13] = 99
+        return result
+
+    monkeypatch.setattr(_NATIVE, "admit_system_console_file", custody)
+    with pytest.raises(RuntimeError):
+        cohort.snapshot()
+    assert cohort.failed and not cohort.console_pins
+    child_handles = [
+        handle for handle, row in kernel.objects.items() if row["identity"] == child_identity
+    ]
+    assert child_handles and all(handle in kernel.closed for handle in child_handles)
+
+
+@pytest.mark.parametrize("fault", ["sid", "session", "image", "birth", "query"])
+def test_service_parent_pin_independently_rechecks_native_authority_and_closes_on_failure(
+    monkeypatch, fault
+):
+    cohort, kernel, births = _console_cohort(monkeypatch)
+    identity = 12, births[12]
+    original_details = cohort.native.details
+    expected = original_details(identity)["image"]
+
+    def details(value):
+        result = dict(original_details(value))
+        if fault == "sid":
+            result["sid"] = b"foreign TokenUser"
+        elif fault == "session":
+            result["session"] = 1
+        elif fault == "image":
+            result["image"] = r"C:\foreign\python.exe"
+        return result
+
+    cohort.native.details = details
+    if fault == "birth":
+        identity = 12, births[12] + 1
+    elif fault == "query":
+        kernel.GetProcessTimes = lambda *_args: False
+    with pytest.raises((OSError, RuntimeError)):
+        cohort.native.pin_service_parent(identity, "python", _SERVICE_SID, expected)
+    assert len(kernel.objects) == 1 and kernel.closed == list(kernel.objects)
+
+
+def test_retained_parent_close_failure_preserves_handle_and_does_not_terminate(monkeypatch):
+    cohort, kernel, _ = _console_cohort(monkeypatch)
+    cohort.snapshot()
+    parent_pin = next(iter(cohort.parent_pins.values()))
+    original_handle = parent_pin.handle
+    kernel.CloseHandle = lambda _handle: False
+    with pytest.raises(RuntimeError, match="released"):
+        parent_pin.close()
+    assert parent_pin.handle == original_handle
+    assert kernel.objects[original_handle]["running"]
+    assert not cohort.console_individual_termination_used
 
 
 def test_pinned_exit_does_not_follow_pid_reuse_or_individual_termination(monkeypatch):
@@ -692,11 +999,12 @@ def test_finish_closes_exited_pin_once_and_receipt_keeps_os_helper_separate(monk
     assert len(cohort.snapshot()) == 6
     pin = next(iter(cohort.console_pins.values()))
     handle = pin.handle
+    parent_handles = [parent_pin.handle for parent_pin in cohort.parent_pins.values()]
     kernel.objects[handle]["running"] = False
     births.clear()
     _finish_ready(cohort)
     cohort.finish()
-    assert not cohort.failed and kernel.closed == [handle]
+    assert not cohort.failed and kernel.closed == [handle, *parent_handles]
     receipt = cohort.ownership_receipt()
     assert receipt["admitted_service_count"] == 5
     assert receipt["admitted_service_images"] == ["caddy", "host", "mediamtx", "python", "wrapper"]
@@ -717,6 +1025,7 @@ def test_finish_live_helper_fails_once_with_existing_cleanup_budget_and_no_kill(
     cohort.snapshot()
     pin = next(iter(cohort.console_pins.values()))
     handle, calls = pin.handle, []
+    parent_handles = [parent_pin.handle for parent_pin in cohort.parent_pins.values()]
     _finish_ready(cohort)
     cohort.service_stopped = False
 
@@ -729,7 +1038,7 @@ def test_finish_live_helper_fails_once_with_existing_cleanup_budget_and_no_kill(
     monkeypatch.setattr(_DESKTOP, "_wait_owned_cleanup", observe)
     cohort.finish()
     assert calls == ["stop", "existing_wait"]
-    assert cohort.failed and kernel.closed == [handle]
+    assert cohort.failed and kernel.closed == [handle, *parent_handles]
     assert pin.cached_exit == {"exited": False, "exit_code": None}
     assert not cohort.console_individual_termination_used
 
@@ -812,3 +1121,135 @@ def test_observer_retains_first_finite_failure_without_private_exception_content
     assert "private path" not in str(note) and "credentials" not in str(note)
     cohort._record_failure(RuntimeError("later private failure"), "finish_pin_close")
     assert cohort.first_failure is note
+
+
+@pytest.mark.parametrize(
+    "fault", ["exit_query", "creation_query", "release", "dead_reused_pid", "access_denied"]
+)
+def test_fresh_parent_native_failures_or_dead_pid_reuse_are_not_exit_proof(monkeypatch, fault):
+    cohort, kernel, births = _console_cohort(monkeypatch)
+    original_details = cohort.native.details
+    original_open, original_exit = kernel.OpenProcess, kernel.GetExitCodeProcess
+    original_times, original_close = kernel.GetProcessTimes, kernel.CloseHandle
+    changed = []
+
+    def open_process(rights, inherited, pid):
+        if rights == 0x1000 and fault == "access_denied":
+            return 0
+        handle = original_open(rights, inherited, pid)
+        if rights == 0x1000 and fault == "dead_reused_pid":
+            kernel.objects[handle]["running"] = False
+        return handle
+
+    def exit_code(handle, output):
+        return (
+            False
+            if handle in kernel.query_handles and fault == "exit_query"
+            else original_exit(handle, output)
+        )
+
+    def creation(handle, *values):
+        return (
+            False
+            if handle in kernel.query_handles and fault == "creation_query"
+            else original_times(handle, *values)
+        )
+
+    def close(handle):
+        return (
+            False
+            if handle in kernel.query_handles and fault == "release"
+            else original_close(handle)
+        )
+
+    def details(identity):
+        if identity[0] == 13 and not changed:
+            changed.append(True)
+            original_pin = cohort.parent_pins[(12, births[12])]
+            kernel.objects[original_pin.handle]["running"] = False
+            if fault == "dead_reused_pid":
+                births[12] += 1
+            kernel.OpenProcess, kernel.GetExitCodeProcess = open_process, exit_code
+            kernel.GetProcessTimes, kernel.CloseHandle = creation, close
+            if fault == "access_denied":
+                monkeypatch.setattr(_NATIVE.ctypes, "get_last_error", lambda: 5)
+        return original_details(identity)
+
+    cohort.native.details = details
+    with pytest.raises(RuntimeError):
+        cohort.snapshot()
+    assert changed and cohort.failed and not cohort.console_pins
+    assert cohort.ownership_records[(13, births[13])]["outcome"] == "proof_unavailable"
+    if fault not in {"access_denied", "release"}:
+        assert kernel.query_handles and set(kernel.query_closed) == kernel.query_handles
+    if fault == "release":
+        assert kernel.query_handles and not kernel.query_closed
+    assert all(
+        handle in kernel.closed
+        for handle, process in kernel.objects.items()
+        if process["identity"][0] == 13
+    )
+
+
+@pytest.mark.parametrize(
+    "phase", ["initial_exit_query", "final_exit_query", "live_authority_lookup"]
+)
+def test_new_parent_pin_native_query_failure_is_not_silently_skipped(monkeypatch, phase):
+    cohort, kernel, births = _console_cohort(monkeypatch)
+    births.pop(13)
+    cohort.native.last_parents.pop(13)
+    original_exit, original_details = kernel.GetExitCodeProcess, cohort.native.details
+    queries, details_calls = [], []
+
+    def exit_code(handle, output):
+        queries.append(handle)
+        fail_at = 1 if phase == "initial_exit_query" else 2
+        if phase != "live_authority_lookup" and len(queries) == fail_at:
+            return False
+        return original_exit(handle, output)
+
+    def details(identity):
+        if identity[0] == 12:
+            details_calls.append(identity)
+            if phase == "live_authority_lookup" and len(details_calls) == 2:
+                raise ProcessLookupError("Unretained native authority detail")
+        return original_details(identity)
+
+    kernel.GetExitCodeProcess, cohort.native.details = exit_code, details
+    with pytest.raises(RuntimeError):
+        cohort.snapshot()
+    assert cohort.failed and not cohort.parent_pins and not cohort.console_pins
+    assert kernel.objects and kernel.closed == list(kernel.objects)
+    assert cohort.ownership_records[(12, births[12])]["outcome"] == "proof_unavailable"
+
+
+@pytest.mark.parametrize("target", ["parent", "child"])
+def test_failed_pin_transfer_cannot_hide_native_release_failure_as_disappearance(
+    monkeypatch, target
+):
+    cohort, kernel, births = _console_cohort(monkeypatch)
+    target_pid = 12 if target == "parent" else 13
+    if target == "parent":
+        births.pop(13)
+        cohort.native.last_parents.pop(13)
+    original_open, original_close = kernel.OpenProcess, kernel.CloseHandle
+    rejected_handles = []
+
+    def open_exited(rights, inherited, pid):
+        handle = original_open(rights, inherited, pid)
+        if rights == 0x00101000 and pid == target_pid:
+            kernel.objects[handle]["running"] = False
+            rejected_handles.append(handle)
+        return handle
+
+    def close(handle):
+        return False if handle in rejected_handles else original_close(handle)
+
+    kernel.OpenProcess, kernel.CloseHandle = open_exited, close
+    with pytest.raises(RuntimeError):
+        cohort.snapshot()
+    assert rejected_handles and cohort.failed and not cohort.console_pins
+    assert all(handle not in kernel.closed for handle in rejected_handles)
+    assert (
+        cohort.ownership_records[(target_pid, births[target_pid])]["outcome"] == "proof_unavailable"
+    )

@@ -324,10 +324,9 @@ class _WindowsStage:
             raise ValueError
         legacy = _known_folder(_LOCAL_DATA) / "K5VisionOperatorState" / "identity"
         identity_state._checked_path(legacy)
+        # The fixed current profile uses the established TokenUser/BA/SY policy;
+        # an elevated creator's private Python0700 directory can be BA-owned.
         identity_state._windows_admission(legacy, private=True, directory=True)
-        owner, _ = self.native.descriptor(legacy)
-        if owner != self.native.current_user():
-            raise ValueError
         self.program_data = _known_folder(_PROGRAM_DATA)
         self.root = self.program_data / "K5Vision"
         self._pins = []

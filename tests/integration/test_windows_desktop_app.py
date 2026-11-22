@@ -340,6 +340,7 @@ class _Cohort:
         self.root_roles = {}
         self.ownership_records = {}
         self.console_pins = {}
+        self.parent_pins = {}
         self.console_individual_termination_used = False
         self.console_seen = False
         self.failed = False
@@ -432,18 +433,27 @@ class _Cohort:
                 and PureWindowsPath(details["image"]).name.casefold() == "conhost.exe"
                 and details["sid"] == self.native.service_sid()
             ):
-                parent_pid = self.native.parents().get(identity[0])
-                parent = parent_pid, self.native.birth(parent_pid) if parent_pid else None
+                # This exact edge was checked while both original identities
+                # were live in the completed descendant traversal. A later
+                # parent exit does not change the retained process object.
+                parent = self.native.last_identity_edges.get(identity)
                 admitted_parent = self.ownership_records.get(parent)
+                parent_pin = self.parent_pins.get(parent)
                 if (
-                    admitted_parent is None
+                    parent is None
+                    or parent_pin is None
+                    or admitted_parent is None
                     or not admitted_parent["accepted"]
                     or admitted_parent["role"] != "service"
                     or admitted_parent["kind"] not in {"python", "mediamtx", "caddy"}
                 ):
                     raise RuntimeError("Console host parent identity was not positively admitted")
                 pin = self.native.admit_console_host(
-                    identity, parent, admitted_parent["kind"], self.native.service_sid()
+                    identity,
+                    parent,
+                    admitted_parent["kind"],
+                    self.native.service_sid(),
+                    parent_pin=parent_pin,
                 )
                 self.console_pins[identity] = pin
                 note = {
@@ -466,6 +476,14 @@ class _Cohort:
                 root=root,
                 diagnose_image=helper.image_diagnostic,
             )
+            if note["accepted"] and note["kind"] in {"python", "mediamtx", "caddy"}:
+                if identity not in self.parent_pins:
+                    expected_image = next(
+                        path for path, kind in images.items() if kind == note["kind"]
+                    )
+                    self.parent_pins[identity] = self.native.pin_service_parent(
+                        identity, note["kind"], self.native.service_sid(), expected_image
+                    )
         except ProcessLookupError:
             return False
         except helper.OwnershipFailure as error:
@@ -792,6 +810,14 @@ class _Cohort:
                         except BaseException as error:
                             self._record_failure(error, "finish_pin_close")
                             self.failed = True
+        # Parent query references outlive every console-child admission and
+        # exit check; closing them cannot terminate any process.
+        for pin in self.parent_pins.values():
+            try:
+                pin.close()
+            except BaseException as error:
+                self._record_failure(error, "finish_pin_close")
+                self.failed = True
 
 
 def _wait(condition, label, *, timeout=30, process=None):

@@ -74,6 +74,54 @@ def admit_system_console_file(image, system_directory):
     return {"system_file_identity_verified": True, "trusted_code_custody_verified": True}
 
 
+class PinnedServiceParent:
+    """Retain an already-admitted parent object, including after native exit."""
+
+    def __init__(self, native, identity, handle, kind, service_sid):
+        self.native, self.identity, self.handle = native, identity, handle
+        self.kind, self.service_sid, self.cached_exit = kind, service_sid, None
+
+    def validate(self, identity, kind, service_sid):
+        if (
+            self.handle is None
+            or self.identity != identity
+            or self.kind != kind
+            or self.service_sid != service_sid
+            or self.native._handle_creation(self.handle) != identity[1]
+        ):
+            raise RuntimeError("Original admitted service parent identity differs")
+
+    def exited(self):
+        self.validate(self.identity, self.kind, self.service_sid)
+        state = self.native.api.WaitForSingleObject(self.handle, 0)
+        if state == 258:
+            return False
+        if state != 0:
+            raise RuntimeError("Original service parent exit query failed")
+        code = wintypes.DWORD()
+        if not self.native.api.GetExitCodeProcess(self.handle, ctypes.byref(code)):
+            raise RuntimeError("Original service parent exit code is unavailable")
+        self.cached_exit = {"exited": True, "exit_code": code.value}
+        return True
+
+    def close(self):
+        if self.handle is None:
+            return
+        failure = None
+        try:
+            if not self.exited():
+                self.cached_exit = {"exited": False, "exit_code": None}
+        except BaseException as error:
+            failure = error
+        handle = self.handle
+        if self.native.api.CloseHandle(handle):
+            self.handle = None
+        else:
+            raise RuntimeError("Original service parent query handle could not be released")
+        if failure is not None:
+            raise failure
+
+
 class PinnedConsoleHost:
     """An original process object held with query/synchronize rights only."""
 
@@ -216,8 +264,10 @@ def service_candidate(details, service_sid, images, *, root=False, diagnose_imag
     return result
 
 
-def descendant_identities(root, parent_pids, read_identity, reread_parent_pids):
+def descendant_identities(root, parent_pids, read_identity, reread_parent_pids, *, edge_sink=None):
     """Return a stable root and descendants, rejecting identity/topology races."""
+    if edge_sink is not None:
+        edge_sink.clear()
     if read_identity(root[0]) != root[1]:
         return ()
     children = {}
@@ -265,6 +315,12 @@ def descendant_identities(root, parent_pids, read_identity, reread_parent_pids):
         pending = remaining
     if read_identity(root[0]) != root[1]:
         return ()
+    if edge_sink is not None:
+        edge_sink.update(
+            ((pid, birth), edges[pid])
+            for pid, birth in stable.items()
+            if pid in edges and stable.get(edges[pid][0]) == edges[pid][1]
+        )
     return tuple(stable.items())
 
 
@@ -295,6 +351,7 @@ class NativeProcessTree:
         self.security = ctypes.WinDLL("advapi32", use_last_error=True)
         self._service_sid = None
         self.last_parents = {}
+        self.last_identity_edges = {}
         self.api.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
         self.api.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
         for name in ("Process32FirstW", "Process32NextW"):
@@ -400,30 +457,72 @@ class NativeProcessTree:
             raise OSError("Native Windows system directory could not be read")
         return result.value
 
-    def admit_console_host(self, identity, parent, parent_kind, service_sid):
-        if parent_kind not in {"python", "mediamtx", "caddy"}:
-            raise RuntimeError("Console host parent is not an admitted native executor")
+    def pin_service_parent(self, identity, kind, service_sid, expected_image):
+        if kind not in {"python", "mediamtx", "caddy"}:
+            raise RuntimeError("Service parent is not an admitted native executor")
+        handle = self.api.OpenProcess(0x00101000, False, identity[0])
+        if not handle:
+            raise RuntimeError("Original service parent could not be pinned")
+        transferred = False
+        try:
+            if self._live_parent_birth(handle) != identity[1]:
+                raise ProcessLookupError("Service parent changed before pin admission")
+            try:
+                details = self.details(identity)
+            except ProcessLookupError:
+                if self._live_parent_birth(handle) == identity[1]:
+                    raise RuntimeError(
+                        "Live service parent authority query was unavailable"
+                    ) from None
+                raise
+            if (
+                details["sid"] != service_sid
+                or details["session"] != 0
+                or PureWindowsPath(details["image"]) != PureWindowsPath(expected_image)
+            ):
+                raise RuntimeError("Service parent native authority differs")
+            if self._live_parent_birth(handle) != identity[1]:
+                raise ProcessLookupError("Service parent exited during pin admission")
+            pin = PinnedServiceParent(self, identity, handle, kind, service_sid)
+            transferred = True
+            return pin
+        finally:
+            if not transferred and not self.api.CloseHandle(handle):
+                raise RuntimeError("Untransferred service parent handle could not be released")
+
+    def _verify_console_parent(self, identity, parent, parent_kind, service_sid, parent_pin):
+        if (
+            not isinstance(parent_pin, PinnedServiceParent)
+            or parent_pin.native is not self
+            or parent_kind not in {"python", "mediamtx", "caddy"}
+            or self.last_identity_edges.get(identity) != parent
+            or self.parents().get(identity[0]) != parent[0]
+        ):
+            raise RuntimeError("Console host exact admitted parent edge differs")
+        parent_pin.validate(parent, parent_kind, service_sid)
+        current_birth = self.parent_creation(parent[0])
+        if current_birth is not None:
+            if current_birth != parent[1]:
+                raise RuntimeError("Console host parent PID has a different occupant")
+        elif not parent_pin.exited():
+            raise RuntimeError("Console host original parent liveness is unavailable")
+
+    def admit_console_host(self, identity, parent, parent_kind, service_sid, *, parent_pin):
         handle = self.api.OpenProcess(0x00101000, False, identity[0])
         if not handle:
             raise RuntimeError("Console host original process could not be pinned")
         transferred = False
         try:
-            if self._handle_birth(handle) != identity[1] or self.birth(parent[0]) != parent[1]:
-                raise ProcessLookupError("Console host or parent changed before admission")
+            if self._handle_birth(handle) != identity[1]:
+                raise ProcessLookupError("Console host changed before admission")
+            self._verify_console_parent(identity, parent, parent_kind, service_sid, parent_pin)
             details = self.details(identity)
-            if (
-                details["sid"] != service_sid
-                or details["session"] != 0
-                or self.parents().get(identity[0]) != parent[0]
-            ):
+            if details["sid"] != service_sid or details["session"] != 0:
                 raise RuntimeError("Console host native authority was not admitted")
             facts = admit_system_console_file(details["image"], self.system_directory())
-            if (
-                self.birth(parent[0]) != parent[1]
-                or self._handle_birth(handle) != identity[1]
-                or self.parents().get(identity[0]) != parent[0]
-            ):
-                raise ProcessLookupError("Console host or parent changed during admission")
+            if self._handle_birth(handle) != identity[1]:
+                raise ProcessLookupError("Console host changed during admission")
+            self._verify_console_parent(identity, parent, parent_kind, service_sid, parent_pin)
             facts.update(
                 admitted_parent_identity_verified=True,
                 parent_pid=parent[0],
@@ -433,8 +532,8 @@ class NativeProcessTree:
             transferred = True
             return result
         finally:
-            if not transferred:
-                self.api.CloseHandle(handle)
+            if not transferred and not self.api.CloseHandle(handle):
+                raise RuntimeError("Untransferred console query handle could not be released")
 
     def details(self, identity):
         """Private native facts; callers expose only the finite projection."""
@@ -490,11 +589,8 @@ class NativeProcessTree:
                 self.api.CloseHandle(token)
             self.api.CloseHandle(handle)
 
-    def _handle_birth(self, handle):
+    def _handle_creation(self, handle):
         created, exited, kernel, user = (_FileTime() for _ in range(4))
-        code = wintypes.DWORD()
-        if not self.api.GetExitCodeProcess(handle, ctypes.byref(code)) or code.value != 259:
-            return None
         if not self.api.GetProcessTimes(
             handle,
             ctypes.byref(created),
@@ -504,6 +600,38 @@ class NativeProcessTree:
         ):
             raise OSError("Native process creation identity could not be read")
         return (created.high << 32) | created.low
+
+    def _handle_birth(self, handle):
+        code = wintypes.DWORD()
+        if not self.api.GetExitCodeProcess(handle, ctypes.byref(code)) or code.value != 259:
+            return None
+        return self._handle_creation(handle)
+
+    def _live_parent_birth(self, handle):
+        code = wintypes.DWORD()
+        if not self.api.GetExitCodeProcess(handle, ctypes.byref(code)):
+            raise OSError("Native service parent exit query failed")
+        if code.value != 259:
+            return None
+        return self._handle_creation(handle)
+
+    def parent_creation(self, pid):
+        """Distinguish original exit from an unavailable or reused PID object."""
+        handle = self.api.OpenProcess(0x1000, False, pid)
+        if not handle:
+            error = ctypes.get_last_error()
+            if error in {87, 1168}:
+                return None
+            raise OSError(0, "Native parent identity could not be opened", None, error)
+        try:
+            code = wintypes.DWORD()
+            if not self.api.GetExitCodeProcess(handle, ctypes.byref(code)):
+                raise OSError("Native parent exit query failed")
+            # An exited new PID occupant must still fail exact identity matching.
+            return self._handle_creation(handle)
+        finally:
+            if not self.api.CloseHandle(handle):
+                raise RuntimeError("Native parent query handle could not be released")
 
     def birth(self, pid, *, handle=None):
         if handle is not None:
@@ -540,6 +668,7 @@ class NativeProcessTree:
             self.api.CloseHandle(handle)
 
     def descendants(self, root):
+        self.last_identity_edges = {}
         parents = self.parents()
 
         def identity(pid):
@@ -560,4 +689,7 @@ class NativeProcessTree:
                     }
                 ) from None
 
-        return descendant_identities(root, parents, identity, self.parents)
+        edges = {}
+        result = descendant_identities(root, parents, identity, self.parents, edge_sink=edges)
+        self.last_identity_edges = edges
+        return result

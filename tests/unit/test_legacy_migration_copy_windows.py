@@ -155,7 +155,7 @@ def test_native_migration_copy_windows_actual_security_and_io(record_property):
         entry = _metadata(source)
         original = source.read_bytes()
         before = copy._signature(source.stat())
-        source_acl = stage.native.descriptor(source)
+        source_acl = stage.native.descriptor(os.fspath(source))
         # Explicit private root + genuine inherited descendant descriptors.
         owner, entries, protected = stage._descriptor(stage.root)
         copy._target_policy(
@@ -275,7 +275,7 @@ def test_native_migration_copy_windows_actual_security_and_io(record_property):
         finally:
             os.rmdir(reparse)
         assert source.read_bytes() == original and copy._signature(source.stat()) == before
-        assert stage.native.descriptor(source) == source_acl
+        assert stage.native.descriptor(os.fspath(source)) == source_acl
         record_property("native_copy_security_and_io", "real Win32 APIs; elevated original owner")
         record_property("native_copy_service_token", "not exercised by this adapter test")
         record_property("native_copy_exact_mtime_ns", str(_STAMP))
