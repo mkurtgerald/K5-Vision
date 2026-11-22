@@ -203,6 +203,116 @@ function Assert-CopyContracts {
         }finally{$source.Dispose();$destination.Dispose();$cancellation.Dispose()}
     }
 }
+function Read-BootFailureLive {
+    $vm=Owned-VM
+    $facts=@{vm_state=[string]$vm.State;uptime_seconds=[Math]::Round($vm.Uptime.TotalSeconds,3);cpu_usage=[int]$vm.CPUUsage;memory_assigned_bytes=[long]$vm.MemoryAssigned;intrinsic=@{};own_seal_present=$false}
+    $computer=Get-WmiObject -Namespace root\virtualization\v2 -Class Msvm_ComputerSystem -Filter ("Name='"+$vmId.ToString()+"'")
+    $components=@($computer.GetRelated('Msvm_KvpExchangeComponent'))
+    if($components.Count -eq 1){
+        foreach($raw in @($components[0].GuestIntrinsicExchangeItems)){
+            if($null -eq $raw -or $raw.Length -gt 8192){continue};[xml]$item=$raw
+            $name=$item.SelectSingleNode('/INSTANCE/PROPERTY[@NAME="Name"]/VALUE');$value=$item.SelectSingleNode('/INSTANCE/PROPERTY[@NAME="Data"]/VALUE')
+            if($null -ne $name -and $null -ne $value -and $name.InnerText -in @('OSName','OSVersion','IntegrationServicesVersion','ProcessorArchitecture') -and $value.InnerText.Length -le 256){$facts.intrinsic[$name.InnerText]=$value.InnerText}
+        }
+        foreach($raw in @($components[0].GuestExchangeItems)){
+            if($null -eq $raw -or $raw.Length -gt 8192){continue};[xml]$item=$raw
+            $name=$item.SelectSingleNode('/INSTANCE/PROPERTY[@NAME="Name"]/VALUE');$value=$item.SelectSingleNode('/INSTANCE/PROPERTY[@NAME="Data"]/VALUE')
+            if($null -ne $name -and $null -ne $value -and $name.InnerText -ceq ('K5GuestWitness-'+$transfer)){
+                $facts.own_seal_present=$true
+                if($value.InnerText -match '^(bootstrap|reboot|signout|failed)\|[a-f0-9-]{36}\|[a-f0-9]{64}$'){$facts.own_seal_value=$value.InnerText}
+            }
+        }
+    }
+    # Initial-bootstrap failure only: no keyboard password has been sent and
+    # the first-admin fields use native password controls. No raw log is copied.
+    try{
+        $settings=@($computer.GetRelated('Msvm_VirtualSystemSettingData')|Where-Object{$_.VirtualSystemType -ceq 'Microsoft:Hyper-V:System:Realized'})
+        $manager=Get-WmiObject -Namespace root\virtualization\v2 -Class Msvm_VirtualSystemManagementService
+        if($settings.Count -ne 1){throw 'Actual VM settings unavailable'}
+        $arguments=$manager.GetMethodParameters('GetVirtualSystemThumbnailImage')
+        $arguments['TargetSystem']=$settings[0].Path.Path;$arguments['WidthPixels']=[uint16]640;$arguments['HeightPixels']=[uint16]480
+        $thumbnail=$manager.InvokeMethod('GetVirtualSystemThumbnailImage',$arguments,$null)
+        $facts.thumbnail_return_code=[int]$thumbnail.ReturnValue
+        if($thumbnail.ReturnValue -eq 0){
+            $pixels=[byte[]]$thumbnail.ImageData
+            if($pixels.Length -ne 640*480*2){throw 'Thumbnail byte geometry differs'}
+            Add-Type -AssemblyName System.Drawing
+            $bitmap=[Drawing.Bitmap]::new(640,480,[Drawing.Imaging.PixelFormat]::Format16bppRgb565)
+            $buffer=$null;$png=[IO.MemoryStream]::new()
+            try{
+                $buffer=$bitmap.LockBits([Drawing.Rectangle]::new(0,0,640,480),[Drawing.Imaging.ImageLockMode]::WriteOnly,[Drawing.Imaging.PixelFormat]::Format16bppRgb565)
+                if($buffer.Stride -ne 1280){throw 'Thumbnail stride differs'}
+                [Runtime.InteropServices.Marshal]::Copy($pixels,0,$buffer.Scan0,$pixels.Length)
+                $bitmap.UnlockBits($buffer);$buffer=$null
+                $bitmap.Save($png,[Drawing.Imaging.ImageFormat]::Png)
+                if($png.Length -gt 1048576){throw 'Thumbnail PNG bound exceeded'}
+                $facts.thumbnail_png_base64=[Convert]::ToBase64String($png.ToArray())
+            }finally{if($null -ne $buffer){$bitmap.UnlockBits($buffer)};$bitmap.Dispose();$png.Dispose()}
+        }
+    }catch{$facts.thumbnail_failure_kind=$_.Exception.GetType().Name;$facts.thumbnail_failure_hresult=$_.Exception.HResult}
+    return $facts
+}
+function Read-BootFailureOffline {
+    Assert-Root
+    $facts=@{read_only_mount=$false;known_files=@{};own_receipts=@{};setup_logs=@{}}
+    $attached=$null;$diagnosticPartition=$null;$diagnosticMount=(Join-Path $root 'failure-offline')+'\'
+    try{
+        New-Item -ItemType Directory -Path $diagnosticMount|Out-Null
+        $attached=Mount-VHD -Path $image -ReadOnly -NoDriveLetter -PassThru
+        $diagnosticDisk=[int]$attached.DiskNumber
+        $disk=Get-Disk -Number $diagnosticDisk
+        if(-not $disk.IsReadOnly -or [string]$disk.UniqueId -cne $diskId){throw 'Owned read-only diagnostic disk differs'}
+        $facts.read_only_mount=$true
+        foreach($partition in @(Get-Partition -DiskNumber $diagnosticDisk|Where-Object{$_.Size -gt 1GB})){
+            $diagnosticPartition=[int]$partition.PartitionNumber
+            Add-PartitionAccessPath -DiskNumber $diagnosticDisk -PartitionNumber $diagnosticPartition -AccessPath $diagnosticMount
+            if(Test-Path -LiteralPath (Join-Path $diagnosticMount 'Windows\System32\config\SOFTWARE')){break}
+            Remove-PartitionAccessPath -DiskNumber $diagnosticDisk -PartitionNumber $diagnosticPartition -AccessPath $diagnosticMount;$diagnosticPartition=$null
+        }
+        if($null -eq $diagnosticPartition){throw 'Diagnostic Windows volume unavailable'}
+        $known=@{
+          installed_launcher='Program Files\K5 Vision\K5Vision.exe';identity='ProgramData\K5Vision\identity\identity.json';
+          answer_file='Windows\Panther\Unattend.xml';setup_complete='Windows\Setup\Scripts\SetupComplete.cmd';
+          setup_task=('Windows\System32\Tasks\K5GuestWitness-'+$transfer);bootstrap_task=('Windows\System32\Tasks\K5GuestBootstrap-'+$transfer)
+        }
+        foreach($entry in $known.GetEnumerator()){$facts.known_files[$entry.Key]=[bool](Test-Path -LiteralPath (Join-Path $diagnosticMount $entry.Value) -PathType Leaf)}
+        foreach($name in @('setup-failure.json','bootstrap-receipt.json','bootstrap-witness.json')){
+            $path=Join-Path $diagnosticMount ('K5GuestWitness\'+$name)
+            if(-not(Test-Path -LiteralPath $path -PathType Leaf)){continue}
+            $info=Get-Item -LiteralPath $path
+            if($info.Length -gt 65536 -or ($info.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0){continue}
+            try{
+                $parsed=Get-Content -LiteralPath $path -Raw|ConvertFrom-Json;$safe=@{}
+                foreach($field in @('status','phase','stage','failure_stage','error_kind','failure_type','hresult','failure_hresult','http_status','mfa_enabled_before_reboot','mfa_confirmed_via_normal_api','gui_admin_setup','camera_source_enrolled','service_running','gui_client_closed','cleanup_credentials_removed')){
+                    $property=$parsed.PSObject.Properties[$field]
+                    if($null -eq $property){continue};$value=$property.Value
+                    if($value -is [bool] -or $value -is [int] -or $value -is [long]){$safe[$field]=$value}
+                    elseif($value -is [string] -and $value -match '^[A-Za-z][A-Za-z0-9_.-]{0,79}$'){$safe[$field]=$value}
+                }
+                $facts.own_receipts[$name]=$safe
+            }catch{$facts.own_receipts[$name]=@{parse_failed=$true}}
+        }
+        foreach($relative in @('Windows\Panther\setupact.log','Windows\Panther\setuperr.log','Windows\Panther\UnattendGC\setupact.log','Windows\Panther\UnattendGC\setuperr.log')){
+            $path=Join-Path $diagnosticMount $relative
+            if(-not(Test-Path -LiteralPath $path -PathType Leaf)){continue}
+            $info=Get-Item -LiteralPath $path
+            if($info.Length -gt 16777216 -or ($info.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0){$facts.setup_logs[$relative]=@{bounded_read_refused=$true};continue}
+            $text=[IO.File]::ReadAllText($path)
+            $flags=@{bytes=$info.Length;unattend_error=($text -match '(?is)(?:could not parse|failed[^\r\n]{0,120}unattend|unattend[^\r\n]{0,120}(?:error|fail))');oobe_seen=($text -match '(?i)(?:oobeSystem|windeploy|oobe)');setup_complete_seen=($text -match '(?i)SetupComplete\.cmd');setup_complete_error=($text -match '(?i)(?:SetupComplete[^\r\n]{0,120}(?:fail|error)|(?:fail|error)[^\r\n]{0,120}SetupComplete)')}
+            $codes=@([regex]::Matches($text,'(?i)(?:HRESULT|\bhr|error(?:\s+code)?)\s*[:= ]\s*(0x[0-9a-f]{8})')|ForEach-Object{$_.Groups[1].Value.ToLowerInvariant()}|Select-Object -Unique -First 16)
+            $flags.error_codes=$codes;$facts.setup_logs[$relative]=$flags;$text=$null
+        }
+    }finally{
+        if($null -ne $attached){
+            $admitted=Get-VHD -Path $image
+            if(-not $admitted.Attached -or [int]$admitted.DiskNumber -ne [int]$attached.DiskNumber){throw 'Diagnostic disk attachment changed'}
+            if($null -ne $diagnosticPartition){Remove-PartitionAccessPath -DiskNumber ([int]$attached.DiskNumber) -PartitionNumber $diagnosticPartition -AccessPath $diagnosticMount}
+            Dismount-VHD -Path $image
+            if((Get-VHD -Path $image).Attached){throw 'Diagnostic disk remains mounted'}
+        }
+    }
+    return $facts
+}
 try{
     if($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted' -or $env:RUNNER_OS -ne 'Windows'){throw 'Disposable Windows host required'}
     Assert-CopyContracts
@@ -502,6 +612,9 @@ try{
         try{$receipt.host_address_state_at_failure=Owned-AddressState}catch{$receipt.host_address_observation_failed=$true}
     }
     if($_.Exception -is [ComponentModel.Win32Exception]){$receipt.failure_native_code=$_.Exception.NativeErrorCode}
+    if($null -ne $vmId -and $receipt.stage -ceq 'actual_guest_boot' -and -not $receipt.actual_guest_boot){
+        try{$receipt.bootstrap_failure_live=Read-BootFailureLive}catch{$receipt.bootstrap_live_diagnostic_error=$_.Exception.GetType().Name}
+    }
 }finally{
     $password=$null
     if($null -ne $credential){$credential.Password.Dispose();$credential=$null}
@@ -513,6 +626,9 @@ try{
             $vm=Owned-VM;if([string]$vm.State -ne 'Off'){throw 'Owned VM did not stop'}
             Bounded-Job (Remove-VM -VM $vm -Force -AsJob -Confirm:$false) 30|Out-Null
             if($null -ne (Get-VM -Id $vmId -ErrorAction SilentlyContinue)){throw 'Owned VM remains'}
+            if($receipt.stage -ceq 'actual_guest_boot' -and -not $receipt.actual_guest_boot){
+                try{$receipt.bootstrap_failure_offline=Read-BootFailureOffline}catch{$receipt.bootstrap_offline_diagnostic_error=$_.Exception.GetType().Name}
+            }
         }
         foreach($process in @($publisherProcess,$mediaProcess)){
             if($null -ne $process){if(-not $process.HasExited){$process.Kill();if(-not $process.WaitForExit(5000)){throw 'Owned source process remains'}};$process.Dispose()}
