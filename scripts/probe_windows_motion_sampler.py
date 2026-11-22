@@ -294,7 +294,7 @@ def main():
                 policy,
                 motion,
                 phase="quiet_live",
-                count=16,
+                count=120,
                 observations=receipt["observations"],
                 metadata=metadata,
                 source_state=source_state,
