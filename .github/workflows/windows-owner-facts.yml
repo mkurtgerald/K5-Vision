@@ -1,0 +1,232 @@
+name: Windows elevated directory owner facts
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [codex/windows-owner-facts-20261122]
+
+permissions:
+  contents: read
+
+jobs:
+  native-owner-facts:
+    runs-on: windows-2025
+    timeout-minutes: 5
+    steps:
+      - name: Checkout the isolated owner diagnostic source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Use the exact packaged Python version
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12.10"
+          architecture: x64
+      - name: Observe actual token and private directory ownership
+        shell: pwsh
+        timeout-minutes: 2
+        run: |
+          $ErrorActionPreference = "Stop"
+          $probe = @'
+          import ast
+          import ctypes
+          import hashlib
+          import importlib.util
+          import json
+          import os
+          import platform
+          import sys
+          from pathlib import Path
+          from uuid import uuid4
+
+          proof = {"schema_version": 1, "status": "refused", "native_windows_execution": False,
+                   "product_installation_used": False, "service_registration_used": False,
+                   "existing_profile_used": False, "mocked_native_api": False}
+          root = identity = None
+          root_id = identity_id = None
+          root_created = identity_created = False
+          cleaned = False
+
+          def file_id(path):
+              info = path.lstat()
+              if getattr(info, "st_file_attributes", 0) & 0x400 or not path.is_dir():
+                  raise ValueError()
+              return info.st_dev, info.st_ino
+
+          def roles(sid, user):
+              return {"is_current_user": sid == user, "is_administrators": sid == "S-1-5-32-544",
+                      "is_system": sid == "S-1-5-18"}
+
+          try:
+              if (os.name != "nt" or sys.version_info[:3] != (3, 12, 10) or
+                  ctypes.sizeof(ctypes.c_void_p) != 8 or platform.machine() != "AMD64" or
+                  os.environ.get("GITHUB_ACTIONS") != "true" or
+                  os.environ.get("RUNNER_ENVIRONMENT") != "github-hosted"):
+                  raise ValueError()
+              proof["native_windows_execution"] = True
+              proof["python_version"] = "3.12.10"
+              proof["head_sha"] = os.environ["GITHUB_SHA"]
+              policy_path = Path("src/k5vision/windows_identity_security.py")
+              copy_path = Path("src/k5vision/legacy_migration_copy.py")
+              workflow = Path(".github/workflows/windows-owner-facts.yml")
+              proof["source_hashes"] = {
+                  "generic_policy_sha256": hashlib.sha256(policy_path.read_bytes()).hexdigest(),
+                  "copy_policy_sha256": hashlib.sha256(copy_path.read_bytes()).hexdigest(),
+                  "workflow_sha256": hashlib.sha256(workflow.read_bytes()).hexdigest(),
+              }
+              # Load only the stdlib-only Windows policy. No application imports,
+              # package dependencies, service registration or profile setup run.
+              spec = importlib.util.spec_from_file_location("owner_facts_policy", policy_path)
+              module = importlib.util.module_from_spec(spec)
+              sys.modules[spec.name] = module
+              spec.loader.exec_module(module)
+              native = module._NativeSecurity()
+              user = native.current_user()
+              token = ctypes.c_void_p()
+              if not native.security.OpenProcessToken(native.kernel.GetCurrentProcess(), 8,
+                                                      ctypes.byref(token)):
+                  raise OSError()
+              try:
+                  needed = ctypes.c_uint32()
+                  native.security.GetTokenInformation(token, 4, None, 0, ctypes.byref(needed))
+                  if not ctypes.sizeof(ctypes.c_void_p) <= needed.value <= 4096:
+                      raise ValueError()
+                  buffer = ctypes.create_string_buffer(needed.value)
+                  if not native.security.GetTokenInformation(token, 4, buffer, len(buffer),
+                                                            ctypes.byref(needed)):
+                      raise OSError()
+                  owner = native.sid(ctypes.c_void_p.from_buffer(buffer).value)
+                  elevated = ctypes.c_uint32()
+                  if not native.security.GetTokenInformation(token, 20, ctypes.byref(elevated),
+                                                            4, ctypes.byref(needed)):
+                      raise OSError()
+              finally:
+                  native.kernel.CloseHandle(token)
+              shell = ctypes.WinDLL("shell32", use_last_error=True)
+              shell.IsUserAnAdmin.argtypes, shell.IsUserAnAdmin.restype = [], ctypes.c_int32
+              proof["token_user"] = roles(user, user)
+              proof["token_owner"] = roles(owner, user)
+              proof["elevated"] = bool(elevated.value)
+              proof["administrator"] = bool(shell.IsUserAnAdmin())
+
+              # Bind the diagnostic predicate to the unchanged literal stage
+              # owner precondition without importing or constructing that stage.
+              tree = ast.parse(copy_path.read_text(encoding="utf-8"))
+              stage = next(node for node in tree.body if isinstance(node, ast.ClassDef)
+                           and node.name == "_WindowsStage")
+              constructor = next(node for node in stage.body if isinstance(node, ast.FunctionDef)
+                                 and node.name == "__init__")
+              expected = ast.dump(ast.parse("owner != self.native.current_user()", mode="eval").body)
+              comparisons = [node for node in ast.walk(constructor) if isinstance(node, ast.Compare)]
+              if sum(ast.dump(node) == expected for node in comparisons) != 1:
+                  raise ValueError()
+              proof["literal_stage_predicate_source_verified"] = True
+
+              control = native.security.GetSecurityDescriptorControl
+              control.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint16),
+                                  ctypes.POINTER(ctypes.c_uint32)]
+              control.restype = ctypes.c_int32
+
+              def describe(path):
+                  actual_owner, entries = native.descriptor(path)
+                  descriptor, dacl = ctypes.c_void_p(), ctypes.c_void_p()
+                  flags, revision = ctypes.c_uint16(), ctypes.c_uint32()
+                  try:
+                      if native.security.GetNamedSecurityInfoW(
+                          str(path), 1, 4, None, None, ctypes.byref(dacl), None,
+                          ctypes.byref(descriptor)
+                      ):
+                          raise OSError()
+                      if not control(descriptor, ctypes.byref(flags), ctypes.byref(revision)):
+                          raise OSError()
+                  finally:
+                      if descriptor.value:
+                          native.kernel.LocalFree(descriptor)
+                  counts = {"current_user": 0, "administrators": 0, "system": 0,
+                            "owner_rights": 0, "other": 0}
+                  for entry in entries:
+                      role = ("owner_rights" if entry.sid == module._OWNER_RIGHTS else
+                              "current_user" if entry.sid == user else
+                              "administrators" if entry.sid == "S-1-5-32-544" else
+                              "system" if entry.sid == "S-1-5-18" else "other")
+                      counts[role] += 1
+                  accepted = True
+                  try:
+                      module._check_policy(actual_owner, entries, user, private=True,
+                          require_file_inheritance=True, trusted_installer_verified=False)
+                  except module.WindowsIdentitySecurityError:
+                      accepted = False
+                  return {"owner": roles(actual_owner, user),
+                          "owner_matches_token_owner": actual_owner == owner,
+                          "dacl_protected": bool(flags.value & 0x1000),
+                          "ace_role_counts": counts, "generic_private_policy_admitted": accepted,
+                          "literal_stage_owner_precondition_admitted": actual_owner == user}
+
+              # Only these random, newly created, empty directories are touched.
+              # Existing legacy/service roots and their ACLs are never opened.
+              root = Path(os.environ["RUNNER_TEMP"]) / ("k5-owner-facts-" + uuid4().hex)
+              root.mkdir(mode=0o700)
+              root_created = True
+              root_id = file_id(root)
+              identity = root / "identity"
+              identity.mkdir(mode=0o700)
+              identity_created = True
+              identity_id = file_id(identity)
+              proof["root"] = describe(root)
+              proof["identity"] = describe(identity)
+              proof["status"] = "observed"
+          except Exception as error:
+              name = type(error).__name__
+              proof["failure_type"] = name if name in {
+                  "ValueError", "OSError", "RuntimeError", "WindowsIdentitySecurityError",
+                  "FileNotFoundError", "PermissionError", "StopIteration", "SyntaxError"
+              } else "Other"
+              proof["status"] = "refused"
+          finally:
+              try:
+                  if (identity_created and identity_id is None) or (root_created and root_id is None):
+                      raise ValueError()
+                  if identity_id is not None:
+                      if file_id(identity) != identity_id or next(identity.iterdir(), None) is not None:
+                          raise ValueError()
+                      identity.rmdir()
+                  if root_id is not None:
+                      if file_id(root) != root_id or next(root.iterdir(), None) is not None:
+                          raise ValueError()
+                      root.rmdir()
+                  cleaned = True
+              except Exception:
+                  proof["status"] = "refused"
+                  proof["failure_type"] = "owned_cleanup_refused"
+              proof["owned_cleanup"] = cleaned
+              Path("windows-owner-facts.json").write_text(json.dumps(proof, sort_keys=True, indent=2)
+                                                         + "\n", encoding="utf-8")
+          print(json.dumps({"owner_facts_status": proof["status"], "owned_cleanup": cleaned}))
+          raise SystemExit(0 if proof["status"] == "observed" and cleaned else 1)
+          '@
+          $path = Join-Path $env:RUNNER_TEMP ("k5-owner-probe-" + [guid]::NewGuid().ToString("N") + ".py")
+          $ownedScript = $false
+          try {
+            $stream = [System.IO.File]::Open($path, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+            $ownedScript = $true
+            try {
+              $bytes = [System.Text.UTF8Encoding]::new($false).GetBytes($probe)
+              $stream.Write($bytes, 0, $bytes.Length)
+              $stream.Flush($true)
+            } finally {
+              $stream.Dispose()
+            }
+            & python -I $path
+            if ($LASTEXITCODE -ne 0) { throw "Native owner fact observation was refused" }
+          } finally {
+            if ($ownedScript) { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue }
+          }
+      - name: Preserve only bounded native ownership facts
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: windows-owner-facts-${{ github.run_id }}
+          path: windows-owner-facts.json
+          if-no-files-found: error
+          retention-days: 7
