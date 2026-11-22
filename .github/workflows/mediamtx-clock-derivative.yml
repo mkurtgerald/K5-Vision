@@ -5,6 +5,7 @@ on:
   push:
     branches: [codex/mediamtx-clock-20261122]
     paths:
+      - .gitattributes
       - .github/workflows/mediamtx-clock-derivative.yml
       - scripts/build_mediamtx_clock_derivative.py
       - third_party/builds/mediamtx-clock-derivative.json
