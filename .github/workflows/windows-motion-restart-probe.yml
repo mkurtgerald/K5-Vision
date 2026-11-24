@@ -1,0 +1,84 @@
+name: Diagnostic Windows motion decoder restart
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [codex/windows-motion-restart-probe-20261124]
+    paths:
+      - .github/workflows/windows-motion-restart-probe.yml
+      - scripts/probe_windows_motion_restart.py
+
+permissions:
+  contents: read
+
+concurrency:
+  group: motion-restart-probe-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  decoder-restart:
+    name: DIAGNOSTIC ONLY - exact Windows decoder restart
+    runs-on: windows-2025
+    timeout-minutes: 15
+    steps:
+      - name: Checkout separately identified diagnostic source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Use version-matched diagnostic Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12.10"
+          architecture: x64
+      - name: Install only the exact admitted decoder and model contracts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          @'
+          import hashlib,pathlib,sys,sysconfig
+          root=pathlib.Path.cwd()
+          expected='9d9e94ccadbe016d051d1e84374a59e467695116e00434c087dd4580fb837837'
+          raw=(root/'windows/desktop/runtime-requirements.txt').read_bytes().replace(b'\r\n',b'\n')
+          if hashlib.sha256(raw).hexdigest()!=expected:
+              raise SystemExit('Exact runtime lock identity differs')
+          wanted={'numpy','opencv-python-headless','pydantic','pydantic-core','annotated-types','typing-inspection','typing-extensions'}
+          selected=[line for line in raw.decode().splitlines() if line.split('==')[0].lower().replace('_','-') in wanted]
+          if len(selected)!=len(wanted):
+              raise SystemExit('Exact decoder runtime subset differs')
+          pathlib.Path('probe-runtime.txt').write_text('\n'.join(selected)+'\n')
+          (pathlib.Path(sysconfig.get_paths()['purelib'])/'k5-motion-probe-source.pth').write_text(str(root/'src')+'\n')
+          if sys.version_info[:3]!=(3,12,10):
+              raise SystemExit('Exact Python identity differs')
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { throw 'Decoder requirements admission failed' }
+          python -m pip install --require-hashes --only-binary=:all: --no-deps -r probe-runtime.txt
+          if ($LASTEXITCODE -ne 0) { throw 'Decoder dependency installation failed' }
+      - name: Provision original immutable MediaMTX and fixture FFmpeg tools
+        uses: ./.github/actions/provision-operator-tools
+      - name: Exercise exact worker and bounded restart experiment
+        timeout-minutes: 10
+        shell: pwsh
+        run: |
+          python scripts/probe_windows_motion_restart.py
+          if ($LASTEXITCODE -ne 0) { throw 'Diagnostic decoder experiment did not complete' }
+          $observed = Get-Content motion-restart-diagnostic.json -Raw | ConvertFrom-Json
+          if ($observed.diagnostic_only -ne $true -or $observed.product_qualification -ne $false -or
+              $observed.native_windows -ne $true -or $observed.completed -ne $true -or
+              $observed.cleanup_complete -ne $true -or
+              $observed.production_head -cne '6993360f0682e41589005b0b97aa391398baa163' -or
+              $observed.harness_head -cne $env:GITHUB_SHA -or
+              $observed.python -cne '3.12.10' -or $observed.opencv -cne '5.0.0.93' -or
+              $observed.numpy -cne '2.2.6' -or $observed.ordinal_controls -ne 8 -or
+              @($observed.cases | Where-Object {$_.mode -ceq 'baseline'}).Count -lt 12) {
+            throw 'Diagnostic source or receipt scope differs'
+          }
+      - name: Retain only finite diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: diagnostic-only-motion-restart-${{ github.run_id }}-${{ github.run_attempt }}
+          path: motion-restart-diagnostic.json
+          if-no-files-found: error
+          retention-days: 14
