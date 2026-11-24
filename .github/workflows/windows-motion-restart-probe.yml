@@ -3,7 +3,7 @@ name: Diagnostic Windows motion decoder read cause
 on:
   workflow_dispatch:
   push:
-    branches: [codex/windows-motion-read-cause-probe-20261124]
+    branches: [codex/windows-motion-read-cause-2-20261124]
     paths:
       - .github/workflows/windows-motion-restart-probe.yml
       - scripts/probe_windows_motion_restart.py
@@ -71,8 +71,8 @@ jobs:
               $observed.harness_head -cne $env:GITHUB_SHA -or
               $observed.python -cne '3.12.10' -or $observed.opencv -cne '5.0.0.93' -or
               $observed.numpy -cne '2.2.6' -or $observed.ordinal_controls -ne 8 -or
-              $observed.stderr_category_controls -ne 8 -or @($observed.child_stderr).Count -ne 12 -or
-              @($observed.cases | Where-Object {$_.mode -cne 'baseline'}).Count -ne 0 -or
+              $observed.stderr_category_controls -ne 8 -or
+              @($observed.child_stderr).Count -ne (12 * @($observed.experiment_modes).Count) -or
               @($observed.cases | Where-Object {$_.mode -ceq 'baseline'}).Count -lt 12) {
             throw 'Diagnostic source or receipt scope differs'
           }

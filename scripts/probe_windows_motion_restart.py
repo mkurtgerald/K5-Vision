@@ -282,7 +282,7 @@ def main():
     }
     owned, logs, publisher, worker = [], [], None, None
     temporary = None
-    phase = "admission"
+    phase, subphase, cycle, sample_number = "admission", "admission", None, None
     try:
         if os.name != "nt" or platform.machine().lower() not in {"amd64", "x86_64"}:
             raise ValueError("Native Windows x64 required")
@@ -386,6 +386,7 @@ def main():
                 .replace(b"\r\n", b"\n")
             ).hexdigest(),
         )
+        subphase = "source_setup"
         temporary = Path(tempfile.mkdtemp(prefix="K5-motion-restart-"))
         identity = temporary.stat().st_dev, temporary.stat().st_ino
         source_port, api_port, playback_port, rtsp_port, hls_port = free_ports(5)
@@ -484,6 +485,7 @@ def main():
             raise RuntimeError("Owned fixture server not ready")
 
         phase = "source_start"
+        subphase = "source_launch"
         launch("source.json", source_port)
         publisher = fixture.MotionPublisher(
             ffmpeg, f"rtsp://publisher:{'p' * 32}@127.0.0.1:{source_port}/generated"
@@ -510,6 +512,7 @@ def main():
                     ),
                 }
 
+        subphase = "initial_relay_launch"
         relay = launch("relay.json", rtsp_port)
         policy = {
             "revision": 1,
@@ -521,6 +524,7 @@ def main():
         }
         child_captures = []
         cycle = 0
+        mode = "baseline"
 
         def launch_child(args, **kwargs):
             if args == [
@@ -536,15 +540,23 @@ def main():
                     != "rtsp_transport;tcp|fflags;nobuffer"
                 ):
                     raise ValueError("Original worker options differ")
-                path = temporary / f"child-{cycle:02d}.stderr"
+                if mode == "diagnostic_analyzeduration_500000":
+                    environment = dict(kwargs["env"])
+                    environment["OPENCV_FFMPEG_CAPTURE_OPTIONS"] += "|analyzeduration;500000"
+                    kwargs["env"] = environment
+                path = temporary / f"child-{mode}-{cycle:02d}.stderr"
                 handle = path.open("wb")
                 logs.append(handle)
-                child_captures.append((cycle, path, handle))
+                child_captures.append((mode, cycle, path, handle))
                 kwargs["stderr"] = handle
             return ORIGINAL_POPEN(args, **kwargs)
 
         def current_stderr():
-            matching = [path for owner_cycle, path, _ in child_captures if owner_cycle == cycle]
+            matching = [
+                path
+                for owner_mode, owner_cycle, path, _ in child_captures
+                if owner_mode == mode and owner_cycle == cycle
+            ]
             if not matching:
                 return None
             with matching[-1].open("rb") as captured:
@@ -552,21 +564,33 @@ def main():
 
         motion.subprocess.Popen = launch_child
         modes = ["baseline"]
+        result["experiment_modes"] = modes
+        result["controlled_option"] = (
+            "analyzeduration;500000 only in conditional B; original options retained"
+        )
         for mode in modes:
             phase = mode
             for cycle in range(CYCLES):
+                sample_number = None
+                subphase = "cycle_worker_close"
                 if worker is not None:
                     worker.close()
                     worker = None
+                subphase = "relay_stop"
                 stop(relay)
+                subphase = "relay_launch"
                 relay = launch("relay.json", rtsp_port)
+                subphase = "relay_settle"
                 time.sleep((cycle % 6) * 0.1)
+                subphase = "publisher_check"
                 publisher.check()
+                subphase = "worker_initialize"
                 worker = LiveMotionWorker(
                     f"rtsp://worker:{'w' * 32}@127.0.0.1:{rtsp_port}/{binding.path_name}"
                 )
                 cycle_started, first_ready_at = time.monotonic(), None
                 for sample_number in range(3):
+                    subphase = "sample_before_snapshot"
                     started = time.monotonic()
                     facts = {
                         "mode": mode,
@@ -577,8 +601,11 @@ def main():
                         "sample_started_since_cycle_seconds": round(started - cycle_started, 6),
                     }
                     try:
+                        subphase = "worker_sample"
                         sample = worker.sample(policy)
+                        subphase = "ordinal_decode"
                         captured_index = ordinal(sample.jpeg)
+                        subphase = "producer_ordinal_lookup"
                         with timestamp_lock:
                             generated_at = times.get(captured_index)
                         if generated_at is None:
@@ -598,6 +625,7 @@ def main():
                             decoder_phase=error.decoder_phase,
                             reason=error.reason,
                         )
+                    subphase = "sample_after_snapshot"
                     finished = time.monotonic()
                     if facts["outcome"] == "ready" and first_ready_at is None:
                         first_ready_at = finished
@@ -613,16 +641,25 @@ def main():
                     result["cases"].append(facts)
                     if facts["outcome"] == "failed":
                         break
+                    subphase = "sample_idle"
                     time.sleep(0.5)
+                subphase = "cycle_worker_close"
                 worker.close()
                 worker = None
-                for owner_cycle, path, handle in child_captures:
-                    if owner_cycle == cycle:
+                for owner_mode, owner_cycle, path, handle in child_captures:
+                    if owner_mode == mode and owner_cycle == cycle:
+                        subphase = "stderr_handle_close"
                         handle.close()
+                        subphase = "stderr_final_scan"
                         with path.open("rb") as captured:
                             diagnostic = stderr_summary(captured.read(STDERR_LIMIT + 1))
-                        result["child_stderr"].append({"cycle": cycle, **diagnostic})
-                        path.unlink()
+                        result["child_stderr"].append({"mode": mode, "cycle": cycle, **diagnostic})
+            if mode == "baseline" and any(
+                case["outcome"] == "failed" and case.get("decoder_phase") == "decoder_read"
+                for case in result["cases"]
+            ):
+                modes.extend(["diagnostic_analyzeduration_500000", "baseline_confirmation"])
+        subphase = "completed"
         result["completed"] = True
     except BaseException as error:
         result.update(
@@ -635,9 +672,26 @@ def main():
                 "ValueError",
                 "KeyError",
                 "TimeoutError",
+                "PermissionError",
+                "FileNotFoundError",
+                "ProcessLookupError",
+                "BrokenPipeError",
+                "MotionProcessError",
             }
             else "Other",
             failure_phase=phase,
+            failure_subphase=subphase,
+            failure_cycle=cycle,
+            failure_sample=sample_number,
+            os_error_category={
+                2: "not_found",
+                3: "path_not_found",
+                5: "access_denied",
+                32: "sharing_violation",
+                33: "lock_violation",
+            }.get(getattr(error, "winerror", None), "other")
+            if isinstance(error, OSError)
+            else "none",
         )
     finally:
         subprocess.Popen = ORIGINAL_POPEN
