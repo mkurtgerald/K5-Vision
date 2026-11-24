@@ -18,6 +18,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import quote
 
+from k5vision.operator_motion_process import MotionProcessError, sampling_diagnostic
+
 
 class MotionUnavailable(RuntimeError):
     """A fixed, source-free motion failure suitable for an operator response."""
@@ -202,6 +204,7 @@ class MotionRuntime:
         self.generations = {}
         self.holds = {}
         self.health = {}
+        self.sampling = {}
         self.moving = {}
         self.samples = {}
         self.observed = {}
@@ -298,6 +301,7 @@ class MotionRuntime:
             self.pending_gates,
             self.interest,
             self.last_sample,
+            self.sampling,
         ):
             values.pop(path, None)
 
@@ -312,6 +316,7 @@ class MotionRuntime:
             self.generations[path] = self.generations.get(path, 0) + 1
             self.holds.pop(path, None)
             self.health[path] = "unavailable"
+            self.sampling.pop(path, None)
             self.moving.pop(path, None)
             self.gates.pop(path, None)
             if not keep_worker:
@@ -497,7 +502,39 @@ class MotionRuntime:
                 **policy,
                 **self.status(source.binding),
                 "observed_reference": copy.deepcopy(self.observed.get(path)),
+                "sampling": self._sampling_status(source, policy),
             }
+
+    def _sampling_status(self, source, policy):
+        """Cached diagnostics only; no decoder, disk or network query."""
+        path = source.binding.path_name
+        value = dict(
+            self.sampling.get(
+                path,
+                {
+                    "state": "idle",
+                    "phase": "none",
+                    "decoder_phase": "none",
+                    "reason": "not_started",
+                    "attempts": 0,
+                    "failures": 0,
+                },
+            )
+        )
+        preview = self.interest.get(path, 0) > time.monotonic()
+        reason = None
+        if not self.service._ready:
+            reason = "recorder_unavailable"
+        elif not preview:
+            if not source.recording_enabled:
+                reason = "paused"
+            elif self.service._disk_full:
+                reason = "storage_blocked"
+            elif policy["mode"] != "motion":
+                reason = "continuous"
+        if reason is not None:
+            value.update(state="idle", phase="none", decoder_phase="none", reason=reason)
+        return sampling_diagnostic(value)
 
     async def forget(self, camera_id):
         if self.store is None or self.closing:
@@ -575,6 +612,24 @@ class MotionRuntime:
     async def _sample(self, source, policy, generation):
         path = source.binding.path_name
         worker = self.workers.get(path)
+        previous = self.sampling.get(path, {})
+        attempt = {
+            "state": "sampling",
+            "phase": "worker_start",
+            "decoder_phase": "none",
+            "reason": "pending",
+            "attempts": min(1000000, previous.get("attempts", 0) + 1),
+            "failures": previous.get("failures", 0),
+        }
+        if self._current(source, policy, generation):
+            # Keep the last terminal failure observable while the next native
+            # request is pending. Polling must not lose its reason between
+            # retries; a successful sample replaces it below.
+            if previous.get("state") == "failed":
+                self.sampling[path] = {**previous, "attempts": attempt["attempts"]}
+            else:
+                self.sampling[path] = dict(attempt)
+        phase = "worker_start"
         try:
             if worker is None:
                 worker = await self._run(
@@ -586,6 +641,7 @@ class MotionRuntime:
                     return
                 self.workers[path] = worker
             result = await self._run(worker.sample, worker_policy(policy))
+            phase = "ready"
             async with self.service._lock:
                 if (
                     not self._current(source, policy, generation)
@@ -600,6 +656,7 @@ class MotionRuntime:
                     and math.isfinite(result.captured_monotonic)
                     and 0 <= time.monotonic() - result.captured_monotonic <= 2
                 ):
+                    phase = "response_read"
                     raise MotionUnavailable("Motion frame is no longer current")
                 # The child's validated capture clock survives both executor
                 # dispatch and recorder-lock waits. Reconstructing it from an
@@ -614,12 +671,43 @@ class MotionRuntime:
                     if policy["mode"] == "motion" and result.motion:
                         self.holds[path] = captured_at + policy["post_capture_seconds"]
                 if policy["mode"] == "motion":
+                    phase = "recording_gate"
                     await self._gate(source, self.effective_record(source))
+                self.sampling[path] = {
+                    **attempt,
+                    "state": "ready",
+                    "phase": "ready",
+                    "reason": "none",
+                }
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as error:
             async with self.service._lock:
                 if self._current(source, policy, generation):
+                    detail = {
+                        **attempt,
+                        "state": "failed",
+                        "phase": phase,
+                        "reason": "recording_gate"
+                        if phase == "recording_gate"
+                        else ("capture_age" if phase == "response_read" else "runtime_failure"),
+                        "failures": min(1000000, attempt["failures"] + 1),
+                    }
+                    if isinstance(error, MotionProcessError):
+                        detail.update(
+                            phase=error.phase,
+                            decoder_phase=error.decoder_phase,
+                            reason=error.reason,
+                        )
+                    try:
+                        self.sampling[path] = sampling_diagnostic(detail)
+                    except (TypeError, ValueError):
+                        self.sampling[path] = {
+                            **attempt,
+                            "state": "failed",
+                            "reason": "runtime_failure",
+                            "failures": min(1000000, attempt["failures"] + 1),
+                        }
                     self.health[path] = "unavailable"
                     self.holds.pop(path, None)
                     self._retire(path)

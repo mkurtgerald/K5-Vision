@@ -20,10 +20,89 @@ _CLOSE_SECONDS = 2.0
 _MAX_JPEG = 262144
 _MAX_REQUEST = 131072
 _MAX_AGE = 2.0
+_MAX_PROGRESS = 12
+MOTION_PHASES = frozenset(
+    {
+        "none",
+        "worker_start",
+        "request_write",
+        "response_read",
+        "native_import",
+        "detector_import",
+        "frame_wait",
+        "motion_analysis",
+        "jpeg_encode",
+        "response_write",
+        "decoder_open",
+        "decoder_read",
+        "decoder_frame",
+        "ready",
+        "recording_gate",
+    }
+)
+MOTION_REASONS = frozenset(
+    {
+        "none",
+        "pending",
+        "worker_start",
+        "request_io",
+        "response_protocol",
+        "child_failure",
+        "request_deadline",
+        "capture_age",
+        "frame_payload",
+        "worker_closed",
+        "worker_cleanup",
+        "runtime_failure",
+        "recording_gate",
+        "not_started",
+        "recorder_unavailable",
+        "storage_blocked",
+        "paused",
+        "continuous",
+    }
+)
+
+
+def sampling_diagnostic(value):
+    """Admit only bounded, source-free cached sampler facts."""
+    if type(value) is not dict or set(value) != {
+        "state",
+        "phase",
+        "decoder_phase",
+        "reason",
+        "attempts",
+        "failures",
+    }:
+        raise ValueError
+    if (
+        any(type(value[k]) is not str for k in ("state", "phase", "decoder_phase", "reason"))
+        or value["state"] not in {"idle", "sampling", "ready", "failed"}
+        or value["phase"] not in MOTION_PHASES
+        or value["decoder_phase"] not in {"none", "decoder_open", "decoder_read", "decoder_frame"}
+        or value["reason"] not in MOTION_REASONS
+        or any(
+            type(value[k]) is not int or not 0 <= value[k] <= 1000000
+            for k in ("attempts", "failures")
+        )
+        or value["failures"] > value["attempts"]
+    ):
+        raise ValueError
+    return dict(value)
 
 
 class MotionProcessError(RuntimeError):
     """Fixed diagnostics without credentials, source addresses or native errors."""
+
+    def __init__(self, message, *, phase="none", decoder_phase="none", reason="runtime_failure"):
+        super().__init__(message)
+        self.phase = phase if phase in MOTION_PHASES else "none"
+        self.decoder_phase = (
+            decoder_phase
+            if decoder_phase in {"decoder_open", "decoder_read", "decoder_frame"}
+            else "none"
+        )
+        self.reason = reason if reason in MOTION_REASONS else "runtime_failure"
 
 
 @dataclass(frozen=True, slots=True)
@@ -286,6 +365,7 @@ class LiveMotionWorker:
         self._last_sequence = 0
         self._sequence_base = 0
         self._public_sequence = 0
+        self._decoder_phase = "none"
         self._deadline = _RequestDeadline()
 
     def _start(self, child_mode="--child"):
@@ -323,10 +403,15 @@ class LiveMotionWorker:
             process.stdout = io.BufferedReader(process.stdout, buffer_size=65536)
             self._process, self._job = process, job
             self._last_sequence, self._sequence_base = 0, self._public_sequence
+            self._decoder_phase = "none"
         except BaseException:
             self._process, self._job = process, job
             self._dispose()
-            raise MotionProcessError("Motion worker ownership is unavailable") from None
+            raise MotionProcessError(
+                "Motion worker ownership is unavailable",
+                phase="worker_start",
+                reason="worker_start",
+            ) from None
 
     @staticmethod
     def _write(stream, raw):
@@ -344,6 +429,7 @@ class LiveMotionWorker:
             self._start()
             process = self._process
             expired = self._deadline.arm(process)
+            phase, decoder_phase, reason = "request_write", self._decoder_phase, "request_io"
             try:
                 if self._closing.is_set():
                     raise MotionProcessError("Motion worker is closed")
@@ -355,10 +441,43 @@ class LiveMotionWorker:
                 if len(raw) > _MAX_REQUEST:
                     raise MotionProcessError("Motion policy was refused")
                 self._write(process.stdin, raw)
-                header = process.stdout.readline(4097)
-                if not header.endswith(b"\n") or len(header) > 4096:
-                    raise MotionProcessError("Motion response was refused")
-                metadata = _document(header)
+                phase, reason = "response_read", "response_protocol"
+                # Progress is finite metadata under the original single armed
+                # deadline. It never refreshes the watchdog or admits pixels.
+                progress = 0
+                while True:
+                    header = process.stdout.readline(4097)
+                    if not header.endswith(b"\n") or len(header) > 4096:
+                        raise MotionProcessError("Motion response was refused")
+                    metadata = _document(header)
+                    if metadata.get("status") not in {"progress", "unavailable"}:
+                        break
+                    if (
+                        set(metadata) != {"status", "phase"}
+                        or type(metadata["phase"]) is not str
+                        or metadata["phase"]
+                        not in MOTION_PHASES
+                        - {
+                            "none",
+                            "worker_start",
+                            "request_write",
+                            "response_read",
+                            "ready",
+                            "recording_gate",
+                        }
+                    ):
+                        raise MotionProcessError("Motion response was refused")
+                    if metadata["phase"].startswith("decoder_"):
+                        decoder_phase = metadata["phase"]
+                        self._decoder_phase = decoder_phase
+                    else:
+                        phase = metadata["phase"]
+                    if metadata["status"] == "unavailable":
+                        reason = "child_failure"
+                        raise MotionProcessError("Motion frame is unavailable")
+                    progress += 1
+                    if progress > _MAX_PROGRESS:
+                        raise MotionProcessError("Motion response was refused")
                 if (
                     set(metadata)
                     != {
@@ -402,6 +521,9 @@ class LiveMotionWorker:
                     raise MotionProcessError("Motion response was refused")
                 pixels = process.stdout.read(size)
                 age = time.monotonic() - captured
+                reason = "frame_payload"
+                if not 0 <= age <= _MAX_AGE:
+                    reason = "capture_age"
                 if (
                     len(pixels) != size
                     or _jpeg_geometry(pixels) != _preview_size(width, height)
@@ -424,8 +546,20 @@ class LiveMotionWorker:
                     captured,
                 )
             except (OSError, ValueError, TypeError, MotionProcessError):
-                self._dispose()
-                raise MotionProcessError("Motion frame is unavailable") from None
+                if expired.is_set():
+                    reason = "request_deadline"
+                elif self._closing.is_set():
+                    reason = "worker_closed"
+                try:
+                    self._dispose()
+                except MotionProcessError:
+                    reason = "worker_cleanup"
+                raise MotionProcessError(
+                    "Motion frame is unavailable",
+                    phase=phase,
+                    decoder_phase=decoder_phase,
+                    reason=reason,
+                ) from None
             finally:
                 self._deadline.disarm()
 
@@ -555,6 +689,16 @@ def _child_main() -> int:
     latest = None
     failed = False
     reader = None
+    phase, decoder_phase = "native_import", "decoder_open"
+    output_lock = threading.Lock()
+
+    def progress(value):
+        with output_lock:
+            sys.stdout.buffer.write(
+                json.dumps({"status": "progress", "phase": value}).encode("ascii") + b"\n"
+            )
+            sys.stdout.buffer.flush()
+
     try:
         initial = sys.stdin.buffer.readline(2049)
         if len(initial) > 2048 or not initial.endswith(b"\n"):
@@ -563,17 +707,21 @@ def _child_main() -> int:
         if set(startup) != {"relay_uri"}:
             return 1
         uri = _relay(startup["relay_uri"])
+        progress(phase)
         import cv2
 
         cv2.setNumThreads(1)
+        phase = "detector_import"
+        progress(phase)
         from k5vision.operator_motion import SceneMotionDetector
 
         detector = SceneMotionDetector()
 
         def capture_frames():
-            nonlocal latest, failed
+            nonlocal latest, failed, decoder_phase
             capture = None
             try:
+                progress("decoder_open")
                 capture = cv2.VideoCapture(
                     uri,
                     cv2.CAP_FFMPEG,
@@ -589,9 +737,15 @@ def _child_main() -> int:
                 if not capture.isOpened():
                     raise ValueError
                 sequence = 0
+                decoder_phase = "decoder_read"
+                progress(decoder_phase)
                 while not stopped.is_set():
+                    decoder_phase = "decoder_read"
                     ready, frame = capture.read()
-                    if not ready or frame is None or frame.ndim != 3 or frame.shape[2] != 3:
+                    if not ready or frame is None:
+                        raise ValueError
+                    decoder_phase = "decoder_frame"
+                    if frame.ndim != 3 or frame.shape[2] != 3:
                         raise ValueError
                     height, width = frame.shape[:2]
                     if not _geometry(width, height):
@@ -622,11 +776,14 @@ def _child_main() -> int:
             if set(request) != {"policy"}:
                 return 1
             policy = _policy(request["policy"])
+            phase = "frame_wait"
+            progress(phase)
             deadline = time.monotonic() + 3.0
             with condition:
                 while True:
                     now = time.monotonic()
                     if failed:
+                        phase = decoder_phase
                         raise ValueError
                     if (
                         latest is not None
@@ -640,7 +797,11 @@ def _child_main() -> int:
                         raise ValueError
                     condition.wait(remaining)
             height, width = frame.shape[:2]
+            phase = "motion_analysis"
+            progress(phase)
             motion = detector.observe(frame, policy)
+            phase = "jpeg_encode"
+            progress(phase)
             preview_width, preview_height = _preview_size(width, height)
             preview = cv2.resize(
                 frame, (preview_width, preview_height), interpolation=cv2.INTER_AREA
@@ -663,14 +824,22 @@ def _child_main() -> int:
                 "captured_monotonic": captured,
                 "bytes": len(pixels),
             }
-            sys.stdout.buffer.write(json.dumps(metadata, allow_nan=False).encode("ascii") + b"\n")
-            sys.stdout.buffer.write(pixels.tobytes())
-            sys.stdout.buffer.flush()
+            phase = "response_write"
+            progress(phase)
+            with output_lock:
+                sys.stdout.buffer.write(
+                    json.dumps(metadata, allow_nan=False).encode("ascii") + b"\n"
+                )
+                sys.stdout.buffer.write(pixels.tobytes())
+                sys.stdout.buffer.flush()
             last_sequence = sequence
     except BaseException:
         try:
-            sys.stdout.buffer.write(b'{"status":"unavailable"}\n')
-            sys.stdout.buffer.flush()
+            with output_lock:
+                sys.stdout.buffer.write(
+                    json.dumps({"status": "unavailable", "phase": phase}).encode("ascii") + b"\n"
+                )
+                sys.stdout.buffer.flush()
         except (OSError, ValueError):
             pass
         return 1

@@ -307,6 +307,136 @@ async def _sample(engine):
     await runtime._sample(source, copy.deepcopy(policy), runtime._generation(source, policy))
 
 
+def test_sampling_diagnostic_is_cached_bounded_and_reset_with_camera_authority(engine, monkeypatch):
+    async def scenario():
+        service, source = engine.service, engine.sources[0]
+        await service.start(engine.sources)
+        runtime, path = service._motion, source.binding.path_name
+        try:
+            await service.apply_motion_policy(source, 0, _body())
+            initial = (await service.get_motion_policy(source))["sampling"]
+            assert initial["state"] == "idle" and initial["reason"] == "not_started"
+            assert initial["attempts"] == 0
+            await _sample(engine)
+            ready = (await service.get_motion_policy(source))["sampling"]
+            assert ready["state"] == "ready" and ready["attempts"] == 1
+
+            def failed(_policy):
+                from k5vision.operator_motion_process import MotionProcessError
+
+                raise MotionProcessError(
+                    "credential-canary",
+                    phase="frame_wait",
+                    decoder_phase="decoder_open",
+                    reason="request_deadline",
+                )
+
+            monkeypatch.setattr(engine.workers[-1], "sample", failed)
+            await _sample(engine)
+            observed = (await service.get_motion_policy(source))["sampling"]
+            assert observed == {
+                "state": "failed",
+                "phase": "frame_wait",
+                "decoder_phase": "decoder_open",
+                "reason": "request_deadline",
+                "attempts": 2,
+                "failures": 1,
+            }
+            assert "credential-canary" not in str(observed)
+            service._ready = False
+            assert (await service.get_motion_policy(source))["sampling"][
+                "reason"
+            ] == "recorder_unavailable"
+            service._ready = True
+            service._disk_full = True
+            assert (await service.get_motion_policy(source))["sampling"][
+                "reason"
+            ] == "storage_blocked"
+            service._disk_full = False
+            runtime.sampling[path].update(attempts=1000000, failures=1000000)
+            await _sample(engine)
+            assert runtime.sampling[path]["attempts"] == 1000000
+            assert runtime.sampling[path]["failures"] == 1000000
+            runtime.invalidate((path,))
+            assert path not in runtime.sampling
+            assert (await service.get_motion_policy(source))["sampling"]["attempts"] == 0
+            runtime.sampling[path] = dict(observed)
+            runtime._forget_ephemeral(path)
+            assert path not in runtime.sampling
+        finally:
+            await service.stop()
+
+    asyncio.run(scenario())
+
+
+def test_sampling_diagnostic_does_not_reflect_arbitrary_runtime_exception(engine, monkeypatch):
+    async def scenario():
+        service, source = engine.service, engine.sources[0]
+        await service.start(engine.sources)
+        try:
+            await service.apply_motion_policy(source, 0, _body())
+            await _sample(engine)
+
+            def fail(_policy):
+                raise OSError("rtsp://credential-canary@private-camera/")
+
+            monkeypatch.setattr(engine.workers[-1], "sample", fail)
+            await _sample(engine)
+            value = (await service.get_motion_policy(source))["sampling"]
+            assert value["state"] == "failed" and value["reason"] == "runtime_failure"
+            assert "credential-canary" not in str(value)
+        finally:
+            await service.stop()
+
+    asyncio.run(scenario())
+
+
+def test_sampling_failure_remains_observable_during_blocked_retry(engine, monkeypatch):
+    async def scenario():
+        from k5vision.operator_motion_process import MotionProcessError
+
+        service, source = engine.service, engine.sources[0]
+        await service.start(engine.sources)
+        runtime = service._motion
+        replacement = _Worker()
+        replacement.release = threading.Event()
+        pending = None
+        try:
+            await service.apply_motion_policy(source, 0, _body())
+            await _sample(engine)
+
+            def fail(_policy):
+                raise MotionProcessError(
+                    "private-error-canary",
+                    phase="frame_wait",
+                    decoder_phase="decoder_open",
+                    reason="request_deadline",
+                )
+
+            monkeypatch.setattr(engine.workers[-1], "sample", fail)
+            await _sample(engine)
+            failed = (await service.get_motion_policy(source))["sampling"]
+            assert failed["state"] == "failed" and failed["failures"] == 1
+            monkeypatch.setattr(runtime, "_new_worker", lambda *_args: replacement)
+            pending = asyncio.create_task(_sample(engine))
+            assert await asyncio.to_thread(replacement.started.wait, 1)
+            waiting = (await service.get_motion_policy(source))["sampling"]
+            assert waiting == {**failed, "attempts": failed["attempts"] + 1}
+            assert "private-error-canary" not in str(waiting)
+            replacement.release.set()
+            await pending
+            ready = (await service.get_motion_policy(source))["sampling"]
+            assert ready["state"] == "ready" and ready["reason"] == "none"
+            assert ready["attempts"] == 3 and ready["failures"] == 1
+        finally:
+            replacement.release.set()
+            if pending is not None:
+                await pending
+            await service.stop()
+
+    asyncio.run(scenario())
+
+
 async def _durable_runtime(tmp_path):
     identity = identity_state.initialize_identity_state(
         tmp_path / "identity", username="motion-admin", password="motion-test-private-password"

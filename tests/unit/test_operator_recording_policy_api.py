@@ -168,6 +168,64 @@ def _get(api):
     return response.json()
 
 
+def test_admin_policy_projects_only_finite_sampling_diagnostic_and_rechecks_authority(api):
+    original = api.service.get_motion_policy
+    sampling = {
+        "state": "failed",
+        "phase": "frame_wait",
+        "decoder_phase": "decoder_open",
+        "reason": "request_deadline",
+        "attempts": 2,
+        "failures": 1,
+    }
+
+    async def get(source):
+        return {
+            **await original(source),
+            "sampling": dict(sampling),
+            "private": "credential-canary",
+        }
+
+    api.service.get_motion_policy = get
+    result = _get(api)
+    assert result["sampling"] == sampling and "credential-canary" not in str(result)
+    api.state.recording = False
+    denied = api.client.get(api.prefix + "/recording-policy", headers=api.headers)
+    assert denied.status_code == 403 and "sampling" not in denied.text
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"phase": "credential-canary"},
+        {"extra": "credential-canary"},
+        {"attempts": 1000001},
+        {"reason": []},
+    ],
+)
+def test_policy_refuses_malformed_diagnostic_without_reflecting_private_values(api, change):
+    original = api.service.get_motion_policy
+
+    async def get(source):
+        return {
+            **await original(source),
+            "sampling": {
+                "state": "failed",
+                "phase": "frame_wait",
+                "decoder_phase": "decoder_open",
+                "reason": "request_deadline",
+                "attempts": 2,
+                "failures": 1,
+                **change,
+            },
+        }
+
+    api.service.get_motion_policy = get
+    response = api.client.get(api.prefix + "/recording-policy", headers=api.headers)
+    assert response.status_code == 503 and response.json()["detail"] == "motion_policy_unavailable"
+    assert "credential-canary" not in response.text
+
+
 def _payload(value, **updates):
     fields = ("mode", "post_capture_seconds", "sensitivity", "minimum_area_percent", "zones")
     return {"expected_revision": value["revision"], **{k: value[k] for k in fields}, **updates}

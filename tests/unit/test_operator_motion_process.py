@@ -535,6 +535,12 @@ def test_child_continuously_drains_fresh_frames_without_recording_files(monkeypa
     samples = []
     for _ in range(2):
         header = json.loads(outgoing.readline())
+        progress = []
+        while header.get("status") == "progress":
+            assert set(header) == {"status", "phase"} and header["phase"] in motion.MOTION_PHASES
+            progress.append(header)
+            header = json.loads(outgoing.readline())
+        assert 1 <= len(progress) <= motion._MAX_PROGRESS
         assert outgoing.read(header["bytes"]) == JPEG
         samples.append(header)
     assert samples[1]["sequence"] > samples[0]["sequence"]
@@ -546,6 +552,120 @@ def test_jpeg_frame_header_geometry_is_checked():
     assert motion._jpeg_geometry(JPEG) == (1, 1)
     assert motion._jpeg_geometry(b"\xff\xd8INVALID\xff\xd9") is None
     assert motion._jpeg_geometry(JPEG[:-1]) is None
+
+
+def _progress(phase, **extra):
+    return json.dumps({"status": "progress", "phase": phase, **extra}).encode() + b"\n"
+
+
+def test_progress_preserves_strict_ready_pixels_and_decoder_context(worker):
+    worker.instance._start()
+    worker.processes[0].stdout = io.BytesIO(
+        _progress("native_import")
+        + _progress("decoder_open")
+        + _progress("decoder_read")
+        + response()
+        + _progress("frame_wait")
+        + b'{"status":"unavailable","phase":"frame_wait"}\n'
+    )
+    assert worker.instance.sample(policy()).jpeg == JPEG
+    with pytest.raises(motion.MotionProcessError) as caught:
+        worker.instance.sample(policy())
+    assert (caught.value.phase, caught.value.decoder_phase, caught.value.reason) == (
+        "frame_wait",
+        "decoder_read",
+        "child_failure",
+    )
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        _progress("private-rtsp://credential-canary"),
+        _progress("native_import", private="credential-canary"),
+        _progress("native_import") * 13,
+        b'{"status":"progress","phase":[]}\n',
+        b'{"status":"unavailable","phase":"credential-canary"}\n',
+        b'{"status":"progress","phase":"native_import","phase":"decoder_read"}\n',
+        b'{"status":"progress","phase":"' + b"x" * 4096 + b'"}\n',
+    ],
+)
+def test_untrusted_or_excess_progress_is_rejected_without_material_disclosure(worker, output):
+    worker.instance._start()
+    worker.processes[0].stdout = io.BytesIO(output + response())
+    with pytest.raises(motion.MotionProcessError) as caught:
+        worker.instance.sample(policy())
+    assert caught.value.reason == "response_protocol"
+    assert "credential-canary" not in str(caught.value)
+    assert worker.processes[0].returncode is not None
+
+
+def test_actual_progress_does_not_refresh_watchdog_and_retains_blocked_decoder_phase(monkeypatch):
+    real_start = subprocess.Popen
+    owned = []
+
+    def start(_args, **_kwargs):
+        program = (
+            "import sys,time; "
+            'sys.stdout.buffer.write(b\'{"status":"progress","phase":"native_import"}\\n\'); '
+            "sys.stdout.buffer.flush(); time.sleep(.07); "
+            'sys.stdout.buffer.write(b\'{"status":"progress","phase":"decoder_open"}\\n\'); '
+            "sys.stdout.buffer.flush(); sys.stdin.buffer.read()"
+        )
+        process = real_start(
+            [sys.executable, "-I", "-B", "-c", program],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            bufsize=0,
+        )
+        owned.append(process)
+        return process
+
+    monkeypatch.setattr(motion.subprocess, "Popen", start)
+    monkeypatch.setattr(motion, "_REQUEST_SECONDS", 0.15)
+    instance = motion.LiveMotionWorker(URI)
+    arm = instance._deadline.arm
+    arms = []
+    instance._deadline.arm = lambda process: (arms.append(process), arm(process))[1]
+    began = time.monotonic()
+    try:
+        with pytest.raises(motion.MotionProcessError) as caught:
+            instance.sample(policy())
+        elapsed = time.monotonic() - began
+        assert len(arms) == 1 and 0.12 <= elapsed < 1
+        assert caught.value.reason == "request_deadline"
+        assert (
+            caught.value.phase == "native_import" and caught.value.decoder_phase == "decoder_open"
+        )
+        assert owned[0].poll() is not None
+    finally:
+        instance.close()
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"phase": "credential-canary"},
+        {"reason": []},
+        {"attempts": True},
+        {"attempts": 1000001},
+        {"failures": 2},
+        {"extra": "credential-canary"},
+    ],
+)
+def test_cached_sampling_projection_rejects_unknown_or_unbounded_values(changes):
+    value = {
+        "state": "failed",
+        "phase": "frame_wait",
+        "decoder_phase": "decoder_read",
+        "reason": "request_deadline",
+        "attempts": 1,
+        "failures": 1,
+        **changes,
+    }
+    with pytest.raises(ValueError):
+        motion.sampling_diagnostic(value)
 
 
 def mask_policy():

@@ -19,6 +19,7 @@ from starlette.responses import JSONResponse
 
 from k5vision.domain.users import UserRole
 from k5vision.operator_camera_settings_api import _joined
+from k5vision.operator_motion_process import sampling_diagnostic
 from k5vision.operator_recording_policy import (
     MotionPolicy,
     MotionReference,
@@ -123,6 +124,9 @@ def _public(value, source):
             "pre_capture_seconds": 0,
             "status": value["status"],
             "observed_reference": _observed(value.get("observed_reference")),
+            "sampling": sampling_diagnostic(value["sampling"])
+            if value.get("sampling") is not None
+            else None,
             **policy,
         }
     except (KeyError, TypeError, ValueError, RuntimeError):

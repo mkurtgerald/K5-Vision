@@ -27,6 +27,7 @@ import pytest
 
 from k5vision import identity_state
 from k5vision.media.mediamtx_provider import MediaMTXBinding
+from k5vision.operator_motion_process import sampling_diagnostic
 
 _INPUTS = (
     "K5_DESKTOP_SETUP",
@@ -88,7 +89,15 @@ def _helpers(name):
 
 
 def _policy(client, camera):
-    return client.json(f"/api/v1/operator/cameras/{camera}/recording-policy")
+    value = client.json(f"/api/v1/operator/cameras/{camera}/recording-policy")
+    # Retain only admitted, finite cached facts from the existing poll. Never
+    # retain a camera URL, native exception, credentials or arbitrary fields.
+    try:
+        sampling = sampling_diagnostic(value.get("sampling"))
+    except (TypeError, ValueError):
+        sampling = None
+    client.motion_sampling_diagnostic = sampling
+    return value
 
 
 def _policy_state(client, camera, wanted, desktop, *, app=None, timeout=20):
@@ -1015,6 +1024,7 @@ def test_native_windows_motion_recording_and_zones(record_testsuite_property):
             diagnostic["client_last_http_status"] = client.last_http_status
             diagnostic["client_transport_failure"] = client.transport_failure
             diagnostic["client_api_error_code"] = client.last_api_error_code
+            diagnostic["motion_sampling"] = getattr(client, "motion_sampling_diagnostic", None)
         diagnostic["failure_kind"] = (
             type(error).__name__
             if type(error).__name__
@@ -1138,6 +1148,7 @@ def test_native_windows_motion_recording_and_zones(record_testsuite_property):
                     "motion_saved_policy",
                     "motion_saved_zone_counts",
                     "motion_observation",
+                    "motion_sampling",
                     "cleanup_failures",
                     "cohort_failed_after_finish",
                     "installer_action",
