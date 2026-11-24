@@ -233,6 +233,51 @@ function Security-Checkpoint([string]$Boot,[long]$Sequence) {
         return @{boot_id=$Boot;boot_sequence=$Sequence;record_id=[long]$newest[0].RecordId;oldest_record_id=[long]$oldest[0].RecordId;xml_sha256=(Security-EventHash $newest[0])}
     }finally{foreach($event in (@($newest)+@($oldest))){if($event -is [IDisposable]){$event.Dispose()}}}
 }
+function Get-LogonDiagnosticSidRole([string]$Value) {
+    # Diagnostic namespace only, never an admission decision. Validate the
+    # canonical SID structure without resolving account names or querying LSA.
+    if($null -eq $Value -or $Value.Length -gt 184){return 'unknown'}
+    $parts=$Value.Split('-')
+    if($parts.Count -lt 4 -or $parts.Count -gt 18 -or $parts[0] -cne 'S' -or $parts[1] -cne '1'){return 'unknown'}
+    [ulong]$authority=0
+    if($parts[2] -cnotmatch '^(0|[1-9][0-9]{0,14})$' -or -not [ulong]::TryParse($parts[2],[Globalization.NumberStyles]::None,[Globalization.CultureInfo]::InvariantCulture,[ref]$authority) -or $authority -gt 281474976710655){return 'unknown'}
+    for($i=3;$i -lt $parts.Count;$i++){
+        [uint32]$rid=0
+        if($parts[$i] -cnotmatch '^(0|[1-9][0-9]{0,9})$' -or -not [uint32]::TryParse($parts[$i],[Globalization.NumberStyles]::None,[Globalization.CultureInfo]::InvariantCulture,[ref]$rid)){return 'unknown'}
+    }
+    if($authority -eq 5){
+        # Microsoft winnt.h: SECURITY_WINDOW_MANAGER_BASE_RID=90 and
+        # SECURITY_UMFD_BASE_RID=96. Older Microsoft event documentation also
+        # shows the two-subauthority DWM form. No matching SID is exempted.
+        if(($parts.Count -eq 6 -and $parts[3] -ceq '90' -and $parts[4] -ceq '0') -or ($parts.Count -eq 5 -and $parts[3] -ceq '90')){return 'window_manager_namespace'}
+        if($parts.Count -eq 6 -and $parts[3] -ceq '96' -and $parts[4] -ceq '0'){return 'font_driver_namespace'}
+        if($parts.Count -eq 8 -and $parts[3] -ceq '21'){return 'account_domain_namespace'}
+        if($Value -ceq 'S-1-5-18'){return 'local_system'}
+    }
+    return 'other'
+}
+function Add-LogonIdentityDiagnostic([xml]$EventXml,[hashtable]$Diagnostic) {
+    # Runs only for a logon that already causes refusal. Export bounded counts
+    # for all offenders, never raw SIDs, names, domains, addresses or event XML.
+    try{
+        $sid=@($EventXml.Event.EventData.Data|Where-Object{$_.Name -ceq 'TargetUserSid'})
+        $role=if($sid.Count -eq 1){Get-LogonDiagnosticSidRole ([string]$sid[0].InnerText)}else{'unknown'}
+        $virtual=@($EventXml.Event.EventData.Data|Where-Object{$_.Name -ceq 'VirtualAccount'})
+        $virtualRole='unknown'
+        if($virtual.Count -eq 1){
+            $value=[string]$virtual[0].InnerText
+            if($value -ceq '%%1842'){$virtualRole='yes'}elseif($value -ceq '%%1843'){$virtualRole='no'}
+        }
+        foreach($name in @(('interactive_target_sid_'+$role),('interactive_virtual_account_'+$virtualRole))){
+            [long]$prior=0
+            if($Diagnostic.ContainsKey($name)){
+                $saved=$Diagnostic[$name]
+                if(($saved -is [int] -or $saved -is [long]) -and $saved -ge 0 -and $saved -le 4096){$prior=[long]$saved}else{$Diagnostic.logon_identity_detail_unavailable=$true}
+            }
+            $Diagnostic[$name]=[Math]::Min(4096L,$prior+1)
+        }
+    }catch{$Diagnostic.logon_identity_detail_unavailable=$true}
+}
 function Add-SecurityPolicyDiagnostic($Event,[hashtable]$Diagnostic) {
     # Optional details on an event that already causes refusal. Export only
     # native audit-family category IDs and recognized enable/disable bit roles.
@@ -339,7 +384,13 @@ function Save-SecurityAuditFailure([hashtable]$Diagnostic,$Failure) {
             if($value -is [long] -or $value -is [int] -or $value -is [uint32] -or $value -is [uint16]){$copy[$name]=[long]$value}
         }
     }
-    foreach($name in @('range_census_complete','range_census_failed','offending_before_only_startup','transport_drop_detail_unavailable','startup_scan_complete','logon_policy_enabled','startup_policy_enabled','policy_detail_unavailable','policy_change_tokens_recognized','policy_success_removed','policy_success_added','policy_failure_removed','policy_failure_added')){
+    foreach($name in @('interactive_target_sid_window_manager_namespace','interactive_target_sid_font_driver_namespace','interactive_target_sid_account_domain_namespace','interactive_target_sid_local_system','interactive_target_sid_other','interactive_target_sid_unknown','interactive_virtual_account_yes','interactive_virtual_account_no','interactive_virtual_account_unknown')){
+        if($Diagnostic.ContainsKey($name)){
+            $value=$Diagnostic[$name]
+            if(($value -is [int] -or $value -is [long]) -and $value -ge 0 -and $value -le 4096){$copy[$name]=[long]$value}
+        }
+    }
+    foreach($name in @('range_census_complete','range_census_failed','offending_before_only_startup','transport_drop_detail_unavailable','startup_scan_complete','logon_policy_enabled','startup_policy_enabled','policy_detail_unavailable','policy_change_tokens_recognized','policy_success_removed','policy_success_added','policy_failure_removed','policy_failure_added','logon_identity_detail_unavailable')){
         if($Diagnostic.ContainsKey($name) -and $Diagnostic[$name] -is [bool]){$copy[$name]=$Diagnostic[$name]}
     }
     if($Diagnostic.ContainsKey('policy_subcategory_guid') -and $Diagnostic.policy_subcategory_guid -cmatch '^0cce92[1-7][0-9a-f]-69ae-11d9-bed3-505054503030$'){$copy.policy_subcategory_guid=$Diagnostic.policy_subcategory_guid}
@@ -420,7 +471,7 @@ function Security-RebootAudit($Checkpoint,[string]$PreviousBoot,[string]$Current
                 if($event.Id -ne 4624){continue}
                 [xml]$xml=$event.ToXml();$types=@($xml.Event.EventData.Data|Where-Object{$_.Name -ceq 'LogonType'})
                 if($types.Count -ne 1 -or [string]$types[0].'#text' -notmatch '^\d{1,2}$'){$diagnostic.offending_event_id=[int]$event.Id;$diagnostic.offending_record_id=[long]$event.RecordId;$diagnostic.reason='logon_type_unavailable';throw 'Logon audit type unavailable'}
-                if([string]$types[0].'#text' -in @('2','7','10','11','12','13')){$interactive++;if(-not $diagnostic.ContainsKey('offending_event_id')){$diagnostic.offending_event_id=[int]$event.Id;$diagnostic.offending_record_id=[long]$event.RecordId;$diagnostic.offending_logon_type=[int]([string]$types[0].'#text')}}
+                if([string]$types[0].'#text' -in @('2','7','10','11','12','13')){$interactive++;Add-LogonIdentityDiagnostic $xml $diagnostic;if(-not $diagnostic.ContainsKey('offending_event_id')){$diagnostic.offending_event_id=[int]$event.Id;$diagnostic.offending_record_id=[long]$event.RecordId;$diagnostic.offending_logon_type=[int]([string]$types[0].'#text')}}
             }
             $diagnostic.interactive_logons=$interactive
             if($interactive -ne 0){$diagnostic.reason='interactive_logon';throw 'Interactive logon preceded boot witness'}
