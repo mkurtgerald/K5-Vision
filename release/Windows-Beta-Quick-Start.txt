@@ -1,0 +1,21 @@
+K5 Vision Windows beta — quick start
+Build: 5247fd96. Installer: K5VisionSetup.exe.
+
+Double-click K5VisionSetup.exe, follow Setup, and create/sign in to your administrator account. Use the K5 Vision shortcut for later launches. The Windows graphical installer includes the runtime; no terminal, Docker or separate Python setup is required.
+
+Existing sites: choose Move existing K5 site using its current Windows owner and K5 administrator account. Keep the existing site until the migration completes.
+
+Connect a camera: Add a camera → ONVIF camera → Find cameras on this network. Select your camera, enter its camera account, test the connection, choose an offered H.264 stream and connect. K5 obtains the stream address. Direct RTSP entry is an optional connection type.
+
+The first useful checks:
+1. Confirm the correct camera image and Recording confirmed. Try Auto wall layout and Camera settings.
+2. In Administration, create an Operator, grant selected cameras, activate the account and verify its access. Account security contains authenticator setup.
+3. After a few minutes, open Recording history. Seek directly, cross clip boundaries, use ±10s and change playback speed. Export a short clip; use browser Downloads → Show in folder and confirm the MP4 opens.
+4. Try Recording and zones: Continuous/Motion-triggered, pause/resume and inclusion/exclusion polygons. Optional sampled person views and recorded events should match the correct camera and UTC footage.
+5. Return the camera to Continuous. Close the client, later reopen it and play that interval. Test Windows sign-out and restart separately; recording should resume before the next human login.
+
+Compare Recorder time with a trusted clock and review storage limits before leaving a long test running.
+
+Report the build, Windows version, camera model/firmware, exact failed step, visible error and UTC interval. Keep credentials and private footage out of public reports.
+
+Beta limits: supported site backup/restore is not implemented. Sustained camera/storage capacity and wider physical-camera compatibility are not qualified. Large-archive inventory/recovery can pause recording. Commercial qualification remains outstanding.

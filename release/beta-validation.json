@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "qualified_at_utc": "2026-11-24T18:41:48.675175+00:00",
+  "scope": "Native Windows beta: automated fixture-backed qualification and exact-installer isolated planned-boot/sign-out observation",
+  "source_commit": "5247fd96b827129c010bfcf1e924824535f4d1c2",
+  "source_tree": "6aa426c8f7899227a74ab4a4ab8c4de3e7ecd43e",
+  "installer": {
+    "name": "K5VisionSetup.exe",
+    "bytes": 286590924,
+    "sha256": "68690ee4f6a18321af7bde22ae679c196d562608c1e3b468f6a78dc2480dc01f"
+  },
+  "qualification_complete_for_beta": true,
+  "commercial_readiness_qualified": false,
+  "ci": {
+    "run_id": 45456600720,
+    "passed": 8823,
+    "skipped": 369,
+    "coverage_percent": 83.38
+  },
+  "windows_desktop": {
+    "run_id": 45456600775,
+    "run_attempt": 1,
+    "jobs_passed": 11,
+    "gui_seconds": 355.33,
+    "gui_deadline_seconds": 360,
+    "qualified_artifact_id": 14950059406,
+    "qualified_archive_sha256": "b24ef4840899f56a7a112754322d5597ae14b8d1f757a16d299ed85819f426d7",
+    "all_installed_scopes_passed": true
+  },
+  "windows_sprint": {
+    "run_id": 45456600704,
+    "lanes_passed": 6
+  },
+  "windows_source_contracts": {
+    "run_id": 45456600677,
+    "jobs_passed": 7
+  },
+  "windows_operator_product": {
+    "run_id": 45456600732,
+    "passed": true
+  },
+  "planned_boot_signout_observation": {
+    "run_id": 45459461934,
+    "job_id": 138677743651,
+    "harness_head": "bc30f708601cf5718ac2db8a9bc56be7e8633ca9",
+    "harness_tree": "b608e88846eb356dc2b5119dee84ff0ce2846d4a",
+    "artifact_id": 14952917035,
+    "artifact_sha256": "32db46c1fff227e8926dc3444ca690a97aa24dc424afefacc610d0d2b8b435e8",
+    "diagnostic_only": true,
+    "product_qualification": false,
+    "recording_before_human_login_observed": true,
+    "recording_after_actual_windows_signout_observed": true,
+    "new_and_retained_footage_decoded": true,
+    "cleanup_complete": true,
+    "native_contract_controls": 165,
+    "native_boot_counter_controls": 34,
+    "independent_evidence_sha256": "3598da3e51aad11ec3a77438ab7b4c47be61293b55a0d688aefd5bf453e706e9"
+  },
+  "independent_evidence_sha256": {
+    "desktop": "2a278b44105dd8be97c67ceaff7a88d1f47d3fe5d1767ac34c23b5f144b86ace",
+    "ci_sprint_source": "7435801c12f583b03280a5f0cb0702187a2450fefd724bb5d1b5f26f882541c0",
+    "guest": "3598da3e51aad11ec3a77438ab7b4c47be61293b55a0d688aefd5bf453e706e9"
+  },
+  "limits": [
+    "Supported site backup/restore is not implemented.",
+    "Sustained camera/storage capacity and endurance are not qualified.",
+    "Broader physical-camera compatibility and external identity-provider tenant qualification remain separate.",
+    "Large-archive inventory/recovery can pause recording.",
+    "Hard-reset recording qualification is not established."
+  ]
+}

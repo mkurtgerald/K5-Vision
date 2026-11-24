@@ -1,0 +1,14 @@
+K5 Vision native Windows beta
+
+Download K5VisionSetup.exe and double-click it. The graphical installer includes the runtime and local person model. Use the K5 Vision shortcut after installation.
+
+This candidate includes automatic ONVIF enrollment, optional direct RTSP enrollment, an adaptive camera wall, camera settings and recording zones, users/permissions/MFA, local person analytics, recording history with seeking and clip export, and an unattended Windows recorder service.
+
+The exact source and installer passed all eleven native Windows qualification jobs, full CI (8,823 passed; 369 skipped; 83.38% coverage), all six Windows Sprint lanes and seven source-contract jobs. The original recording ownership and cleanup guards remain enforced. Both real forward/backward two-day clock-correction lanes preserved footage and timestamps and restored time services. Existing-site migration, cancellation and reversal passed.
+
+The exact installer also passed an isolated Windows VM observation of recording before human login after a planned reboot and continued recording after actual Windows sign-out. New and retained footage decoded successfully, and cleanup completed.
+
+Build: 5247fd96b827129c010bfcf1e924824535f4d1c2
+Installer SHA-256: 68690ee4f6a18321af7bde22ae679c196d562608c1e3b468f6a78dc2480dc01f
+
+Beta limits: supported site backup/restore is not implemented. Sustained camera/storage capacity, broader physical-camera compatibility and commercial readiness remain unqualified. Large-archive inventory/recovery can pause recording. Hard-reset qualification is not established.

@@ -1,0 +1,63 @@
+name: Publish qualified Windows beta 5247fd9
+
+on:
+  push:
+    branches: [codex/publish-beta-5247-20261124]
+    paths:
+      - .github/workflows/publish-beta-5247.yml
+      - scripts/publish_beta_5247.py
+      - release/**
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-windows-beta-5247fd9
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Verify exact completed qualification and publish original installer
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Checkout publication controller only
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Retrieve the original GUI-qualified installer without rebuilding
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          artifact-ids: '14950059406'
+          github-token: ${{ github.token }}
+          run-id: '45456600775'
+          path: qualified-input
+          merge-multiple: true
+      - name: Retrieve the matching actual planned-boot and sign-out receipt
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          artifact-ids: '14952917035'
+          github-token: ${{ github.token }}
+          run-id: '45459461934'
+          path: guest-input
+          merge-multiple: true
+      - name: Admit source, bytes, all normal gates and actual boot before publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python3 scripts/publish_beta_5247.py
+          --qualified-dir qualified-input
+          --guest-dir guest-input
+          --publish
+      - name: Retain finite publication evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: beta-publication-5247-${{ github.run_id }}-${{ github.run_attempt }}
+          path: publication-evidence.json
+          if-no-files-found: ignore
+          retention-days: 14
