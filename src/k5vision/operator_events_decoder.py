@@ -126,7 +126,9 @@ def main() -> int:
                     from k5vision.operator_analytics_person import (
                         OperatorPersonConfiguration,
                         _PersonDetector,
+                        validate_person_runtime,
                     )
+                    from k5vision.operator_person_telemetry import configure_local_person_telemetry
 
                     artifact_root = request["artifact_root"]
                     phase = "model"
@@ -134,8 +136,11 @@ def main() -> int:
                     # Priming owns no camera media and publishes no model path.
                     sys.stdout.buffer.write(b'{"status":"phase","phase":"model"}\n')
                     sys.stdout.buffer.flush()
+                    config = OperatorPersonConfiguration(Path(artifact_root))
+                    validate_person_runtime(config)
+                    configure_local_person_telemetry()
                     detector = _PersonDetector(
-                        OperatorPersonConfiguration(Path(artifact_root)),
+                        config,
                         inference_threads=_recorder_inference_threads(),
                         fixed_view_input=True,
                     )
@@ -170,14 +175,19 @@ def main() -> int:
                     from k5vision.operator_analytics_person import (
                         OperatorPersonConfiguration,
                         _PersonDetector,
+                        validate_person_runtime,
                     )
+                    from k5vision.operator_person_telemetry import configure_local_person_telemetry
 
                     artifact_root = request["artifact_root"]
                     phase = "model"
                     sys.stdout.buffer.write(b'{"status":"phase","phase":"model"}\n')
                     sys.stdout.buffer.flush()
+                    config = OperatorPersonConfiguration(Path(artifact_root))
+                    validate_person_runtime(config)
+                    configure_local_person_telemetry()
                     detector = _PersonDetector(
-                        OperatorPersonConfiguration(Path(artifact_root)),
+                        config,
                         inference_threads=_recorder_inference_threads(),
                         fixed_view_input=True,
                     )

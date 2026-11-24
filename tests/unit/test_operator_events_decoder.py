@@ -8,6 +8,8 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from k5vision import operator_events_decoder as decoder
 
 
@@ -222,6 +224,7 @@ def test_decoder_progress_reports_only_fixed_stage_and_never_source(monkeypatch)
 
 def test_person_model_can_prime_without_decoding_or_retaining_camera_media(monkeypatch):
     from k5vision import operator_analytics_person as person
+    from k5vision import operator_person_telemetry as telemetry
 
     initialized = []
     warmed = []
@@ -235,6 +238,8 @@ def test_person_model_can_prime_without_decoding_or_retaining_camera_media(monke
             return (object(),)
 
     monkeypatch.setattr(person, "OperatorPersonConfiguration", lambda root: root)
+    monkeypatch.setattr(person, "validate_person_runtime", lambda config: None)
+    monkeypatch.setattr(telemetry, "configure_local_person_telemetry", lambda: None)
     monkeypatch.setattr(
         person,
         "_PersonDetector",
@@ -260,6 +265,7 @@ def test_person_model_can_prime_without_decoding_or_retaining_camera_media(monke
 def test_recorded_person_uses_the_same_fixed_graph_after_model_only_prime(monkeypatch):
     """A real recorded snapshot reuses the admitted 544x320 two-thread graph."""
     from k5vision import operator_analytics_person as person
+    from k5vision import operator_person_telemetry as telemetry
 
     models = []
     calls = []
@@ -282,6 +288,8 @@ def test_recorded_person_uses_the_same_fixed_graph_after_model_only_prime(monkey
         return models[-1]
 
     monkeypatch.setattr(person, "OperatorPersonConfiguration", lambda root: root)
+    monkeypatch.setattr(person, "validate_person_runtime", lambda config: None)
+    monkeypatch.setattr(telemetry, "configure_local_person_telemetry", lambda: None)
     monkeypatch.setattr(person, "_PersonDetector", factory)
     monkeypatch.setattr(decoder, "decode", lambda path: (0.25, pixels))
     requests = (
@@ -314,6 +322,7 @@ def test_person_model_prime_cannot_run_without_an_admitted_configuration(monkeyp
 
 def test_model_prime_failure_reports_finite_stage_without_native_details(monkeypatch):
     from k5vision import operator_analytics_person as person
+    from k5vision import operator_person_telemetry as telemetry
 
     def broken_model(_config, *, inference_threads, fixed_view_input):
         assert inference_threads == decoder._recorder_inference_threads()
@@ -321,6 +330,8 @@ def test_model_prime_failure_reports_finite_stage_without_native_details(monkeyp
         raise RuntimeError("rtsp://private-source-with-credentials")
 
     monkeypatch.setattr(person, "OperatorPersonConfiguration", lambda root: root)
+    monkeypatch.setattr(person, "validate_person_runtime", lambda config: None)
+    monkeypatch.setattr(telemetry, "configure_local_person_telemetry", lambda: None)
     monkeypatch.setattr(person, "_PersonDetector", broken_model)
     request = json.dumps({"path": "", "artifact_root": "private-model"}).encode()
     output = io.BytesIO()
@@ -332,3 +343,54 @@ def test_model_prime_failure_reports_finite_stage_without_native_details(monkeyp
     )
     assert b"private-model" not in output.getvalue()
     assert b"private-source" not in output.getvalue()
+
+
+@pytest.mark.parametrize("path", ["", "private-recording.mp4"])
+def test_person_policy_fails_closed_after_admission_before_detector(monkeypatch, path):
+    from k5vision import operator_analytics_person as person
+    from k5vision import operator_person_telemetry as telemetry
+
+    stages = []
+    monkeypatch.setattr(person, "OperatorPersonConfiguration", lambda root: root)
+    monkeypatch.setattr(
+        person, "validate_person_runtime", lambda config: stages.append(("admitted", config))
+    )
+
+    def unavailable():
+        stages.append(("policy", None))
+        raise RuntimeError("private-donor-location-and-secret")
+
+    def forbidden_detector(*args, **kwargs):
+        stages.append(("detector", None))
+        raise AssertionError("detector ran after policy rejection")
+
+    monkeypatch.setattr(telemetry, "configure_local_person_telemetry", unavailable)
+    monkeypatch.setattr(person, "_PersonDetector", forbidden_detector)
+    monkeypatch.setattr(decoder, "decode", lambda path: (0.25, b"fixture-pixels"))
+    incoming = json.dumps({"path": path, "artifact_root": "private-model"}).encode() + b"\n"
+    output = io.BytesIO()
+    monkeypatch.setattr(decoder.sys, "stdin", SimpleNamespace(buffer=io.BytesIO(incoming)))
+    monkeypatch.setattr(decoder.sys, "stdout", SimpleNamespace(buffer=output))
+    assert decoder.main() == 1
+    assert stages == [("admitted", Path("private-model")), ("policy", None)]
+    assert output.getvalue().endswith(b'{"status": "failed", "phase": "model"}\n')
+    assert b"private" not in output.getvalue()
+
+
+def test_decode_without_person_model_does_not_select_usage_policy(monkeypatch):
+    from k5vision import operator_analytics_person as person
+    from k5vision import operator_person_telemetry as telemetry
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("decode-only request entered person-runtime policy")
+
+    monkeypatch.setattr(person, "validate_person_runtime", forbidden)
+    monkeypatch.setattr(telemetry, "configure_local_person_telemetry", forbidden)
+    monkeypatch.setattr(decoder, "decode", lambda path: (0.25, b"fixture-pixels"))
+    incoming = json.dumps({"path": "private-recording.mp4", "artifact_root": None}).encode()
+    output = io.BytesIO()
+    monkeypatch.setattr(decoder.sys, "stdin", SimpleNamespace(buffer=io.BytesIO(incoming + b"\n")))
+    monkeypatch.setattr(decoder.sys, "stdout", SimpleNamespace(buffer=output))
+    assert decoder.main() == 0
+    assert b'"detections": null' in output.getvalue()
+    assert output.getvalue().endswith(b"fixture-pixels")

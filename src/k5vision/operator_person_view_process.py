@@ -217,7 +217,12 @@ def _read_exact(stream, size: int) -> bytearray:
 
 
 def _child() -> int:
-    from k5vision.operator_analytics_person import OperatorPersonConfiguration, _PersonDetector
+    from k5vision.operator_analytics_person import (
+        OperatorPersonConfiguration,
+        _PersonDetector,
+        validate_person_runtime,
+    )
+    from k5vision.operator_person_telemetry import configure_local_person_telemetry
 
     raw = _line(sys.stdin.buffer)
     if set(raw) != {"artifact_root"} or type(raw["artifact_root"]) is not str:
@@ -226,8 +231,11 @@ def _child() -> int:
     if not 0 < len(raw["artifact_root"]) <= 4096:
         return 1
     try:
+        config = OperatorPersonConfiguration(Path(raw["artifact_root"]))
+        validate_person_runtime(config)
+        configure_local_person_telemetry()
         detector = _PersonDetector(
-            OperatorPersonConfiguration(Path(raw["artifact_root"])),
+            config,
             inference_threads=1,
             fixed_view_input=True,
         )
