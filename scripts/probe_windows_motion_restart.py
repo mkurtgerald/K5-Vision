@@ -88,6 +88,84 @@ SOURCE_PINS = {
 }
 ORIGINAL_POPEN = subprocess.Popen
 CYCLES = 12
+STDERR_LIMIT = 65536
+STDERR_CATEGORIES = {
+    "timeout": (b"stream timeout triggered after", b"timed out", b"operation timeout"),
+    "eof": (b"end of file", b"unexpected eof", b"averror_eof"),
+    "connection": (b"connection reset", b"connection refused", b"broken pipe"),
+    "decode": (b"error while decoding", b"failed to decode", b"decode_slice_header error"),
+    "nal": (b"invalid nal", b"missing picture in access unit", b"no start code is found"),
+    "pps": (b"non-existing pps", b"pps id out of range", b"sps_id out of range"),
+    "read_attempts": (b"packet read max attempts exceeded",),
+    "decode_attempts": (b"frame decode max attempts exceeded",),
+}
+
+
+def stderr_summary(raw):
+    """Discard private text; return only capped counts for fixed byte tokens."""
+    if type(raw) is not bytes:
+        raise ValueError("Diagnostic stderr bytes required")
+    counts = dict.fromkeys((*STDERR_CATEGORIES, "other"), 0)
+    for line in raw[:STDERR_LIMIT].lower().splitlines():
+        if not line.strip():
+            continue
+        matched = False
+        for category, tokens in STDERR_CATEGORIES.items():
+            if any(token in line for token in tokens):
+                counts[category] = min(999, counts[category] + 1)
+                matched = True
+        if not matched:
+            counts["other"] = min(999, counts["other"] + 1)
+    return {
+        "bytes_scanned": min(len(raw), STDERR_LIMIT),
+        "truncated": len(raw) > STDERR_LIMIT,
+        "category_counts": counts,
+    }
+
+
+def stderr_controls():
+    canary = b"rtsp://diagnostic-secret@example.invalid/private-camera-CANARY"
+    for category, tokens in STDERR_CATEGORIES.items():
+        for token in tokens:
+            result = stderr_summary(b"prefix " + token.upper() + b" " + canary + b"\n")
+            if result["category_counts"][category] != 1 or "CANARY" in json.dumps(result):
+                raise ValueError("Fixed stderr category control failed")
+    unknown = stderr_summary(canary + b"\n\xff\xfe\n")
+    if unknown["category_counts"]["other"] != 2 or "CANARY" in json.dumps(unknown):
+        raise ValueError("Private stderr negative control failed")
+    trailing = stderr_summary(b"stream timeout triggered after")["category_counts"]
+    if (
+        trailing["timeout"] != 1
+        or trailing != stderr_summary(b"stream timeout triggered after\n")["category_counts"]
+    ):
+        raise ValueError("Trailing stderr line control failed")
+    if (
+        stderr_summary(b"timed out stream timeout triggered after")["category_counts"]["timeout"]
+        != 1
+    ):
+        raise ValueError("One-line stderr category control failed")
+    if any(stderr_summary(b"\n \n\t\n")["category_counts"].values()):
+        raise ValueError("Blank stderr control failed")
+    capped = stderr_summary(b"x\n" * 40000)
+    if (
+        not capped["truncated"]
+        or capped["bytes_scanned"] != STDERR_LIMIT
+        or capped["category_counts"]["other"] != 999
+    ):
+        raise ValueError("Bounded stderr counter control failed")
+    if stderr_summary(b"timed out\n" * 1500)["category_counts"]["timeout"] != 999:
+        raise ValueError("Bounded known-category control failed")
+    giant = stderr_summary(b"x" * STDERR_LIMIT + b"stream timeout triggered after")
+    if not giant["truncated"] or giant["category_counts"]["timeout"] != 0:
+        raise ValueError("Bounded stderr scan control failed")
+    for malformed in (None, "private", bytearray(b"private")):
+        try:
+            stderr_summary(malformed)
+        except ValueError:
+            pass
+        else:
+            raise ValueError("Malformed stderr control failed")
+    return 8
 
 
 def digest(path):
@@ -194,6 +272,13 @@ def main():
         "cleanup_complete": False,
         "phase": "admission",
         "cases": [],
+        "child_stderr": [],
+        "telemetry_scope": (
+            "private regular-file stderr capture; fixed categories only; "
+            "before-call and successful-return snapshots precede cleanup; "
+            "failed-return and final child summaries may include forced cleanup; "
+            "producer generation/pipe-write snapshots are correlations, not RTP arrival proof"
+        ),
     }
     owned, logs, publisher, worker = [], [], None, None
     temporary = None
@@ -281,6 +366,7 @@ def main():
             decoder_avformat="61.7.100",
             media_executable_sha256=digest(media),
             ordinal_controls=controls(),
+            stderr_category_controls=stderr_controls(),
             production_source_sha256=SOURCE_PINS,
             imported_production_modules_verified=True,
             timeout_envelope={
@@ -309,11 +395,19 @@ def main():
         fixture = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(fixture)
         times, timestamp_lock, original_frame = {}, threading.Lock(), fixture.generated_frame
+        generation_gaps, generation_state = [], {"count": 0, "latest": None}
 
         def generated(mode, index, **kwargs):
             raw = stamp(original_frame(mode, index, **kwargs), index, **kwargs)
             with timestamp_lock:
-                times[index] = time.monotonic()
+                generated_at = time.monotonic()
+                previous = generation_state["latest"]
+                if previous is not None:
+                    generation_gaps.append((generated_at, generated_at - previous))
+                    if len(generation_gaps) > 1024:
+                        del generation_gaps[0]
+                generation_state.update(count=generation_state["count"] + 1, latest=generated_at)
+                times[index] = generated_at
                 if len(times) > 1024:
                     del times[min(times)]
             return raw
@@ -400,6 +494,22 @@ def main():
             if time.monotonic() >= until:
                 raise RuntimeError("Owned fixture publisher not ready")
             time.sleep(0.05)
+
+        def source_snapshot():
+            with timestamp_lock:
+                observed = time.monotonic()
+                latest = generation_state["latest"]
+                age = observed - latest if latest is not None else None
+                recent = [gap for ended, gap in generation_gaps if ended >= observed - 5]
+                return {
+                    "generated_frames": generation_state["count"],
+                    "pipe_frames_written": publisher.frames_written,
+                    "latest_generation_age_seconds": round(age, 6) if age is not None else None,
+                    "largest_generation_gap_last_5_seconds": round(
+                        max(recent + ([age] if age is not None else []), default=0), 6
+                    ),
+                }
+
         relay = launch("relay.json", rtsp_port)
         policy = {
             "revision": 1,
@@ -409,10 +519,11 @@ def main():
             "include": [],
             "exclude": [],
         }
-        variant = False
+        child_captures = []
+        cycle = 0
 
         def launch_child(args, **kwargs):
-            if variant and args == [
+            if args == [
                 sys.executable,
                 "-I",
                 "-B",
@@ -420,20 +531,28 @@ def main():
                 "k5vision.operator_motion_process",
                 "--child",
             ]:
-                environment = dict(kwargs["env"])
                 if (
-                    environment.get("OPENCV_FFMPEG_CAPTURE_OPTIONS")
+                    kwargs["env"].get("OPENCV_FFMPEG_CAPTURE_OPTIONS")
                     != "rtsp_transport;tcp|fflags;nobuffer"
                 ):
                     raise ValueError("Original worker options differ")
-                environment["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
-                kwargs["env"] = environment
+                path = temporary / f"child-{cycle:02d}.stderr"
+                handle = path.open("wb")
+                logs.append(handle)
+                child_captures.append((cycle, path, handle))
+                kwargs["stderr"] = handle
             return ORIGINAL_POPEN(args, **kwargs)
+
+        def current_stderr():
+            matching = [path for owner_cycle, path, _ in child_captures if owner_cycle == cycle]
+            if not matching:
+                return None
+            with matching[-1].open("rb") as captured:
+                return stderr_summary(captured.read(STDERR_LIMIT + 1))
 
         motion.subprocess.Popen = launch_child
         modes = ["baseline"]
         for mode in modes:
-            variant = mode == "diagnostic_tcp_only"
             phase = mode
             for cycle in range(CYCLES):
                 if worker is not None:
@@ -446,9 +565,17 @@ def main():
                 worker = LiveMotionWorker(
                     f"rtsp://worker:{'w' * 32}@127.0.0.1:{rtsp_port}/{binding.path_name}"
                 )
+                cycle_started, first_ready_at = time.monotonic(), None
                 for sample_number in range(3):
                     started = time.monotonic()
-                    facts = {"mode": mode, "cycle": cycle, "sample": sample_number}
+                    facts = {
+                        "mode": mode,
+                        "cycle": cycle,
+                        "sample": sample_number,
+                        "source_before": source_snapshot(),
+                        "stderr_before_sample": current_stderr(),
+                        "sample_started_since_cycle_seconds": round(started - cycle_started, 6),
+                    }
                     try:
                         sample = worker.sample(policy)
                         captured_index = ordinal(sample.jpeg)
@@ -471,16 +598,31 @@ def main():
                             decoder_phase=error.decoder_phase,
                             reason=error.reason,
                         )
-                    facts["elapsed_seconds"] = round(time.monotonic() - started, 6)
+                    finished = time.monotonic()
+                    if facts["outcome"] == "ready" and first_ready_at is None:
+                        first_ready_at = finished
+                    facts.update(
+                        elapsed_seconds=round(finished - started, 6),
+                        sample_completed_since_cycle_seconds=round(finished - cycle_started, 6),
+                        seconds_since_first_ready=round(finished - first_ready_at, 6)
+                        if first_ready_at is not None
+                        else None,
+                        source_after=source_snapshot(),
+                        stderr_after_sample=current_stderr(),
+                    )
                     result["cases"].append(facts)
                     if facts["outcome"] == "failed":
                         break
                     time.sleep(0.5)
-            if mode == "baseline" and any(
-                x.get("decoder_phase") == "decoder_read" and x["outcome"] == "failed"
-                for x in result["cases"]
-            ):
-                modes.extend(["diagnostic_tcp_only", "baseline_confirmation"])
+                worker.close()
+                worker = None
+                for owner_cycle, path, handle in child_captures:
+                    if owner_cycle == cycle:
+                        handle.close()
+                        with path.open("rb") as captured:
+                            diagnostic = stderr_summary(captured.read(STDERR_LIMIT + 1))
+                        result["child_stderr"].append({"cycle": cycle, **diagnostic})
+                        path.unlink()
         result["completed"] = True
     except BaseException as error:
         result.update(
@@ -538,6 +680,14 @@ if __name__ == "__main__":
     parser.add_argument("--controls", action="store_true")
     arguments = parser.parse_args()
     if arguments.controls:
-        print(json.dumps({"diagnostic_controls": controls(), "product_qualification": False}))
+        print(
+            json.dumps(
+                {
+                    "diagnostic_controls": controls(),
+                    "stderr_category_controls": stderr_controls(),
+                    "product_qualification": False,
+                }
+            )
+        )
     else:
         raise SystemExit(main())
