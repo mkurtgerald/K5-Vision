@@ -9,6 +9,7 @@ from __future__ import annotations
 import http.cookiejar
 import importlib.util
 import json
+import math
 import os
 import platform
 import re
@@ -17,6 +18,7 @@ import shutil
 import subprocess
 import threading
 import time
+from contextvars import ContextVar
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.parse import urlencode, urljoin
@@ -41,6 +43,224 @@ pytestmark = pytest.mark.skipif(
 )
 _SECONDS = 16
 _MAX_MEDIA = 16 * 1024**2
+_AUTH_TRACE_CONTEXT = ContextVar("test_only_auth_trace", default=None)
+
+
+class _AuthPhaseTrace:
+    """Test-only fixed phase facts; never inspect arguments, results or error text."""
+
+    _STAGES = frozenset(
+        {
+            "executor",
+            "audit_started",
+            "audit_finished",
+            "password_verify",
+            "kdf",
+            "security_started",
+            "security_password",
+            "security_validate",
+            "factor_status",
+            "session_issue",
+            "session_resolve",
+            "client_open",
+            "application",
+        }
+    )
+    _EDGES = frozenset({"queued", "entered", "returned", "raised", "headers", "complete"})
+
+    def __init__(self, generation, *, clock=time.monotonic):
+        self.generation = generation if type(generation) is int and 1 <= generation <= 8 else 0
+        self._clock, self._born = clock, clock()
+        self._lock, self._worker = threading.Lock(), threading.local()
+        self._events, self._restores = [], []
+        self._dropped, self._work, self._active_login = 0, 0, 0
+        self.restored = False
+
+    def begin_login(self, ordinal):
+        with self._lock:
+            self._active_login = ordinal if type(ordinal) is int and 1 <= ordinal <= 16 else 0
+
+    def event(self, stage, edge, *, login=None, work=None, status=0):
+        if stage not in self._STAGES or edge not in self._EDGES:
+            return
+        context = _AUTH_TRACE_CONTEXT.get()
+        if login is None:
+            if context is None or context[0] is not self:
+                return
+            login = context[1]
+        if type(login) is not int or not 1 <= login <= 16:
+            return
+        elapsed = self._clock() - self._born
+        elapsed = round(min(600.0, max(0.0, elapsed)), 6) if math.isfinite(elapsed) else 0.0
+        work = getattr(self._worker, "identifier", 0) if work is None else work
+        item = {
+            "stage": stage,
+            "edge": edge,
+            "login_ordinal": login,
+            "work_item": work if type(work) is int and 0 <= work <= 512 else 0,
+            "elapsed_seconds": elapsed,
+            "http_status": status if type(status) is int and 100 <= status <= 599 else 0,
+        }
+        with self._lock:
+            if len(self._events) < 512:
+                self._events.append(item)
+            else:
+                self._dropped = min(999, self._dropped + 1)
+
+    def _observe(self, stage, operation, *args, **kwargs):
+        self.event(stage, "entered")
+        try:
+            result = operation(*args, **kwargs)
+        except BaseException:
+            self.event(stage, "raised")
+            raise
+        self.event(stage, "returned")
+        return result
+
+    def _replace(self, owner, name, replacement):
+        original = getattr(owner, name)
+        setattr(owner, name, replacement)
+        self._restores.append((owner, name, original, replacement))
+
+    def wrap(self, owner, name, stage):
+        original = getattr(owner, name)
+
+        def observed(*args, **kwargs):
+            return self._observe(stage, original, *args, **kwargs)
+
+        self._replace(owner, name, observed)
+
+    def wrap_async(self, owner, name, stage):
+        original = getattr(owner, name)
+
+        async def observed(*args, **kwargs):
+            self.event(stage, "entered")
+            try:
+                result = await original(*args, **kwargs)
+            except BaseException:
+                self.event(stage, "raised")
+                raise
+            self.event(stage, "returned")
+            return result
+
+        self._replace(owner, name, observed)
+
+    def install(self, application):
+        from k5vision.services import user_registry
+
+        state = application.state
+        executor = state.user_login_executor
+        submit = executor.submit
+
+        def observed_submit(operation, /, *args, **kwargs):
+            context = _AUTH_TRACE_CONTEXT.get()
+            if context is None or context[0] is not self:
+                return submit(operation, *args, **kwargs)
+            login = context[1]
+            with self._lock:
+                self._work = min(512, self._work + 1)
+                work = self._work
+            self.event("executor", "queued", login=login, work=work)
+
+            def execute():
+                previous = getattr(self._worker, "identifier", 0)
+                self._worker.identifier = work
+                self.event("executor", "entered", login=login, work=work)
+                try:
+                    result = operation(*args, **kwargs)
+                except BaseException:
+                    self.event("executor", "raised", login=login, work=work)
+                    raise
+                else:
+                    self.event("executor", "returned", login=login, work=work)
+                    return result
+                finally:
+                    self._worker.identifier = previous
+
+            return submit(execute)
+
+        self._replace(executor, "submit", observed_submit)
+        audit = state.operator_audit
+        record = audit.record
+
+        def observed_record(*args, **kwargs):
+            if not args or args[0] != "auth.login":
+                return record(*args, **kwargs)
+            stage = "audit_started" if kwargs.get("outcome") == "started" else "audit_finished"
+            return self._observe(stage, record, *args, **kwargs)
+
+        self._replace(audit, "record", observed_record)
+        self.wrap(state.user_registry, "verify_password_snapshot", "password_verify")
+        security = state.operator_identity_security
+        for name, stage in (
+            ("primary_started", "security_started"),
+            ("password_authenticated", "security_password"),
+            ("validate_primary_proof", "security_validate"),
+        ):
+            self.wrap(security, name, stage)
+        self.wrap(security.store, "status", "factor_status")
+        self.wrap_async(state.user_session_manager, "issue", "session_issue")
+        self.wrap_async(state.user_session_manager, "resolve", "session_resolve")
+        derive = user_registry._derive_credential
+
+        def observed_derive(*args, **kwargs):
+            context = _AUTH_TRACE_CONTEXT.get()
+            if context is None or context[0] is not self:
+                return derive(*args, **kwargs)
+            return self._observe("kdf", derive, *args, **kwargs)
+
+        self._replace(user_registry, "_derive_credential", observed_derive)
+
+    async def application(self, app, scope, receive, send):
+        if (
+            scope["type"] != "http"
+            or scope.get("method") != "POST"
+            or scope.get("path") != "/api/v1/auth/login"
+        ):
+            await app(scope, receive, send)
+            return
+        with self._lock:
+            login = self._active_login
+        token = _AUTH_TRACE_CONTEXT.set((self, login))
+        self.event("application", "entered")
+
+        async def observed_send(message):
+            if message["type"] == "http.response.start":
+                self.event("application", "headers", status=message.get("status"))
+            elif message["type"] == "http.response.body" and not message.get("more_body", False):
+                self.event("application", "complete")
+            await send(message)
+
+        try:
+            await app(scope, receive, observed_send)
+        except BaseException:
+            self.event("application", "raised")
+            raise
+        else:
+            self.event("application", "returned")
+        finally:
+            _AUTH_TRACE_CONTEXT.reset(token)
+
+    def restore(self):
+        good = True
+        for owner, name, original, replacement in reversed(self._restores):
+            if getattr(owner, name) is replacement:
+                setattr(owner, name, original)
+            else:
+                good = False
+        self._restores.clear()
+        self.restored = good
+
+    def snapshot(self):
+        with self._lock:
+            return {
+                "diagnostic_only": True,
+                "product_qualification": False,
+                "product_generation": self.generation,
+                "restored": self.restored,
+                "events": [dict(event) for event in self._events],
+                "dropped": self._dropped,
+            }
 
 
 def _helpers():
@@ -62,6 +282,8 @@ class _Client:
         self.transport_failure = None
         self.last_http_status = None
         self.last_api_error_code = None
+        self.auth_trace = None
+        self.auth_login_ordinal = 0
 
     def get(
         self,
@@ -90,6 +312,11 @@ class _Client:
         ):
             raise ValueError("Explicit preview deadline must be exactly seven seconds")
         began = time.monotonic()
+        trace = self.auth_trace if route == "/api/v1/auth/login" else None
+        if trace is not None:
+            self.auth_login_ordinal += 1
+            trace.begin_login(self.auth_login_ordinal)
+            trace.event("client_open", "entered", login=self.auth_login_ordinal)
         try:
             response = self.opener.open(
                 request, timeout=3 if request_deadline_seconds is None else 7
@@ -97,6 +324,8 @@ class _Client:
         except HTTPError as error:
             response = error
         except OSError as error:
+            if trace is not None:
+                trace.event("client_open", "raised", login=self.auth_login_ordinal)
             safe_types = {
                 "TimeoutError",
                 "ConnectionRefusedError",
@@ -121,6 +350,8 @@ class _Client:
             ) from None
         with response:
             status = response.code
+            if trace is not None:
+                trace.event("client_open", "headers", login=self.auth_login_ordinal, status=status)
             self.last_http_status = status
             deadline = time.monotonic() + 15 if request_deadline_seconds is None else began + 7
             body = bytearray()
@@ -143,6 +374,8 @@ class _Client:
                 body.extend(part)
             if len(body) > max_bytes:
                 pytest.fail("Local operator response exceeded its byte budget")
+            if trace is not None:
+                trace.event("client_open", "complete", login=self.auth_login_ordinal, status=status)
             return status, bytes(body), response.headers
 
     def json(self, route, *, expected=200, **kwargs):
@@ -175,7 +408,7 @@ class _Client:
 
 
 class _Product:
-    def __init__(self, identity, recording_root, media, caddy, ports):
+    def __init__(self, identity, recording_root, media, caddy, ports, *, generation=1):
         public, control, api, playback, rtsp, hls = ports
         self.service = OperatorProductService(
             site_id=identity.site_id,
@@ -193,9 +426,23 @@ class _Product:
         self.app = create_operator_product_app(
             identity_directory=identity.directory, service=self.service
         )
+        self.auth_trace = _AuthPhaseTrace(generation)
+        try:
+            self.auth_trace.install(self.app)
+        except BaseException:
+            self.auth_trace.restore()
+            raise
+
+        async def observed_application(scope, receive, send):
+            await self.auth_trace.application(self.app, scope, receive, send)
+
         self.server = uvicorn.Server(
             uvicorn.Config(
-                self.app, host="127.0.0.1", port=control, access_log=False, log_level="critical"
+                observed_application,
+                host="127.0.0.1",
+                port=control,
+                access_log=False,
+                log_level="critical",
             )
         )
         self.failed = False
@@ -213,6 +460,7 @@ class _Product:
         self.server.should_exit = True
         self.thread.join(timeout=25)
         assert not self.thread.is_alive(), "Owned operator application did not finish cleanup"
+        self.auth_trace.restore()
 
 
 def _wait(condition, *, label, product=None, timeout=15):
@@ -391,6 +639,8 @@ def test_assembled_operator_product_login_live_recording_logout_and_restart(
     recording_root = identity.directory / "recordings with spaces"
     source_uri = f"rtsp://127.0.0.1:{upstream_port}/generated"
     receipt = {
+        "diagnostic_only": True,
+        "product_qualification": False,
         "platform": platform.system(),
         "native_windows_execution": os.name == "nt",
         "generated_media_only": True,
@@ -407,6 +657,7 @@ def test_assembled_operator_product_login_live_recording_logout_and_restart(
         product = _Product(identity, recording_root, media, caddy, product_ports)
         products.append(product)
         client = _Client(product_ports[0])
+        client.auth_trace = product.auth_trace
         _wait(
             lambda: product.server.started and client.get("/operator/")[0] == 200,
             label="Product startup",
@@ -515,8 +766,9 @@ def test_assembled_operator_product_login_live_recording_logout_and_restart(
 
         print("Product phase: whole application restart and durable recovery", flush=True)
         product.stop()
-        product = _Product(identity, recording_root, media, caddy, product_ports)
+        product = _Product(identity, recording_root, media, caddy, product_ports, generation=2)
         products.append(product)
+        client.auth_trace = product.auth_trace
         _wait(
             lambda: product.server.started and client.get("/operator/")[0] == 200,
             label="Product restart",
@@ -554,12 +806,12 @@ def test_assembled_operator_product_login_live_recording_logout_and_restart(
             }
         )
         record_testsuite_property(
-            "operator_product_runtime_receipt", json.dumps(receipt, sort_keys=True)
+            "diagnostic_operator_product_runtime_receipt", json.dumps(receipt, sort_keys=True)
         )
     finally:
         if client is not None and client.transport_failure is not None:
             record_testsuite_property(
-                "operator_product_transport_failure",
+                "diagnostic_operator_product_transport_failure",
                 json.dumps(client.transport_failure, sort_keys=True),
             )
             # Failure-only independent health probe. Do not retry the failed
@@ -574,7 +826,7 @@ def test_assembled_operator_product_login_live_recording_logout_and_restart(
             except RuntimeError:
                 pass
             record_testsuite_property(
-                "operator_product_failure_health",
+                "diagnostic_operator_product_failure_health",
                 json.dumps({"independent_health": health_class}, sort_keys=True),
             )
         print("Product phase: stop and reap owned application and fixtures", flush=True)
@@ -591,4 +843,17 @@ def test_assembled_operator_product_login_live_recording_logout_and_restart(
                 cleanup_failures += 1
         for listener in reservations:
             listener.close()
+        record_testsuite_property(
+            "diagnostic_auth_phase_timing",
+            json.dumps(
+                {
+                    "diagnostic_only": True,
+                    "product_qualification": False,
+                    "original_login_open_seconds": 3,
+                    "failed_login_retried": False,
+                    "generations": [product.auth_trace.snapshot() for product in products],
+                },
+                sort_keys=True,
+            ),
+        )
         assert cleanup_failures == 0, "Owned product and fixture cleanup did not complete"

@@ -1,0 +1,183 @@
+name: Diagnostic Windows authentication phases
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [codex/auth-login-phase-diagnostic-20261124]
+    paths:
+      - .github/workflows/windows-auth-login-phase-diagnostic.yml
+      - tests/integration/test_operator_product_runtime.py
+      - tests/unit/test_operator_acceptance_diagnostics.py
+
+permissions:
+  contents: read
+
+concurrency:
+  group: diagnostic-auth-phases-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  auth-phases:
+    name: DIAGNOSTIC ONLY - unchanged product authentication phases
+    runs-on: windows-2025
+    timeout-minutes: 15
+    env:
+      K5_AUTH_DIAGNOSTIC_PRODUCT_HEAD: 8a60ea86ecb4a95a3cb40ff732d2bd044d2a0fd9
+      K5_AUTH_DIAGNOSTIC_HARNESS_HEAD: ${{ github.sha }}
+    steps:
+      - name: Checkout separately identified diagnostic harness
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Use the original Sprint development Python contract
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+          architecture: x64
+          cache: pip
+      - name: Admit exact product, diagnostic sources, and immutable tool contracts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          @'
+          import hashlib,json,os,pathlib,platform,subprocess,sys
+          root=pathlib.Path.cwd()
+          product=os.environ['K5_AUTH_DIAGNOSTIC_PRODUCT_HEAD']
+          harness=os.environ['K5_AUTH_DIAGNOSTIC_HARNESS_HEAD']
+          def git(*args):
+              return subprocess.check_output(['git',*args])
+          def digest(raw):
+              return hashlib.sha256(raw.replace(b'\r\n',b'\n')).hexdigest()
+          assert platform.system()=='Windows' and platform.machine().lower() in {'amd64','x86_64'}
+          assert sys.version_info[:2]==(3,12)
+          assert git('rev-parse','HEAD').decode().strip()==harness
+          assert git('rev-parse',product+'^{tree}').decode().strip()=='a10997dc7bb43efdb780bbb2de775a7e8f2a24f4'
+          assert subprocess.run(['git','merge-base','--is-ancestor',product,harness]).returncode==0
+          expected={
+              'tests/integration/test_operator_product_runtime.py':'e537edf0cf95479898bae5c742919ab8b28447518d9a3204ca5160ab3cd97dd3',
+              'tests/unit/test_operator_acceptance_diagnostics.py':'0871d970a1961de27bd51182eeb73e463c3e694b267933898903f021621d3f06',
+          }
+          workflow='.github/workflows/windows-auth-login-phase-diagnostic.yml'
+          changed=set(git('diff','--name-only',product,harness).decode().splitlines())
+          assert changed==set(expected)|{workflow}
+          for name,wanted in expected.items():
+              assert digest((root/name).read_bytes())==digest(git('show',harness+':'+name))==wanted
+          names=[
+              'src/k5vision/user_admin_api.py','src/k5vision/services/user_registry.py',
+              'src/k5vision/auth_sessions.py','src/k5vision/operator_identity_security.py',
+              'src/k5vision/operator_audit_middleware.py','src/k5vision/operator_product.py',
+              'src/k5vision/operator_product_service.py','src/k5vision/main.py',
+              'src/k5vision/operator_motion_process.py','src/k5vision/identity_state.py',
+              'src/k5vision/data/mediamtx-donor-manifest.json',
+              'src/k5vision/data/mediamtx-donor-test-tools.json',
+              'src/k5vision/data/caddy-donor-manifest.json',
+              '.github/actions/provision-operator-tools/action.yml',
+              'scripts/verify_operator_beta_receipt.py','pyproject.toml',
+          ]
+          pins={}
+          for name in names:
+              raw=git('show',product+':'+name)
+              assert raw==git('show',harness+':'+name)
+              assert digest((root/name).read_bytes())==digest(raw)
+              pins[name]=digest(raw)
+          scope={
+              'schema_version':1,'diagnostic_only':True,'product_qualification':False,
+              'product_head':product,'product_tree':'a10997dc7bb43efdb780bbb2de775a7e8f2a24f4',
+              'harness_head':harness,'harness_tree':git('rev-parse','HEAD^{tree}').decode().strip(),
+              'harness_sources_sha256':{name:digest(git('show',harness+':'+name)) for name in sorted(changed)},
+              'unchanged_product_and_tool_source_sha256':pins,
+              'python_contract':'Original Sprint development Python3.12+[dev]; not embedded-runtime byte equality.',
+              'original_login_open_seconds':3,'failed_login_retried':False,
+              'scope':'One original assembled product journey, generated media, caller account; no SCM/installer/physical-camera qualification.',
+              'native_result':'pending',
+          }
+          pathlib.Path('diagnostic-auth-scope.json').write_text(json.dumps(scope,indent=2,sort_keys=True)+'\n')
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { throw 'Diagnostic source admission failed' }
+      - name: Install the unchanged Sprint product development dependencies
+        shell: pwsh
+        run: |
+          python -m pip install -e ".[dev]"
+          if ($LASTEXITCODE -ne 0) { throw 'Diagnostic development dependency installation failed' }
+      - name: Provision original immutable native development workers
+        uses: ./.github/actions/provision-operator-tools
+      - name: Require observer privacy, original-call, and rejection controls
+        shell: pwsh
+        run: |
+          python -m pytest tests/unit/test_operator_acceptance_diagnostics.py --no-cov -q --junitxml=diagnostic-auth-controls.xml
+          if ($LASTEXITCODE -ne 0) { throw 'Diagnostic observer controls failed' }
+      - name: Execute one original journey and preserve its actual result
+        timeout-minutes: 10
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python -m pytest tests/integration/test_operator_product_runtime.py::test_assembled_operator_product_login_live_recording_logout_and_restart --no-cov -s -o faulthandler_timeout=180 --junitxml=diagnostic-auth-product.xml
+          $journeyExit = $LASTEXITCODE
+          $env:K5_AUTH_DIAGNOSTIC_JOURNEY_EXIT = [string]$journeyExit
+          @'
+          import json,math,os,pathlib,runpy,subprocess,xml.etree.ElementTree as ET
+          path=pathlib.Path('diagnostic-auth-scope.json')
+          scope=json.loads(path.read_text())
+          report=pathlib.Path('diagnostic-auth-product.xml')
+          root=ET.parse(report).getroot()
+          cases=list(root.iter('testcase'))
+          assert len(cases)==1
+          assert cases[0].get('name')=='test_assembled_operator_product_login_live_recording_logout_and_restart'
+          properties=list(root.iter('property'))
+          assert properties and all(v.get('name','').startswith('diagnostic_') for v in properties)
+          traces=[v for v in properties if v.get('name')=='diagnostic_auth_phase_timing']
+          assert len(traces)==1
+          trace=json.loads(traces[0].get('value'))
+          assert set(trace)=={'diagnostic_only','product_qualification','original_login_open_seconds','failed_login_retried','generations'}
+          assert trace['diagnostic_only'] is True and trace['product_qualification'] is False
+          assert trace['original_login_open_seconds']==3 and trace['failed_login_retried'] is False
+          generations=trace['generations']
+          assert type(generations) is list and 1<=len(generations)<=2
+          stages={'executor','audit_started','audit_finished','password_verify','kdf','security_started','security_password','security_validate','factor_status','session_issue','session_resolve','client_open','application'}
+          edges={'queued','entered','returned','raised','headers','complete'}
+          for number,generation in enumerate(generations,1):
+              assert set(generation)=={'diagnostic_only','product_qualification','product_generation','restored','events','dropped'}
+              assert generation['diagnostic_only'] is True and generation['product_qualification'] is False
+              assert type(generation['product_generation']) is int and generation['product_generation']==number
+              assert generation['restored'] is True
+              assert type(generation['dropped']) is int and 0<=generation['dropped']<=999
+              assert type(generation['events']) is list and len(generation['events'])<=512
+              for event in generation['events']:
+                  assert set(event)=={'stage','edge','login_ordinal','work_item','elapsed_seconds','http_status'}
+                  assert event['stage'] in stages and event['edge'] in edges
+                  assert type(event['login_ordinal']) is int and event['login_ordinal'] in ({1,2} if number==1 else {3})
+                  assert type(event['work_item']) is int and 0<=event['work_item']<=512
+                  assert type(event['elapsed_seconds']) in {int,float} and math.isfinite(event['elapsed_seconds']) and 0<=event['elapsed_seconds']<=600
+                  assert type(event['http_status']) is int and (event['http_status']==0 or 100<=event['http_status']<=599)
+          rejected=False
+          verifier=runpy.run_path('scripts/verify_operator_beta_receipt.py')['verify']
+          try:
+              verifier('product',report)
+          except ValueError:
+              rejected=True
+          assert rejected
+          assert subprocess.run(['git','diff','--quiet','--','src','scripts','windows','.github/actions','pyproject.toml']).returncode==0
+          scope.update(
+              native_result='diagnostic_completed',journey_pytest_exit_code=int(os.environ['K5_AUTH_DIAGNOSTIC_JOURNEY_EXIT']),
+              observed_test_failures=len(root.findall('.//failure')),observed_test_errors=len(root.findall('.//error')),
+              observed_test_skips=len(root.findall('.//skipped')),normal_sprint_receipt_verifier_rejected=True,
+              all_properties_diagnostic_prefixed=True,phase_timing=trace,
+          )
+          assert scope['observed_test_skips']==0
+          path.write_text(json.dumps(scope,indent=2,sort_keys=True,allow_nan=False)+'\n')
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { throw 'Diagnostic phase evidence is incomplete or outside its finite scope' }
+          if ($journeyExit -ne 0) { throw 'Original diagnostic journey failed; its result and finite phases are retained' }
+      - name: Retain only separately labeled diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: diagnostic-only-auth-phases-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            diagnostic-auth-scope.json
+            diagnostic-auth-controls.xml
+            diagnostic-auth-product.xml
+          if-no-files-found: error
+          retention-days: 14
