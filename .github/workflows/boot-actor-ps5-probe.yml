@@ -1,0 +1,58 @@
+name: Diagnostic Windows PowerShell 5 boot actor helpers
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [codex/boot-actor-ps5-20261124]
+    paths:
+      - .github/workflows/boot-actor-ps5-probe.yml
+      - scripts/probe_boot_actor_ps5.ps1
+
+permissions:
+  contents: read
+
+concurrency:
+  group: boot-actor-ps5-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  original-helpers:
+    runs-on: windows-2025
+    timeout-minutes: 5
+    steps:
+      - name: Checkout exact unmodified production witness
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: a300b80755f46a9f0dafd24e09a39af08296fc99
+          persist-credentials: false
+      - name: Checkout separately identified controlled helper probe
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          path: probe-source
+          persist-credentials: false
+      - name: Admit canonical immutable Git blobs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          if((& git rev-parse HEAD).Trim() -cne 'a300b80755f46a9f0dafd24e09a39af08296fc99'){throw 'Source head differs'}
+          if((& git -C probe-source rev-parse HEAD).Trim() -cne '${{ github.sha }}'){throw 'Probe head differs'}
+          & (Join-Path $env:SYSTEMROOT 'System32/cmd.exe') /d /c 'git cat-file blob HEAD:scripts/windows_guest_witness.ps1 > source-bound.ps1'
+          if($LASTEXITCODE -ne 0 -or (Get-FileHash -LiteralPath source-bound.ps1 -Algorithm SHA256).Hash.ToLowerInvariant() -cne '52a7c3fd246993b85d21f3698b4f21ec7d05432855e93cd398e78b963164a0e5'){throw 'Source blob differs'}
+          & (Join-Path $env:SYSTEMROOT 'System32/cmd.exe') /d /c 'git -C probe-source cat-file blob HEAD:scripts/probe_boot_actor_ps5.ps1 > probe-bound.ps1'
+          if($LASTEXITCODE -ne 0){throw 'Probe blob unavailable'}
+      - name: Exercise exact helpers under native Windows PowerShell 5
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          if($PSVersionTable.PSVersion.Major -ne 5 -or $PSVersionTable.PSEdition -cne 'Desktop'){throw 'Native Windows PowerShell 5 required'}
+          & (Join-Path $env:WINDIR 'System32/WindowsPowerShell/v1.0/powershell.exe') -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ./probe-bound.ps1 -WitnessPath ./source-bound.ps1 -OutputPath ./boot-actor-ps5.json
+          if($LASTEXITCODE -ne 0){throw 'Controlled helper probe failed'}
+      - name: Retain finite controlled diagnostics only
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: diagnostic-only-boot-actor-ps5-${{ github.run_id }}
+          path: boot-actor-ps5.json
+          if-no-files-found: error
+          retention-days: 14
