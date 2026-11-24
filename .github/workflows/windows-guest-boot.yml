@@ -102,7 +102,7 @@ jobs:
               if (@($errors).Count) { throw 'Guest controller source did not parse' }
             }
           }
-          if ($sourceHashes['windows_guest_witness.ps1'] -ne 'a01e1fdbaf35d0483fa8134cb2a6082797b2e43421e3e9f6b5cf42ff39babf93') { throw 'Native guest witness Git blob differs' }
+          if ($sourceHashes['windows_guest_witness.ps1'] -ne '52a7c3fd246993b85d21f3698b4f21ec7d05432855e93cd398e78b963164a0e5') { throw 'Native guest witness Git blob differs' }
           if ($sourceHashes['windows_guest_bootstrap.cs'] -ne 'b8ef1a885d876d0a66833b3350221bd66794f972843e418815628278b9163909' -or
               $sourceHashes['windows_guest_bootstrap_controls.cs'] -ne '4757e92ab04d387d9d04f0572949c1224dbfa2f25222cb5680290577ec30c837') { throw 'Guest GUI bootstrap controls source differs' }
           if ($sourceHashes['windows_guest_boot_sequence_controls.ps1'] -ne '84204b182165214c3cf46558ff812c87892b6213a0529d7641a2ea3606cb48c0') { throw 'Native boot sequence controls source differs' }
