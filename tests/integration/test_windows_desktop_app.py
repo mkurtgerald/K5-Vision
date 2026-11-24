@@ -2467,7 +2467,10 @@ def _desktop_nvr_journey(
     publishers[1] = _publish_fixture(parent, ffmpeg, sources[1], helpers, color="blue")
     processes.append(publishers[1])
     browser_helpers._decoded_video(
-        page, f'#wall-panel [data-camera-id="{camera_ids[1]}"] video', "blue"
+        page,
+        f'#wall-panel [data-camera-id="{camera_ids[1]}"] video',
+        "blue",
+        diagnostic=diagnostic,
     )
     recovered = sizes()
     _wait(lambda: all_progress(recovered), "Installed camera recording recovery", process=app)

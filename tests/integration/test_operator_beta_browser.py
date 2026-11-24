@@ -619,41 +619,35 @@ def _decoded_video(page, selector, color, *, diagnostic=None):
 def _decoded_video_proof(page, selector, color, diagnostic):
     """Check a particular visible video, including independent camera-wall tiles."""
     __tracebackhide__ = True
-    page.wait_for_function(
-        """selector => {
+    sample = page.wait_for_function(
+        """({selector, color}) => {
           const video = document.querySelector(selector);
-          return video && video.getBoundingClientRect().width > 0 &&
+          const ready = video && video.getBoundingClientRect().width > 0 &&
             video.readyState >= 2 && !video.paused && video.videoWidth === 320 &&
-            video.videoHeight === 240 && video.currentTime > 0.15 &&
-            video.getVideoPlaybackQuality().totalVideoFrames >= 4;
-        }""",
-        arg=selector,
-        timeout=25_000,
-    )
-    diagnostic["video_phase"] = "pixels"
-    decoded = page.evaluate(
-        """selector => {
-          const video = document.querySelector(selector);
+            video.videoHeight === 240 && video.currentTime > 0.15;
+          if (!ready) return false;
+          const frames = video.getVideoPlaybackQuality().totalVideoFrames;
+          if (!(frames >= 4)) return false;
           const canvas = document.createElement('canvas');
           canvas.width = canvas.height = 1;
           const context = canvas.getContext('2d');
           context.drawImage(video, 0, 0, 1, 1);
-          return {
-            frames: video.getVideoPlaybackQuality().totalVideoFrames,
-            rgb: Array.from(context.getImageData(0, 0, 1, 1).data).slice(0, 3)
-          };
+          const rgb = Array.from(context.getImageData(0, 0, 1, 1).data).slice(0, 3);
+          const [red, green, blue] = rgb;
+          const isolated = color === 'red' ? red > 180 && green < 70 && blue < 70
+            : color === 'blue' ? blue > 180 && red < 70 && green < 70
+              : color === 'lime' ? green > 180 && red < 70 && blue < 70
+                : color === 'yellow' ? red > 180 && green > 180 && blue < 70 : false;
+          return isolated ? {frames, rgb} : false;
         }""",
-        selector,
+        arg={"selector": selector, "color": color},
+        timeout=25_000,
     )
+    try:
+        decoded = sample.json_value()
+    finally:
+        sample.dispose()
     diagnostic.update(video_decoded_frames=decoded["frames"], video_rgb=decoded["rgb"])
-    red, green, blue = decoded["rgb"]
-    isolated = {
-        "red": red > 180 and green < 70 and blue < 70,
-        "blue": blue > 180 and red < 70 and green < 70,
-        "lime": green > 180 and red < 70 and blue < 70,
-        "yellow": red > 180 and green > 180 and blue < 70,
-    }.get(color, False)
-    _require(isolated, "Decoded video did not match the selected generated camera")
     diagnostic["video_phase"] = "complete"
     return decoded["frames"]
 

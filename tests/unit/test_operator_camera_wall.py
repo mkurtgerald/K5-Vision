@@ -6,7 +6,9 @@ per-camera failures and teardown deterministically, without camera addresses.
 
 from __future__ import annotations
 
+import importlib.util
 import os
+import time
 from pathlib import Path
 
 import pytest
@@ -441,3 +443,144 @@ def test_unchanged_camera_poll_keeps_actual_fullscreen_tile_mounted(wall_page):
     }""")
     assert resized == {"fullscreen": True, "connected": True, "sameTile": True}
     assert page.evaluate("fixture.calls.filter(call => call.id==='camera-0').length") == 1
+
+
+# These three real-video controls run on the existing Windows ONVIF browser
+# lane. Linux needs explicit opt-in and a supplied browser executable.
+_REAL_DECODED_VIDEO_CONTROL = pytest.mark.skipif(
+    os.name != "nt"
+    and (
+        os.getenv("K5_DECODED_BROWSER_CONTROL") != "1"
+        or not os.getenv("K5_DECODED_CONTROL_BROWSER_PATH")
+    ),
+    reason="Linux decoded-video controls require explicit opt-in and browser executable",
+)
+
+
+def _decoded_proof_helpers():
+    path = Path(
+        os.environ.get(
+            "K5_DECODED_HELPER_SOURCE",
+            str(Path(__file__).parents[1] / "integration/test_operator_beta_browser.py"),
+        )
+    )
+    spec = importlib.util.spec_from_file_location("decoded_proof_control_helpers", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.fixture
+def decoded_proof_page():
+    playwright = pytest.importorskip("playwright.sync_api")
+    with playwright.sync_playwright() as factory:
+        executable = os.environ.get("K5_DECODED_CONTROL_BROWSER_PATH")
+        channel = os.getenv(
+            "K5_OPERATOR_BROWSER_CHANNEL", "msedge" if os.name == "nt" else "chromium"
+        )
+        options = {"headless": True}
+        if executable:
+            options["executable_path"] = executable
+        else:
+            options["channel"] = channel
+        if os.name != "nt":
+            options["args"] = ["--no-sandbox", "--disable-dev-shm-usage"]
+        browser = factory.chromium.launch(**options)
+        try:
+            page = browser.new_page(viewport={"width": 480, "height": 360})
+            page.set_content(
+                '<video id="probe" width="320" height="240" muted autoplay playsinline>'
+                '</video><canvas id="source" width="320" height="240"></canvas>'
+            )
+            yield page
+        finally:
+            browser.close()
+
+
+def _start_decoded_proof_video(page, color):
+    page.evaluate(
+        """async color => {
+          const canvas = document.querySelector('#source');
+          const context = canvas.getContext('2d');
+          const draw = () => {
+            context.fillStyle = color;
+            context.fillRect(0, 0, 320, 240);
+          };
+          draw();
+          window.controlDrawTimer = setInterval(draw, 25);
+          const video = document.querySelector('#probe');
+          video.srcObject = canvas.captureStream(30);
+          await video.play();
+        }""",
+        color,
+    )
+
+
+class _ResetDecodedVideoAfterReadiness:
+    """Reset the actual media element between the old helper's browser tasks."""
+
+    def __init__(self, page):
+        self.page = page
+        self.resets = 0
+        self.reset_state = None
+        self.later_evaluations = 0
+
+    def wait_for_function(self, *args, **kwargs):
+        proof = self.page.wait_for_function(*args, **kwargs)
+        self.resets += 1
+        self.reset_state = self.page.evaluate(
+            """() => {
+              const video = document.querySelector('#probe');
+              video.pause();
+              video.srcObject = null;
+              video.removeAttribute('src');
+              video.load();
+              return {ready: video.readyState, width: video.videoWidth, paused: video.paused};
+            }"""
+        )
+        return proof
+
+    def evaluate(self, *args, **kwargs):
+        self.later_evaluations += 1
+        return self.page.evaluate(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self.page, name)
+
+
+@_REAL_DECODED_VIDEO_CONTROL
+def test_decoded_proof_same_blue_reset_returns_atomic_sample(decoded_proof_page):
+    _start_decoded_proof_video(decoded_proof_page, "blue")
+    wrapped = _ResetDecodedVideoAfterReadiness(decoded_proof_page)
+    diagnostic = {}
+    frames = _decoded_proof_helpers()._decoded_video(
+        wrapped, "#probe", "blue", diagnostic=diagnostic
+    )
+    assert wrapped.resets == 1
+    assert wrapped.reset_state == {"ready": 0, "width": 0, "paused": True}
+    assert wrapped.later_evaluations == 0
+    assert frames >= 4 and diagnostic["video_decoded_frames"] == frames
+    red, green, blue = diagnostic["video_rgb"]
+    assert blue > 180 and red < 70 and green < 70
+    assert diagnostic["video_phase"] == "complete"
+
+
+@_REAL_DECODED_VIDEO_CONTROL
+def test_decoded_proof_permanent_wrong_color_keeps_bound(decoded_proof_page):
+    from playwright.sync_api import TimeoutError as BrowserTimeout
+
+    _start_decoded_proof_video(decoded_proof_page, "red")
+    started = time.monotonic()
+    with pytest.raises(BrowserTimeout):
+        _decoded_proof_helpers()._decoded_video(decoded_proof_page, "#probe", "blue", diagnostic={})
+    assert 24 <= time.monotonic() - started < 30
+
+
+@_REAL_DECODED_VIDEO_CONTROL
+def test_decoded_proof_never_ready_keeps_bound(decoded_proof_page):
+    from playwright.sync_api import TimeoutError as BrowserTimeout
+
+    started = time.monotonic()
+    with pytest.raises(BrowserTimeout):
+        _decoded_proof_helpers()._decoded_video(decoded_proof_page, "#probe", "blue", diagnostic={})
+    assert 24 <= time.monotonic() - started < 30
