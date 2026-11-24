@@ -1,0 +1,62 @@
+name: Diagnostic Windows person dependency command origin
+on:
+  workflow_dispatch:
+  push:
+    branches: [codex/person-command-origin-20261124]
+    paths: [.github/workflows/person-command-origin.yml, scripts/probe_person_command_origin.py]
+permissions:
+  contents: read
+concurrency:
+  group: person-command-origin-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  dependency-origin:
+    name: DIAGNOSTIC ONLY - native dependency caller and stock optional fallback
+    runs-on: windows-2025
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: '3.12.10'
+          architecture: x64
+      - name: Install exact hashed runtime dependencies without changing product
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          @'
+          import hashlib,pathlib,sysconfig
+          root=pathlib.Path.cwd()
+          raw=(root/'windows/desktop/runtime-requirements.txt').read_bytes().replace(b'\r\n',b'\n')
+          if hashlib.sha256(raw).hexdigest()!='9d9e94ccadbe016d051d1e84374a59e467695116e00434c087dd4580fb837837':
+              raise SystemExit('Exact runtime lock differs')
+          (pathlib.Path(sysconfig.get_paths()['purelib'])/'k5-person-origin.pth').write_text(str(root/'src')+'\n')
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { throw 'Runtime source admission failed' }
+          python -m pip install --require-hashes --only-binary=:all: --no-deps -r windows/desktop/runtime-requirements.txt
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned runtime dependencies failed' }
+      - name: Run finite original query and explicitly controlled fallback comparisons
+        timeout-minutes: 4
+        shell: pwsh
+        run: |
+          python scripts/probe_person_command_origin.py
+          if ($LASTEXITCODE -ne 0) { throw 'Diagnostic dependency experiment did not complete' }
+          $receipt = Get-Content person-command-origin.json -Raw | ConvertFrom-Json
+          if ($receipt.diagnostic_only -ne $true -or $receipt.product_qualification -ne $false -or
+              $receipt.completed -ne $true -or $receipt.cleanup_complete -ne $true -or
+              $receipt.comparison_supported -ne $true -or
+              $receipt.production_head -cne '3f798445c33d34a433af3394e43064ffefb1d211' -or
+              $receipt.harness_head -cne $env:GITHUB_SHA -or @($receipt.cases).Count -ne 3) {
+            throw 'Diagnostic receipt scope differs'
+          }
+      - name: Retain finite counts and fixed caller labels only
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: diagnostic-person-command-origin-${{ github.run_id }}-${{ github.run_attempt }}
+          path: person-command-origin.json
+          if-no-files-found: error
+          retention-days: 14
