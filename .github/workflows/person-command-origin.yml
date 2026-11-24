@@ -2,7 +2,7 @@ name: Diagnostic Windows person dependency command origin
 on:
   workflow_dispatch:
   push:
-    branches: [codex/person-command-origin-20261124]
+    branches: [codex/person-telemetry-policy-native-20261124]
     paths: [.github/workflows/person-command-origin.yml, scripts/probe_person_command_origin.py]
 permissions:
   contents: read
@@ -49,7 +49,7 @@ jobs:
               $receipt.completed -ne $true -or $receipt.cleanup_complete -ne $true -or
               $receipt.comparison_supported -ne $true -or
               $receipt.production_head -cne '3f798445c33d34a433af3394e43064ffefb1d211' -or
-              $receipt.harness_head -cne $env:GITHUB_SHA -or @($receipt.cases).Count -ne 3) {
+              $receipt.harness_head -cne $env:GITHUB_SHA -or @($receipt.cases).Count -ne 4) {
             throw 'Diagnostic receipt scope differs'
           }
       - name: Retain finite counts and fixed caller labels only

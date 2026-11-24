@@ -6,6 +6,7 @@ import argparse
 import ctypes
 import hashlib
 import importlib.metadata
+import importlib.util
 import json
 import os
 import platform
@@ -13,11 +14,27 @@ import re
 import subprocess
 import sys
 from pathlib import Path, PureWindowsPath
+from types import ModuleType
 
 ROOT = Path(__file__).resolve().parents[1]
 BASE = "3f798445c33d34a433af3394e43064ffefb1d211"
 OUTPUT = ROOT / "person-command-origin.json"
-MODES = ("native_admin", "controlled_wmi_failure", "controlled_optional_telemetry_absent")
+MODES = (
+    "native_admin",
+    "controlled_wmi_failure",
+    "controlled_optional_telemetry_absent",
+    "controlled_worker_policy",
+)
+POLICY_SHA256 = "226d115242aae6a38b49e86fac7758293822781b518a0eb2c2939f01193763ac"
+POLICY_CHECKS = {
+    "real_module",
+    "real_file_and_spec",
+    "real_package_path",
+    "version_metadata",
+    "backend_available",
+    "official_class_selected",
+    "idempotent_after_core",
+}
 PINS = {
     key: value
     for key, value in (
@@ -85,7 +102,7 @@ def admit_case(value, mode):
         "ver_caller_labels",
         "completed",
     }
-    optional = {"generated_inference", "stock_telemetry_fallback", "error_kind"}
+    optional = {"generated_inference", "stock_telemetry_fallback", "error_kind", "policy_checks"}
     labels = {*CALLERS.values(), "other"}
     if type(value) is not dict or not required <= set(value) or set(value) - required - optional:
         raise ValueError("Diagnostic fields refused")
@@ -106,13 +123,21 @@ def admit_case(value, mode):
     ):
         raise ValueError("Diagnostic label refused")
     if value["completed"]:
+        policy_fields = {"policy_checks"} if mode == "controlled_worker_policy" else set()
         if (
-            set(value) != required | {"generated_inference", "stock_telemetry_fallback"}
+            set(value)
+            != required | {"generated_inference", "stock_telemetry_fallback"} | policy_fields
             or type(value["stock_telemetry_fallback"]) is not bool
             or value["generated_inference"] != [0.0, 2.0, 0.0, 4.0]
             or any(type(number) is not float for number in value["generated_inference"])
         ):
             raise ValueError("Diagnostic inference refused")
+        if policy_fields and (
+            type(value["policy_checks"]) is not dict
+            or set(value["policy_checks"]) != POLICY_CHECKS
+            or any(type(v) is not bool for v in value["policy_checks"].values())
+        ):
+            raise ValueError("Diagnostic policy proof refused")
     elif set(value) != required | {"error_kind"} or value["error_kind"] not in {
         "RuntimeError",
         "ValueError",
@@ -174,6 +199,12 @@ def child(mode):
         if mode == "controlled_optional_telemetry_absent":
             # TEST ONLY: choose the donor's existing ImportError fallback.
             sys.modules["openvino_telemetry"] = None
+        if mode == "controlled_worker_policy":
+            from k5vision.operator_person_telemetry import configure_local_person_telemetry
+
+            configure_local_person_telemetry()
+            telemetry = sys.modules["openvino_telemetry"]
+            original_spec, original_path = telemetry.__spec__, tuple(telemetry.__path__)
         from k5vision.operator_analytics_person import _cap_windows_native_cpu_isa
 
         _cap_windows_native_cpu_isa()
@@ -195,7 +226,47 @@ def child(mode):
             generated_inference=actual,
             stock_telemetry_fallback="openvino.tools.ovc.telemetry_stub" in sys.modules,
         )
+        if mode == "controlled_worker_policy":
+            configure_local_person_telemetry()
+            telemetry_distribution = importlib.metadata.distribution("openvino-telemetry")
+            expected_init = Path(
+                telemetry_distribution.locate_file("openvino_telemetry/__init__.py")
+            )
+            facts["policy_checks"] = {
+                "real_module": isinstance(telemetry, ModuleType)
+                and sys.modules["openvino_telemetry"] is telemetry,
+                "real_file_and_spec": telemetry.__spec__ is original_spec
+                and importlib.util.find_spec("openvino_telemetry") is original_spec
+                and Path(telemetry.__file__).resolve() == expected_init.resolve(),
+                "real_package_path": tuple(telemetry.__path__) == original_path
+                and Path(original_path[0]).resolve() == expected_init.parent.resolve(),
+                "version_metadata": telemetry.__version__
+                == telemetry_distribution.version
+                == "2025.2.0",
+                "backend_available": importlib.util.find_spec(
+                    "openvino_telemetry.backend.backend_ga4"
+                )
+                is not None,
+                "official_class_selected": telemetry.Telemetry.__module__
+                == "_k5_local_person_usage_policy"
+                and all(
+                    callable(getattr(telemetry.Telemetry, name, None))
+                    for name in [
+                        "send_event",
+                        "send_error",
+                        "start_session",
+                        "end_session",
+                        "force_shutdown",
+                        "send_stack_trace",
+                    ]
+                ),
+                "idempotent_after_core": telemetry.Telemetry.__module__
+                == "_k5_local_person_usage_policy",
+            }
     except BaseException as error:
+        facts["completed"] = False
+        for name in ("generated_inference", "stock_telemetry_fallback", "policy_checks"):
+            facts.pop(name, None)
         facts["error_kind"] = (
             type(error).__name__
             if type(error).__name__
@@ -249,10 +320,13 @@ def main():
             != "4921cb3713434d104b376bf83605db656d72ec00de38ae2a647522ca26552382"
         ):
             raise ValueError("Pinned product person source differs")
+        if digest(ROOT / "src/k5vision/operator_person_telemetry.py") != POLICY_SHA256:
+            raise ValueError("Exact candidate helper differs")
         result.update(
             caller_is_admin=True,
             versions=versions,
             donor_source_sha256=PINS,
+            candidate_policy_sha256=POLICY_SHA256,
             python_platform_source_sha256=digest(Path(platform.__file__)),
             script_sha256=digest(Path(__file__)),
             workflow_sha256=digest(ROOT / ".github/workflows/person-command-origin.yml"),
@@ -296,7 +370,7 @@ def main():
                 if not clean:
                     result["cleanup_complete"] = False
                     raise RuntimeError("Diagnostic child cleanup incomplete")
-        native, forced, absent = result["cases"]
+        native, forced, absent, policy = result["cases"]
         result["comparison"] = {
             "forced_wmi_fallback_exercised": forced["wmi_queries"] > 0
             and forced["known_ver_commands"] > 0,
@@ -309,7 +383,12 @@ def main():
             ),
             "same_real_inference": native["generated_inference"]
             == forced["generated_inference"]
-            == absent["generated_inference"],
+            == absent["generated_inference"]
+            == policy["generated_inference"],
+            "faithful_worker_policy": all(policy["policy_checks"].values())
+            and policy["known_ver_commands"] == 0
+            and policy["wmi_queries"] == 0
+            and sum(policy["system_callers"].values()) == 0,
         }
         result["comparison_supported"] = all(result["comparison"].values())
         result["completed"] = True
