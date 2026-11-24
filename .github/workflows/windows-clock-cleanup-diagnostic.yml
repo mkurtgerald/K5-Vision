@@ -1,0 +1,221 @@
+name: Exact 699 clock cleanup diagnostic only
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [codex/clock-cleanup-replay-20261124]
+    paths:
+      - .github/workflows/windows-clock-cleanup-diagnostic.yml
+      - tests/integration/test_windows_clock_cleanup_diagnostic.py
+      - tests/integration/test_windows_desktop_app.py
+      - tests/unit/test_windows_clock_cleanup_replay.py
+      - tests/unit/test_windows_desktop_analytics_diagnostic.py
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: clock-cleanup-diagnostic-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  exact-699-clock-cleanup:
+    name: DIAGNOSTIC ONLY - exact 699 clock cleanup
+    runs-on: windows-2025
+    timeout-minutes: 15
+    env:
+      K5_DESKTOP_HEAD_SHA: 6993360f0682e41589005b0b97aa391398baa163
+      K5_DESKTOP_SETUP_SHA256: c64a9c50c328acd520491d97572fd2ea247fb9faacaf147164466a40769acbcb
+      K5_OPERATOR_BROWSER_ACCEPTANCE: "1"
+      K5_OPERATOR_BROWSER_CHANNEL: msedge
+      K5_VM_CLOCK_ACCEPTANCE: "1"
+      K5_VM_CLOCK_SETUP_ARTIFACT_ID: "14937595093"
+      K5_VM_CLOCK_PRIMARY_ARTIFACT_ID: "14936174289"
+      K5_VM_CLOCK_PRIMARY_RUN_ID: "45425429979"
+      K5_VM_CLOCK_PRIMARY_RUN_ATTEMPT: "1"
+      K5_CLOCK_CLEANUP_DIAGNOSTIC_ONLY: "1"
+      K5_CLOCK_CLEANUP_DIAGNOSTIC_HARNESS_SHA: ${{ github.sha }}
+    steps:
+      - name: Checkout unchanged original product and clock journey
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: 6993360f0682e41589005b0b97aa391398baa163
+          persist-credentials: false
+      - name: Checkout separately identified diagnostic harness
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          path: diagnostic-source
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Admit exact successful GUI producer and immutable original artifacts
+        shell: pwsh
+        env:
+          GH_READ_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted' -or $env:RUNNER_OS -ne 'Windows') {
+            throw 'Clock diagnostic requires a disposable hosted Windows VM'
+          }
+          $headers = @{ Authorization="Bearer $env:GH_READ_TOKEN"; Accept='application/vnd.github+json'; 'X-GitHub-Api-Version'='2022-11-28' }
+          $api = "https://api.github.com/repos/$env:GITHUB_REPOSITORY/actions"
+          $attempt = Invoke-RestMethod -Uri "$api/runs/45425429979/attempts/1" -Headers $headers -TimeoutSec 30
+          $jobs = Invoke-RestMethod -Uri "$api/runs/45425429979/attempts/1/jobs?per_page=100" -Headers $headers -TimeoutSec 30
+          $producer = @($jobs.jobs | Where-Object { $_.id -eq 138555995448 })
+          if ($attempt.id -ne 45425429979 -or $attempt.run_attempt -ne 1 -or $attempt.head_sha -ne $env:K5_DESKTOP_HEAD_SHA -or
+              $producer.Count -ne 1 -or $producer[0].status -ne 'completed' -or $producer[0].conclusion -ne 'success') {
+            throw 'Original GUI producer identity mismatch'
+          }
+          $artifacts = @(
+            @{ Id=14937595093; Name='k5-vision-windows-setup-6993360f0682e41589005b0b97aa391398baa163'; Bytes=285171137; Digest='sha256:76dda6f6c927dbc9af3ba66cbf55010566a8496a693b1c79d6c7f147125c1a66' },
+            @{ Id=14936174289; Name='desktop-windows-witness-45425429979'; Bytes=8171; Digest='sha256:7b077f9ced67e1d6deb47d3f3483d2ede724249f30166c4d046e199ff0542bf5' }
+          )
+          foreach ($expected in $artifacts) {
+            $actual = Invoke-RestMethod -Uri "$api/artifacts/$($expected.Id)" -Headers $headers -TimeoutSec 30
+            if ($actual.id -ne $expected.Id -or $actual.name -ne $expected.Name -or $actual.expired -ne $false -or
+                $actual.size_in_bytes -ne $expected.Bytes -or $actual.digest -ne $expected.Digest -or
+                $actual.workflow_run.id -ne 45425429979 -or $actual.workflow_run.head_sha -ne $env:K5_DESKTOP_HEAD_SHA) {
+              throw 'Original diagnostic input artifact identity mismatch'
+            }
+          }
+      - name: Download exact GUI-qualified original installer by artifact ID
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          artifact-ids: 14937595093
+          github-token: ${{ github.token }}
+          run-id: 45425429979
+          path: vm-clock-input
+          merge-multiple: true
+      - name: Download exact original raw GUI witness by artifact ID
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          artifact-ids: 14936174289
+          github-token: ${{ github.token }}
+          run-id: 45425429979
+          path: vm-clock-primary
+          merge-multiple: true
+      - name: Set up original development Python for the disposable controller
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install original acceptance dependencies before changing guest time
+        shell: pwsh
+        run: |
+          python -m pip install -e ".[dev]" "playwright==1.58.0"
+          if ($LASTEXITCODE -ne 0) { throw 'Clock diagnostic dependency installation failed' }
+      - name: Re-admit original bytes and strict primary witness before overlay
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pins = @(
+            @{ Path='vm-clock-input/K5VisionSetup.exe'; Sha='c64a9c50c328acd520491d97572fd2ea247fb9faacaf147164466a40769acbcb'; Bytes=286589280 },
+            @{ Path='vm-clock-input/desktop-package.json'; Sha='717a8dd4c4c2ea0f5be4645901ec10dee7eba28403485f70f244bd0359005532'; Bytes=1688 },
+            @{ Path='vm-clock-input/payload-manifest.json'; Sha='0e7be93d8ec8d2902f970beef723d87ca70c55c6cafd422021894b80e5a8a70a'; Bytes=605621 },
+            @{ Path='vm-clock-primary/desktop-windows.xml'; Sha='c2e4782289e35a6375aba9481e17545c6612ce679bb930123c66a0e9b32443d3'; Bytes=34865 },
+            @{ Path='vm-clock-primary/desktop-windows-receipt.json'; Sha='d6e3bde7811b08c7cff707c3a1c91ecc92c9766beb5aee969889d11ff4fc7425'; Bytes=8649 },
+            @{ Path='vm-clock-input/desktop-windows-receipt.json'; Sha='d6e3bde7811b08c7cff707c3a1c91ecc92c9766beb5aee969889d11ff4fc7425'; Bytes=8649 }
+          )
+          foreach ($pin in $pins) {
+            $file = Get-Item -LiteralPath $pin.Path
+            if ($file.Length -ne $pin.Bytes -or (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant() -ne $pin.Sha) {
+              throw 'Original clock input byte identity mismatch'
+            }
+          }
+          python scripts/verify_desktop_receipt.py vm-clock-primary/desktop-windows.xml vm-clock-primary-reverified.json
+          if ($LASTEXITCODE -ne 0) { throw 'Unchanged primary verifier rejected original GUI evidence' }
+          if ((Get-FileHash -LiteralPath vm-clock-primary-reverified.json -Algorithm SHA256).Hash.ToLowerInvariant() -ne 'd6e3bde7811b08c7cff707c3a1c91ecc92c9766beb5aee969889d11ff4fc7425') {
+            throw 'Reverified original primary receipt identity mismatch'
+          }
+          "K5_DESKTOP_SETUP=$((Resolve-Path -LiteralPath vm-clock-input/K5VisionSetup.exe).Path)" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+          "K5_VM_CLOCK_PRIMARY_XML=$((Resolve-Path -LiteralPath vm-clock-primary/desktop-windows.xml).Path)" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+          "K5_VM_CLOCK_PRIMARY_RECEIPT=$((Resolve-Path -LiteralPath vm-clock-primary/desktop-windows-receipt.json).Path)" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+      - name: Overlay only the admitted helper and add the separate diagnostic wrapper
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $productHead = (& git rev-parse HEAD).Trim()
+          $harnessHead = (& git -C diagnostic-source rev-parse HEAD).Trim()
+          $expectedChanged = @(
+            '.github/workflows/windows-clock-cleanup-diagnostic.yml',
+            'tests/integration/test_windows_clock_cleanup_diagnostic.py',
+            'tests/integration/test_windows_desktop_app.py',
+            'tests/unit/test_windows_clock_cleanup_replay.py',
+            'tests/unit/test_windows_desktop_analytics_diagnostic.py'
+          ) | Sort-Object
+          $changed = @(& git -C diagnostic-source diff --name-only $env:K5_DESKTOP_HEAD_SHA HEAD) | Sort-Object
+          if ($productHead -ne $env:K5_DESKTOP_HEAD_SHA -or $harnessHead -ne $env:K5_CLOCK_CLEANUP_DIAGNOSTIC_HARNESS_SHA -or
+              $harnessHead -eq $productHead -or @(Compare-Object $expectedChanged $changed).Count -ne 0) {
+            throw 'Separate diagnostic harness source scope mismatch'
+          }
+          $overlays = @(
+            @{ Path='tests/integration/test_windows_desktop_app.py'; Sha='fed6eb0105ef9989586d51a67dbfb75b2f45903a2df8012346f65ac15f1beacb' },
+            @{ Path='tests/integration/test_windows_clock_cleanup_diagnostic.py'; Sha='babe0591650262bfe3a803bfb5081b74e8cbcfe25084900375db6ac718dbfb8f' }
+          )
+          $index = 0
+          foreach ($overlay in $overlays) {
+            $admitted = 'clock-cleanup-admitted-' + $index + '.py'
+            $command = 'git -C diagnostic-source cat-file blob HEAD:' + $overlay.Path + ' > ' + $admitted
+            & (Join-Path $env:SYSTEMROOT 'System32/cmd.exe') /d /c $command
+            if ($LASTEXITCODE -ne 0 -or (Get-FileHash -LiteralPath $admitted -Algorithm SHA256).Hash.ToLowerInvariant() -ne $overlay.Sha) {
+              throw 'Diagnostic-only helper or wrapper Git blob identity mismatch'
+            }
+            Copy-Item -LiteralPath $admitted -Destination $overlay.Path -Force
+            $index++
+          }
+          @{ schema_version=1; diagnostic_only=$true; normal_qualification=$false;
+             product_head=$productHead; harness_head=$harnessHead; source_run_id=45425429979; source_run_attempt=1;
+             producer_job_id=138555995448; setup_artifact_id=14937595093; primary_artifact_id=14936174289;
+             installer_sha256=$env:K5_DESKTOP_SETUP_SHA256; overlay_files=$overlays } |
+            ConvertTo-Json -Depth 5 | Set-Content -LiteralPath clock-cleanup-replay-provenance.json -Encoding utf8
+      - name: Prepare only the disposable CI user's default browser
+        uses: ./.github/actions/prepare-windows-browser
+      - name: Provision original pinned generated-media tools
+        uses: ./.github/actions/provision-operator-tools
+      - name: Provision original admitted public person fixture
+        shell: pwsh
+        run: |
+          python scripts/provision_operator_person_acceptance.py
+          if ($LASTEXITCODE -ne 0) { throw 'Original analytics fixture admission failed' }
+      - name: Check diagnostic privacy, normal refusal and unchanged clock guard
+        shell: pwsh
+        env:
+          K5_VM_CLOCK_ACCEPTANCE: "0"
+        run: |
+          python -m pytest diagnostic-source/tests/unit/test_windows_clock_cleanup_replay.py diagnostic-source/tests/unit/test_windows_desktop_analytics_diagnostic.py tests/unit/test_windows_vm_clock.py tests/unit/test_windows_vm_clock_receipt.py tests/unit/test_windows_vm_clock_scoped_receipt.py -o addopts= --no-cov --tb=short
+          if ($LASTEXITCODE -ne 0) { throw 'Diagnostic-only source or normal-verifier refusal preflight failed' }
+      - name: Replay unchanged original clock criteria with diagnostic-only properties
+        timeout-minutes: 10
+        shell: pwsh
+        run: |
+          python -m pytest tests/integration/test_windows_clock_cleanup_diagnostic.py -o addopts= --no-cov -s --tb=short -o faulthandler_timeout=400 --junitxml=clock-cleanup-diagnostic.xml
+          $testResult = $LASTEXITCODE
+          [xml]$report = Get-Content -LiteralPath clock-cleanup-diagnostic.xml -Raw
+          $properties = @($report.SelectNodes('//property'))
+          $bindings = @($report.SelectNodes('//property[@name="diagnostic_only_clock_cleanup_binding"]'))
+          if (@($properties | Where-Object { $_.name -notlike 'diagnostic_only_clock_cleanup_*' }).Count -ne 0 -or $bindings.Count -ne 1) {
+            throw 'Diagnostic-only replay emitted an invalid property namespace'
+          }
+          $binding = $bindings[0].value | ConvertFrom-Json
+          if ($binding.diagnostic_only -ne $true -or $binding.normal_qualification -ne $false -or
+              $binding.product_head -ne $env:K5_DESKTOP_HEAD_SHA -or $binding.harness_head -ne $env:K5_CLOCK_CLEANUP_DIAGNOSTIC_HARNESS_SHA -or
+              $binding.installer_sha256 -ne $env:K5_DESKTOP_SETUP_SHA256 -or $binding.helper_sha256 -ne 'fed6eb0105ef9989586d51a67dbfb75b2f45903a2df8012346f65ac15f1beacb') {
+            throw 'Diagnostic-only replay binding mismatch'
+          }
+          python scripts/verify_windows_vm_clock_receipt.py clock-cleanup-diagnostic.xml forbidden-normal-receipt.json --scope vm-clock-dedicated --expected-head $env:K5_DESKTOP_HEAD_SHA --installer-sha256 $env:K5_DESKTOP_SETUP_SHA256 --primary-report $env:K5_VM_CLOCK_PRIMARY_XML --primary-receipt $env:K5_VM_CLOCK_PRIMARY_RECEIPT --package vm-clock-input/desktop-package.json --expected-run-id 45425429979 --expected-run-attempt 1 --expected-primary-artifact-id 14936174289 --expected-setup-artifact-id 14937595093
+          if ($LASTEXITCODE -eq 0 -or (Test-Path -LiteralPath forbidden-normal-receipt.json)) {
+            throw 'Normal verifier unexpectedly admitted diagnostic-only replay'
+          }
+          if ($testResult -ne 0) { throw 'Diagnostic-only replay reproduced an original failing criterion' }
+          exit 0
+      - name: Retain only diagnostic observations without promotion
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: diagnostic-only-699-clock-cleanup-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            clock-cleanup-diagnostic.xml
+            clock-cleanup-replay-provenance.json
+          if-no-files-found: warn
+          retention-days: 14
