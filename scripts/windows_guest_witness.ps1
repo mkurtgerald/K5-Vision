@@ -239,8 +239,8 @@ function Get-LogonDiagnosticSidRole([string]$Value) {
     if($null -eq $Value -or $Value.Length -gt 184){return 'unknown'}
     $parts=$Value.Split('-')
     if($parts.Count -lt 4 -or $parts.Count -gt 18 -or $parts[0] -cne 'S' -or $parts[1] -cne '1'){return 'unknown'}
-    [ulong]$authority=0
-    if($parts[2] -cnotmatch '^(0|[1-9][0-9]{0,14})$' -or -not [ulong]::TryParse($parts[2],[Globalization.NumberStyles]::None,[Globalization.CultureInfo]::InvariantCulture,[ref]$authority) -or $authority -gt 281474976710655){return 'unknown'}
+    [uint64]$authority=0
+    if($parts[2] -cnotmatch '^(0|[1-9][0-9]{0,14})$' -or -not [uint64]::TryParse($parts[2],[Globalization.NumberStyles]::None,[Globalization.CultureInfo]::InvariantCulture,[ref]$authority) -or $authority -gt 281474976710655){return 'unknown'}
     for($i=3;$i -lt $parts.Count;$i++){
         [uint32]$rid=0
         if($parts[$i] -cnotmatch '^(0|[1-9][0-9]{0,9})$' -or -not [uint32]::TryParse($parts[$i],[Globalization.NumberStyles]::None,[Globalization.CultureInfo]::InvariantCulture,[ref]$rid)){return 'unknown'}
