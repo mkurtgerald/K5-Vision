@@ -704,6 +704,107 @@ def test_native_failure_frames_preserve_only_last_four_exact_public_locations(de
     assert private not in json.dumps(frames) and str(source_root) not in json.dumps(frames)
 
 
+@pytest.mark.parametrize(
+    ("failure", "expected_functions"),
+    [
+        ("button", ["_stop_app", "click"]),
+        ("message", ["_stop_app", "click", "message"]),
+        ("gui_exit", ["_stop_app"]),
+        ("service_stop", ["_stop_app", "_service_control"]),
+    ],
+)
+def test_native_clock_cleanup_failure_keeps_the_actual_assertion_boundary_only(
+    desktop, monkeypatch, failure, expected_functions
+):
+    source_root = Path(desktop.__file__).resolve().parents[2]
+    private = "PRIVATE-USER-PATH-rtsp://account:password@camera.invalid/987654321"
+    api = desktop._Windows.__new__(desktop._Windows)
+    api.api = SimpleNamespace(
+        IsWindowVisible=lambda _window: True,
+        IsWindowEnabled=lambda _window: True,
+        SendMessageTimeoutW=lambda *_arguments: failure != "message",
+    )
+    api.control = lambda _form, _identifier: 0 if failure == "button" else 123
+    process = SimpleNamespace(wait=lambda *, timeout: 17 if failure == "gui_exit" else 0)
+    cohort = SimpleNamespace(
+        service=SimpleNamespace(installed=Path(private)), service_stopped=False
+    )
+    calls = []
+
+    def controller(*arguments, **options):
+        calls.append("controller")
+        return SimpleNamespace(returncode=7)
+
+    def drain(*arguments, **options):
+        pytest.fail("The failing cleanup boundary must not reach process draining")
+
+    monkeypatch.setattr(desktop.subprocess, "run", controller)
+    monkeypatch.setattr(desktop, "_wait_owned_cleanup", drain)
+    namespace = {
+        "secret": private,
+        "stop": lambda: desktop._stop_app(process, 456, api, cohort),
+    }
+    exec(
+        compile(
+            "def test_native_windows_vm_clock_qualification():\n"
+            "    private_local = secret\n"
+            "    stop()\n",
+            str(source_root / "tests/integration/test_windows_vm_clock_qualification.py"),
+            "exec",
+        ),
+        namespace,
+    )
+    with pytest.raises(pytest.fail.Exception) as raised:
+        namespace["test_native_windows_vm_clock_qualification"]()
+    error = raised.value
+    error.private = private
+    error.add_note(private)
+    error.args = (*error.args, private)
+    frames = desktop._native_failure_frames(error)
+    assert frames[0] == {
+        "file": "clock",
+        "function": "test_native_windows_vm_clock_qualification",
+        "line": 3,
+    }
+    assert [frame["function"] for frame in frames[1:]] == expected_functions
+    assert all(frame["file"] == "desktop" for frame in frames[1:])
+    assert all(set(frame) == {"file", "function", "line"} for frame in frames)
+    assert len(frames) <= 4
+    assert calls == (["controller"] if failure == "service_stop" else [])
+    serialized = json.dumps(frames)
+    assert private not in serialized and str(source_root) not in serialized
+    assert "987654321" not in serialized
+
+
+def test_native_clock_failure_frame_caps_source_line_without_reading_exception_text(desktop):
+    source_root = Path(desktop.__file__).resolve().parents[2]
+
+    class PrivateError(Exception):
+        def __str__(self):
+            pytest.fail("Failure frame diagnostics must not read exception text")
+
+    error = PrivateError("PRIVATE-EXCEPTION-MESSAGE")
+    namespace = {"error": error}
+    exec(
+        compile(
+            "\n" * 10001 + "def test_native_windows_vm_clock_qualification():\n    raise error\n",
+            str(source_root / "tests/integration/test_windows_vm_clock_qualification.py"),
+            "exec",
+        ),
+        namespace,
+    )
+    with pytest.raises(PrivateError) as raised:
+        namespace["test_native_windows_vm_clock_qualification"]()
+    assert raised.value is error
+    assert desktop._native_failure_frames(error) == [
+        {
+            "file": "clock",
+            "function": "test_native_windows_vm_clock_qualification",
+            "line": 10000,
+        }
+    ]
+
+
 @pytest.mark.parametrize("known_path", [False, True])
 def test_native_failure_frames_refuse_unknown_path_or_function(desktop, known_path):
     source_root = Path(desktop.__file__).resolve().parents[2]
@@ -715,6 +816,38 @@ def test_native_failure_frames_refuse_unknown_path_or_function(desktop, known_pa
     exec(
         compile(
             f"def {function}():\n    raise RuntimeError('private-value')\n", str(source), "exec"
+        ),
+        namespace,
+    )
+    with pytest.raises(RuntimeError) as raised:
+        namespace[function]()
+    assert desktop._native_failure_frames(raised.value) == []
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "function"),
+    [
+        (
+            "private/test_windows_vm_clock_qualification.py",
+            "test_native_windows_vm_clock_qualification",
+        ),
+        ("tests/integration/test_windows_vm_clock_qualification.py", "_stop_app"),
+        (
+            "tests/integration/test_windows_desktop_app.py",
+            "test_native_windows_vm_clock_qualification",
+        ),
+    ],
+)
+def test_native_clock_failure_frames_refuse_same_basename_or_wrong_function(
+    desktop, relative_path, function
+):
+    source_root = Path(desktop.__file__).resolve().parents[2]
+    namespace = {}
+    exec(
+        compile(
+            f"def {function}():\n    raise RuntimeError('PRIVATE-MESSAGE')\n",
+            str(source_root / relative_path),
+            "exec",
         ),
         namespace,
     )

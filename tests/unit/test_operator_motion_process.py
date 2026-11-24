@@ -203,7 +203,7 @@ def test_live_decoder_policy_is_child_only_and_overrides_inherited_options(
     monkeypatch.setenv("K5_MOTION_TEST_ENV", "preserved-test-value")
     worker.instance.sample(policy())
     options = worker.args[0][1]
-    assert options["env"][key] == "rtsp_transport;tcp|fflags;nobuffer"
+    assert options["env"][key] == "rtsp_transport;tcp|fflags;nobuffer|analyzeduration;500000"
     assert options["env"]["K5_MOTION_TEST_ENV"] == "preserved-test-value"
     assert os.environ.get(key) == inherited
 

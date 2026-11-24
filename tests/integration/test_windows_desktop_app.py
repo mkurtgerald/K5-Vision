@@ -3356,7 +3356,15 @@ def _native_failure_frames(error):
                 "_closed_hashes",
                 "_recorded_segment_frames",
                 "_desktop_nvr_journey",
+                "_stop_app",
+                "_service_control",
+                "click",
+                "message",
             },
+        ),
+        (source_root / "tests/integration/test_windows_vm_clock_qualification.py").resolve(): (
+            "clock",
+            {"test_native_windows_vm_clock_qualification"},
         ),
         (source_root / "tests/integration/test_operator_beta_browser.py").resolve(): (
             "browser",

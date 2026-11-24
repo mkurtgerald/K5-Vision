@@ -383,10 +383,13 @@ class LiveMotionWorker:
         try:
             environment = None
             if child_mode == "--child":
-                # Pin only the live decoder's transport/buffering policy. The
-                # parent and image-only mask worker keep their environment.
+                # Bound stream analysis to 500 ms below the existing 1500 ms
+                # open deadline. This preserved fresh frames in Windows restart
+                # tests. Parent/mask workers keep their environment.
                 environment = os.environ.copy()
-                environment["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|fflags;nobuffer"
+                environment["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+                    "rtsp_transport;tcp|fflags;nobuffer|analyzeduration;500000"
+                )
             process = subprocess.Popen(
                 [sys.executable, "-I", "-B", "-m", "k5vision.operator_motion_process", child_mode],
                 stdin=subprocess.PIPE,
