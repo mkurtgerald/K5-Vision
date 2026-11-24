@@ -581,6 +581,22 @@ function Read-GuestReceipt([string]$Phase,$Seal){
     if($result.transfer_id -cne $transfer -or $result.head_sha -cne $ProductHead -or $result.installer_sha256 -cne $SetupSha256 -or $result.boot_id -cne $Seal.boot_id -or $result.reboot_operation -cne $RebootOperation -or $result.harness_head -cne $env:GITHUB_SHA -or $result.witness_sha256 -cne (File-Digest (Join-Path $PSScriptRoot 'windows_guest_witness.ps1'))){throw 'Sealed witness scope differs'}
     return $result
 }
+function Assert-GuestLogonCensus($Witness,[bool]$Planned) {
+    $fields=@('successful_interactive_type_logons_since_checkpoint','human_or_unclassified_interactive_logons_since_checkpoint','reserved_os_virtual_logons_since_checkpoint','reserved_window_manager_logons_since_checkpoint','reserved_font_driver_logons_since_checkpoint')
+    foreach($name in $fields){
+        $property=$Witness.PSObject.Properties[$name]
+        if($null -eq $property){throw 'Guest logon census field unavailable'}
+        $value=$property.Value
+        if(($value -isnot [int] -and $value -isnot [long]) -or $value -lt 0 -or $value -gt 4096){throw 'Guest logon census count differs'}
+    }
+    if($Witness.human_or_unclassified_interactive_logons_since_checkpoint -ne 0 -or
+       $Witness.reserved_os_virtual_logons_since_checkpoint -ne ($Witness.reserved_window_manager_logons_since_checkpoint+$Witness.reserved_font_driver_logons_since_checkpoint) -or
+       $Witness.successful_interactive_type_logons_since_checkpoint -ne ($Witness.human_or_unclassified_interactive_logons_since_checkpoint+$Witness.reserved_os_virtual_logons_since_checkpoint) -or
+       (-not $Planned -and $Witness.reserved_os_virtual_logons_since_checkpoint -ne 0)) {throw 'Guest logon census classification differs'}
+    foreach($oldClaim in @('interactive_logons_since_boot','startup_before_interactive_login','security_all_post_off_shutdown_loss_policy_and_interactive_events_refused')){
+        if($null -ne $Witness.PSObject.Properties[$oldClaim]){throw 'Ambiguous previous guest logon claim retained'}
+    }
+}
 function IPv4-Number([string]$Address){
     $bytes=[Net.IPAddress]::Parse($Address).GetAddressBytes()
     if($bytes.Length -ne 4){throw 'IPv4 required'}
@@ -1204,10 +1220,11 @@ try{
     $receipt.stage='reboot_receipt_read'
     $direct=Open-Direct
     $reboot=Read-GuestReceipt 'reboot' $rebootSeal;$receipt.reboot_witness=$reboot
-    if($reboot.status -cne 'reboot_sealed' -or -not $reboot.startup_before_interactive_login -or -not $reboot.recording_after_reboot -or -not $reboot.retained_closed_hashes_unchanged -or $reboot.boot_id -cne $initial.boot_id -or $reboot.native_boot_sequence_verified -ne $true -or $reboot.native_boot_sequence_increment_verified -ne $true -or $reboot.previous_boot_sequence -ne $initial.boot_sequence -or $reboot.boot_sequence -ne ($initial.boot_sequence+1)){throw 'Reboot recording witness failed'}
+    if($reboot.status -cne 'reboot_sealed' -or -not $reboot.startup_before_human_or_unclassified_interactive_login -or -not $reboot.recording_after_reboot -or -not $reboot.retained_closed_hashes_unchanged -or $reboot.boot_id -cne $initial.boot_id -or $reboot.native_boot_sequence_verified -ne $true -or $reboot.native_boot_sequence_increment_verified -ne $true -or $reboot.previous_boot_sequence -ne $initial.boot_sequence -or $reboot.boot_sequence -ne ($initial.boot_sequence+1)){throw 'Reboot recording witness failed'}
+    Assert-GuestLogonCensus $reboot ($RebootOperation -ceq 'planned-shutdown-start')
     if(-not $reboot.security_policy_coverage_verified -or -not $reboot.security_tail_stable -or -not $reboot.startup_audit_enabled -or -not $reboot.startup_audit_4608_verified -or -not $reboot.security_audit_checkpoint_retained -or -not $reboot.security_no_clear_reset_wrap -or -not $reboot.postboot_clip_created_after_system_inventory -or $null -eq $reboot.postboot_closed_recording){throw 'Reboot audit or new closed recording witness unavailable'}
     if($RebootOperation -ceq 'planned-shutdown-start'){
-        if(-not $receipt.planned_final_off_boundary_verified -or -not $receipt.planned_boundary_dismounted_before_start -or $reboot.planned_final_off_checkpoint_sha256 -cne $receipt.planned_final_off_checkpoint_sha256 -or $reboot.security_final_off_checkpoint_retained -ne $true -or $reboot.security_original_checkpoint_retained -ne $true -or $reboot.security_all_post_off_shutdown_loss_policy_and_interactive_events_refused -ne $true){throw 'Planned sealed witness differs from exact final-Off boundary'}
+        if(-not $receipt.planned_final_off_boundary_verified -or -not $receipt.planned_boundary_dismounted_before_start -or $reboot.planned_final_off_checkpoint_sha256 -cne $receipt.planned_final_off_checkpoint_sha256 -or $reboot.security_final_off_checkpoint_retained -ne $true -or $reboot.security_original_checkpoint_retained -ne $true -or $reboot.security_all_post_off_shutdown_loss_policy_and_human_or_unclassified_interactive_events_refused -ne $true){throw 'Planned sealed witness differs from exact final-Off boundary'}
     }
     $receipt.recording_after_reboot_before_login=$true
     $receipt.stage='actual_console_logon'

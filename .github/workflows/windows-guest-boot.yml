@@ -102,11 +102,12 @@ jobs:
               if (@($errors).Count) { throw 'Guest controller source did not parse' }
             }
           }
-          if ($sourceHashes['windows_guest_witness.ps1'] -ne '623c190df630bba668d33f33222553e0b455859824d8204d11428484042dc09d') { throw 'Native guest witness Git blob differs' }
+          if ($sourceHashes['probe_windows_guest_recording.ps1'] -ne 'ab0152dfd13ad5ce4093e3d7692f16ce6ba6c78e2b846e722ed5d4bea00a83f1') { throw 'Native guest controller Git blob differs' }
+          if ($sourceHashes['windows_guest_witness.ps1'] -ne '0c95c4a387964a76f4aee9a26b991646b187bc0d02b39c776c94ca02909129a6') { throw 'Native guest witness Git blob differs' }
           if ($sourceHashes['windows_guest_bootstrap.cs'] -ne 'b8ef1a885d876d0a66833b3350221bd66794f972843e418815628278b9163909' -or
               $sourceHashes['windows_guest_bootstrap_controls.cs'] -ne '4757e92ab04d387d9d04f0572949c1224dbfa2f25222cb5680290577ec30c837') { throw 'Guest GUI bootstrap controls source differs' }
           if ($sourceHashes['windows_guest_boot_sequence_controls.ps1'] -ne '84204b182165214c3cf46558ff812c87892b6213a0529d7641a2ea3606cb48c0') { throw 'Native boot sequence controls source differs' }
-          if ($sourceHashes['windows_guest_logon_identity_controls.ps1'] -ne '7a42705cad182bad311e105627d9eab4d94ecd1e7f4c1aa734e2b0f8ba0c7d8a') { throw 'Native logon identity controls source differs' }
+          if ($sourceHashes['windows_guest_logon_identity_controls.ps1'] -ne '7cdaac46bfb21e52a0fe717683adc52f3192ccf860d7cc2561acfbb89482f1fb') { throw 'Native logon identity controls source differs' }
           $compiler=Join-Path $env:SYSTEMROOT 'Microsoft.NET/Framework64/v4.0.30319/csc.exe'
           $buildRoot=(Resolve-Path -LiteralPath guest-native-build).Path
           $helperSource=(Get-Item -LiteralPath (Join-Path $buildRoot 'windows_guest_bootstrap.cs')).FullName
@@ -159,15 +160,18 @@ jobs:
               $counter.vendor_wdk_header_sha256 -ne '2d82908d3c5cfda7214a1d299dc730fd4863c090df7d146a62b0f7fb080320f7' -or
               $counter.vendor_sdk_mapping_header_sha256 -ne '832f26c59686cf6864da83681f97fc6fee3a7006399c48efa777d4330a499efb') { throw 'Native boot read controls receipt differs' }
           $counterOutput
-          # Run the actual diagnostic helpers with the guest's Windows PS5 engine.
-          # No VM, native logon query, account resolution, or actor exemption.
-          $logonOutput=& (Join-Path $env:SYSTEMROOT 'System32/WindowsPowerShell/v1.0/powershell.exe') -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $buildRoot 'windows_guest_logon_identity_controls.ps1') -Source (Join-Path $buildRoot 'windows_guest_witness.ps1') -ExpectedSourceSha256 $sourceHashes['windows_guest_witness.ps1']
+          # Exercise actual helpers and the host census validator in native PS5
+          # with fixed fake events before downloading or starting any VM.
+          $logonOutput=& (Join-Path $env:SYSTEMROOT 'System32/WindowsPowerShell/v1.0/powershell.exe') -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $buildRoot 'windows_guest_logon_identity_controls.ps1') -Source (Join-Path $buildRoot 'windows_guest_witness.ps1') -ExpectedSourceSha256 $sourceHashes['windows_guest_witness.ps1'] -ControllerSource (Join-Path $buildRoot 'probe_windows_guest_recording.ps1') -ExpectedControllerSha256 $sourceHashes['probe_windows_guest_recording.ps1']
           if ($LASTEXITCODE -ne 0) { throw 'Native logon identity controls failed' }
           $logon=$logonOutput | ConvertFrom-Json
           if ($logon.schema_version -ne 1 -or $logon.diagnostic_only -ne $true -or $logon.product_qualification -ne $false -or
               $logon.windows_powershell_major -ne 5 -or $logon.edition -cne 'Desktop' -or $logon.source_sha256 -cne $sourceHashes['windows_guest_witness.ps1'] -or
-              $logon.contract_controls_passed -lt 20 -or $logon.namespace_cases -ne 6 -or $logon.invalid_sid_cases -ne 8 -or
-              $logon.actual_boot_actor_observed -ne $false -or $logon.all_interactive_refusals_unchanged -ne $true) { throw 'Native logon identity controls receipt differs' }
+              $logon.contract_controls_passed -ne 165 -or $logon.namespace_cases -ne 6 -or $logon.invalid_sid_cases -ne 8 -or
+              $logon.reserved_os_classification_cases -ne 92 -or $logon.host_census_cases -ne 46 -or
+              $logon.controller_source_sha256 -cne $sourceHashes['probe_windows_guest_recording.ps1'] -or
+              $logon.actual_boot_actor_observed -ne $false -or $logon.human_or_unclassified_interactive_refusals_preserved -ne $true -or
+              $logon.planned_reserved_os_type2_classification_controls_passed -ne $true -or $logon.hard_reset_exemption_enabled -ne $false) { throw 'Native logon identity controls receipt differs' }
           $logonOutput
           $sourceHashes['windows_guest_bootstrap.exe']=(Get-FileHash -LiteralPath guest-native-build/windows_guest_bootstrap.exe -Algorithm SHA256).Hash.ToLowerInvariant()
           @{schema_version=1; diagnostic_only=$true; product_qualification=$false; harness_head=$env:GITHUB_SHA;
@@ -244,6 +248,12 @@ jobs:
               $evidence.installer_sha256 -ne $env:K5_GUEST_SETUP_SHA256 -or
               $evidence.reboot_operation -cne $env:K5_GUEST_REBOOT_OPERATION) { throw 'Guest recording diagnostic scope differs' }
           if ($env:K5_GUEST_BOOTSTRAP_OBSERVATION -ne 'true') {
+            $tokens=$null; $errors=$null
+            $controllerAst=[Management.Automation.Language.Parser]::ParseFile($controller,[ref]$tokens,[ref]$errors)
+            $censusHelper=@($controllerAst.FindAll({param($node)$node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Assert-GuestLogonCensus'},$true))
+            if (@($errors).Count -ne 0 -or $censusHelper.Count -ne 1) { throw 'Host logon census validator unavailable' }
+            . ([scriptblock]::Create($censusHelper[0].Extent.Text))
+            Assert-GuestLogonCensus $evidence.reboot_witness ($env:K5_GUEST_REBOOT_OPERATION -ceq 'planned-shutdown-start')
             if ($evidence.reboot_operation_executed -ne $true) { throw 'Requested owned reboot operation was not observed' }
             if ($env:K5_GUEST_REBOOT_OPERATION -ceq 'planned-shutdown-start') {
               if ($evidence.proof_scope -cne 'planned-shutdown-start-recording' -or
@@ -257,7 +267,7 @@ jobs:
                   $evidence.reboot_witness.planned_final_off_checkpoint_sha256 -cne $evidence.planned_final_off_checkpoint_sha256 -or
                   $evidence.reboot_witness.security_final_off_checkpoint_retained -ne $true -or
                   $evidence.reboot_witness.security_original_checkpoint_retained -ne $true -or
-                  $evidence.reboot_witness.security_all_post_off_shutdown_loss_policy_and_interactive_events_refused -ne $true) { throw 'Planned shutdown/start identity or operation bounds differ' }
+                  $evidence.reboot_witness.security_all_post_off_shutdown_loss_policy_and_human_or_unclassified_interactive_events_refused -ne $true) { throw 'Planned shutdown/start identity or operation bounds differ' }
             } elseif ($evidence.proof_scope -cne 'hard-reset-recording') { throw 'Hard-reset proof scope differs' }
           }
           if ($env:K5_GUEST_BOOTSTRAP_OBSERVATION -eq 'true') {

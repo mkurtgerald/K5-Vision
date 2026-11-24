@@ -234,8 +234,8 @@ function Security-Checkpoint([string]$Boot,[long]$Sequence) {
     }finally{foreach($event in (@($newest)+@($oldest))){if($event -is [IDisposable]){$event.Dispose()}}}
 }
 function Get-LogonDiagnosticSidRole([string]$Value) {
-    # Diagnostic namespace only, never an admission decision. Validate the
-    # canonical SID structure without resolving account names or querying LSA.
+    # Validate canonical SID structure without resolving names or querying LSA.
+    # A namespace alone never admits a successful interactive-type logon.
     if($null -eq $Value -or $Value.Length -gt 184){return 'unknown'}
     $parts=$Value.Split('-')
     if($parts.Count -lt 4 -or $parts.Count -gt 18 -or $parts[0] -cne 'S' -or $parts[1] -cne '1'){return 'unknown'}
@@ -277,6 +277,26 @@ function Add-LogonIdentityDiagnostic([xml]$EventXml,[hashtable]$Diagnostic) {
             $Diagnostic[$name]=[Math]::Min(4096L,$prior+1)
         }
     }catch{$Diagnostic.logon_identity_detail_unavailable=$true}
+}
+function Get-ReservedOsVirtualLogonRole([xml]$EventXml) {
+    # The planned-Off path alone may classify Windows desktop components.
+    # Require each event's exact type, modern reserved SID and virtual-account
+    # bit together; account names are neither inspected nor trusted.
+    try{
+        $types=@($EventXml.Event.EventData.Data|Where-Object{$_.Name -ceq 'LogonType'})
+        $sids=@($EventXml.Event.EventData.Data|Where-Object{$_.Name -ceq 'TargetUserSid'})
+        $virtual=@($EventXml.Event.EventData.Data|Where-Object{$_.Name -ceq 'VirtualAccount'})
+        if($types.Count -ne 1 -or $sids.Count -ne 1 -or $virtual.Count -ne 1){return 'unclassified'}
+        foreach($field in @($types[0],$sids[0],$virtual[0])){
+            if($field.ChildNodes.Count -ne 1 -or $field.FirstChild.NodeType -ne [Xml.XmlNodeType]::Text){return 'unclassified'}
+        }
+        if([string]$types[0].InnerText -cne '2' -or [string]$virtual[0].InnerText -cne '%%1842'){return 'unclassified'}
+        $sid=[string]$sids[0].InnerText
+        if($sid -cnotmatch '^S-1-5-(90|96)-0-(0|[1-9][0-9]{0,9})$'){return 'unclassified'}
+        $role=Get-LogonDiagnosticSidRole $sid
+        if($role -cin @('window_manager_namespace','font_driver_namespace')){return $role}
+    }catch{}
+    return 'unclassified'
 }
 function Add-SecurityPolicyDiagnostic($Event,[hashtable]$Diagnostic) {
     # Optional details on an event that already causes refusal. Export only
@@ -378,7 +398,7 @@ function Save-SecurityAuditFailure([hashtable]$Diagnostic,$Failure) {
     $copy=@{schema_version=1;stage='checkpoint_admission';reason='unspecified'}
     if($Diagnostic.stage -cin $allowedStages){$copy.stage=$Diagnostic.stage}
     if($Diagnostic.reason -cin $allowedReasons){$copy.reason=$Diagnostic.reason}
-    foreach($name in @('stability_attempt','elapsed_ms','checkpoint_record_id','checkpoint_oldest_record_id','oldest_record_id','newest_record_id','range_expected','range_actual','startup_events','startup_record_id','offending_event_id','offending_record_id','offending_logon_type','interactive_logons','interactive_sessions','tail_record_id','hresult','native_code','range_startup_events','range_startup_record_id','range_poststartup_continuity_events','range_first_poststartup_continuity_event_id','range_first_poststartup_continuity_record_id','transport_drop_reason','range_interactive_logons_after_checkpoint','range_interactive_logons_logged_after_startup')){
+    foreach($name in @('stability_attempt','elapsed_ms','checkpoint_record_id','checkpoint_oldest_record_id','oldest_record_id','newest_record_id','range_expected','range_actual','startup_events','startup_record_id','offending_event_id','offending_record_id','offending_logon_type','interactive_logons','human_or_unclassified_interactive_logons','reserved_os_virtual_logons','reserved_window_manager_logons','reserved_font_driver_logons','interactive_sessions','tail_record_id','hresult','native_code','range_startup_events','range_startup_record_id','range_poststartup_continuity_events','range_first_poststartup_continuity_event_id','range_first_poststartup_continuity_record_id','transport_drop_reason','range_interactive_logons_after_checkpoint','range_interactive_logons_logged_after_startup')){
         if($Diagnostic.ContainsKey($name)){
             $value=$Diagnostic[$name]
             if($value -is [long] -or $value -is [int] -or $value -is [uint32] -or $value -is [uint16]){$copy[$name]=[long]$value}
@@ -463,18 +483,29 @@ function Security-RebootAudit($Checkpoint,[string]$PreviousBoot,[string]$Current
             $diagnostic.startup_events=$startup.Count;$diagnostic.startup_scan_complete=$true
             if($startup.Count -ne 1){$diagnostic.reason='startup_count';throw 'Exact new startup audit event unavailable'}
             $diagnostic.stage='startup_validation'
-            [long]$startupId=$startup[0].RecordId;$interactive=0;$diagnostic.startup_record_id=$startupId;$diagnostic.stage='logon_validation'
+            [long]$startupId=$startup[0].RecordId;$interactive=0;$humanOrUnclassified=0;$windowManager=0;$fontDriver=0;$diagnostic.startup_record_id=$startupId;$diagnostic.stage='logon_validation'
             foreach($event in $events){
                 if($event.Id -eq 1100 -and ($RejectAllShutdown -or [long]$event.RecordId -gt $startupId)){$diagnostic.offending_event_id=[int]$event.Id;$diagnostic.offending_record_id=[long]$event.RecordId;$diagnostic.reason='logging_shutdown_after_startup';throw 'Event logging stopped after startup'}
-                # Exclude every successful interactive logon after the sealed
-                # checkpoint; record storage order is not an epoch assignment.
+                # Inspect every successful interactive-type logon after the
+                # sealed checkpoint; storage order is not an epoch assignment.
                 if($event.Id -ne 4624){continue}
                 [xml]$xml=$event.ToXml();$types=@($xml.Event.EventData.Data|Where-Object{$_.Name -ceq 'LogonType'})
-                if($types.Count -ne 1 -or [string]$types[0].'#text' -notmatch '^\d{1,2}$'){$diagnostic.offending_event_id=[int]$event.Id;$diagnostic.offending_record_id=[long]$event.RecordId;$diagnostic.reason='logon_type_unavailable';throw 'Logon audit type unavailable'}
-                if([string]$types[0].'#text' -in @('2','7','10','11','12','13')){$interactive++;Add-LogonIdentityDiagnostic $xml $diagnostic;if(-not $diagnostic.ContainsKey('offending_event_id')){$diagnostic.offending_event_id=[int]$event.Id;$diagnostic.offending_record_id=[long]$event.RecordId;$diagnostic.offending_logon_type=[int]([string]$types[0].'#text')}}
+                if($types.Count -ne 1 -or [string]$types[0].'#text' -cnotmatch '^(0|[1-9][0-9]?)$'){$diagnostic.offending_event_id=[int]$event.Id;$diagnostic.offending_record_id=[long]$event.RecordId;$diagnostic.reason='logon_type_unavailable';throw 'Logon audit type unavailable'}
+                if([string]$types[0].'#text' -in @('2','7','10','11','12','13')){
+                    $interactive++
+                    $role=if($RejectAllShutdown){Get-ReservedOsVirtualLogonRole $xml}else{'unclassified'}
+                    if($role -ceq 'window_manager_namespace'){$windowManager++;continue}
+                    if($role -ceq 'font_driver_namespace'){$fontDriver++;continue}
+                    $humanOrUnclassified++;Add-LogonIdentityDiagnostic $xml $diagnostic
+                    if(-not $diagnostic.ContainsKey('offending_event_id')){$diagnostic.offending_event_id=[int]$event.Id;$diagnostic.offending_record_id=[long]$event.RecordId;$diagnostic.offending_logon_type=[int]([string]$types[0].'#text')}
+                }
             }
             $diagnostic.interactive_logons=$interactive
-            if($interactive -ne 0){$diagnostic.reason='interactive_logon';throw 'Interactive logon preceded boot witness'}
+            $diagnostic.human_or_unclassified_interactive_logons=$humanOrUnclassified
+            $diagnostic.reserved_os_virtual_logons=$windowManager+$fontDriver
+            $diagnostic.reserved_window_manager_logons=$windowManager
+            $diagnostic.reserved_font_driver_logons=$fontDriver
+            if($humanOrUnclassified -ne 0){$diagnostic.reason='interactive_logon';throw 'Human or unclassified interactive logon preceded boot witness'}
             $diagnostic.stage='retained_anchor_query'
             $oldestAfter=@(Get-WinEvent -LogName Security -MaxEvents 1 -Oldest -ErrorAction Stop)
             $anchorAfter=@(Get-WinEvent -LogName Security -FilterXPath ('*[System[EventRecordID={0}]]' -f [long]$Checkpoint.record_id) -MaxEvents 2 -ErrorAction Stop)
@@ -509,7 +540,7 @@ function Security-RebootAudit($Checkpoint,[string]$PreviousBoot,[string]$Current
             $diagnostic.stage='boundary_tail_hash'
             if((Security-EventHash $boundaryTail[0]) -cne $tailHash){$diagnostic.reason='final_tail_id_reused';throw 'Security final tail ID was reused'}
             if($stability.Elapsed.TotalSeconds -ge 5){$diagnostic.reason='final_hash_deadline';throw [TimeoutException]::new('Security audit final hash exceeded budget')}
-            return @{checkpoint_retained=$true;no_clear_reset_wrap=$true;policy_coverage_verified=$true;tail_stable=$true;startup_event_id=4608;startup_record_id=$startupId;through_record_id=$through;interactive_logons=0;stability_attempts=($attempt+1)}
+            return @{checkpoint_retained=$true;no_clear_reset_wrap=$true;policy_coverage_verified=$true;tail_stable=$true;startup_event_id=4608;startup_record_id=$startupId;through_record_id=$through;interactive_logons=$interactive;human_or_unclassified_interactive_logons=$humanOrUnclassified;reserved_os_virtual_logons=($windowManager+$fontDriver);reserved_window_manager_logons=$windowManager;reserved_font_driver_logons=$fontDriver;stability_attempts=($attempt+1)}
         }catch{$diagnostic.elapsed_ms=$stability.ElapsedMilliseconds;Save-SecurityAuditFailure $diagnostic $_;throw}finally{foreach($event in (@($oldest)+@($newest)+@($anchor)+@($events)+@($oldestAfter)+@($anchorAfter)+@($tailAfter)+@($boundaryOldest)+@($boundaryAnchor)+@($boundaryTail)+@($originalAnchor)+@($originalFinal))){if($event -is [IDisposable]){$event.Dispose()}}}
     }
     $diagnostic.stage='tail_stability';$diagnostic.reason='tail_never_stable';$diagnostic.elapsed_ms=$stability.ElapsedMilliseconds;$diagnostic.error_kind='TimeoutException'
@@ -575,7 +606,7 @@ try{
 $receipt = [ordered]@{
     schema_version=1; phase=$phase; transfer_id=$transfer; status='failed'; boot_id=$boot; boot_sequence=$bootSequence; native_boot_sequence_verified=$true;
     head_sha=$config.head_sha; installer_sha256=$config.setup_sha256; harness_head=$config.harness_head;witness_sha256=$config.witness_sha256; reboot_operation=$config.reboot_operation; observer_sid='SYSTEM'; observer_session=0;
-    startup_before_interactive_login=$false; recording_after_reboot=$false; recording_after_signout=$false;
+    startup_before_human_or_unclassified_interactive_login=$false; recording_after_reboot=$false; recording_after_signout=$false;
     retained_closed_hashes_unchanged=$false; logon_audit_enabled=$false; cleanup_credentials_removed=$false
 }
 $observationStage='phase_admission'
@@ -681,7 +712,7 @@ try {
         Write-EntryDiagnostic 'observer-stage-reboot.json' @{schema_version=1;phase=$phase;status='observing';stage=$observationStage;boot_id=$boot;observer_session=$guestWitnessSession}
         $audit=Security-RebootAudit $securityCheckpoint $baseline.boot_id $boot $baseline.boot_sequence $bootSequence $rejectAllShutdown $baseline.security_checkpoint
         $receipt.security_audit_checkpoint_retained=$audit.checkpoint_retained
-        if($rejectAllShutdown){$receipt.security_final_off_checkpoint_retained=$audit.checkpoint_retained;$receipt.security_original_checkpoint_retained=$true;$receipt.security_all_post_off_shutdown_loss_policy_and_interactive_events_refused=$true}
+        if($rejectAllShutdown){$receipt.security_final_off_checkpoint_retained=$audit.checkpoint_retained;$receipt.security_original_checkpoint_retained=$true;$receipt.security_all_post_off_shutdown_loss_policy_and_human_or_unclassified_interactive_events_refused=$true}
         $receipt.security_no_clear_reset_wrap=$audit.no_clear_reset_wrap
         $receipt.security_policy_coverage_verified=$audit.policy_coverage_verified
         $receipt.security_tail_stable=$audit.tail_stable
@@ -691,14 +722,18 @@ try {
         $receipt.previous_boot_id = $baseline.boot_id
         $receipt.previous_boot_sequence = $baseline.boot_sequence
         $receipt.native_boot_sequence_increment_verified = $true
-        $receipt.startup_before_interactive_login = $true
+        $receipt.startup_before_human_or_unclassified_interactive_login = $true
         $receipt.recording_after_reboot = $true
         $receipt.retained_closed_hashes_unchanged = $true
         $receipt.recording_bytes_before = $before
         $receipt.recording_bytes_after = $after
         $receipt.observed_seconds = [Math]::Round($watch.Elapsed.TotalSeconds,3)
         $receipt.interactive_sessions_observed = 0
-        $receipt.interactive_logons_since_boot = 0
+        $receipt.successful_interactive_type_logons_since_checkpoint = $audit.interactive_logons
+        $receipt.human_or_unclassified_interactive_logons_since_checkpoint = $audit.human_or_unclassified_interactive_logons
+        $receipt.reserved_os_virtual_logons_since_checkpoint = $audit.reserved_os_virtual_logons
+        $receipt.reserved_window_manager_logons_since_checkpoint = $audit.reserved_window_manager_logons
+        $receipt.reserved_font_driver_logons_since_checkpoint = $audit.reserved_font_driver_logons
         $receipt.service = $service
         $receipt.status = 'reboot_sealed'
     } elseif ($phase -eq 'signout') {
