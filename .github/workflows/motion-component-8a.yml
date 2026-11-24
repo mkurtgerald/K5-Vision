@@ -1,0 +1,166 @@
+name: Component only - exact 8a candidate installed Motion
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [codex/motion-component-8a-20261124]
+    paths: [.github/workflows/motion-component-8a.yml]
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: motion-component-8a-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  installed-motion-component:
+    name: UNQUALIFIED candidate - Motion component only
+    runs-on: windows-2025
+    timeout-minutes: 12
+    env:
+      K5_DESKTOP_HEAD_SHA: 8a60ea86ecb4a95a3cb40ff732d2bd044d2a0fd9
+      K5_OPERATOR_BROWSER_ACCEPTANCE: "1"
+      K5_OPERATOR_BROWSER_CHANNEL: msedge
+      K5_NATIVE_MOTION_ACCEPTANCE: "1"
+      K5_VM_CLOCK_ACCEPTANCE: "1"
+    steps:
+      - name: Checkout unchanged exact candidate product and acceptance source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: 8a60ea86ecb4a95a3cb40ff732d2bd044d2a0fd9
+          persist-credentials: false
+      - name: Admit immutable candidate from its failed overall GUI producer
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $headers = @{ Authorization="Bearer $env:GH_TOKEN"; 'X-GitHub-Api-Version'='2022-11-28' }
+          $base = 'https://api.github.com/repos/mkurtgerald/K5-Vision/actions'
+          $artifact = Invoke-RestMethod -Headers $headers -Uri "$base/artifacts/14943460713"
+          $run = Invoke-RestMethod -Headers $headers -Uri "$base/runs/45438720904"
+          $producer = Invoke-RestMethod -Headers $headers -Uri "$base/jobs/138603546130"
+          $upload = @($producer.steps | Where-Object { $_.name -ceq 'Upload non-release candidate for independent upgrade and reversal qualification' })
+          if ($artifact.id -ne 14943460713 -or $artifact.expired -ne $false -or
+              $artifact.size_in_bytes -ne 285151595 -or
+              $artifact.digest -cne 'sha256:eedad94c0eda9621c5c2b3ffd25b911eade9271960b9df537ba6faa42c08987c' -or
+              $artifact.workflow_run.id -ne 45438720904 -or
+              $artifact.workflow_run.head_sha -cne $env:K5_DESKTOP_HEAD_SHA -or
+              $run.id -ne 45438720904 -or $run.run_attempt -ne 1 -or
+              $run.head_sha -cne $env:K5_DESKTOP_HEAD_SHA -or
+              $run.path -cne '.github/workflows/operator-desktop-windows.yml' -or
+              $producer.id -ne 138603546130 -or $producer.run_id -ne 45438720904 -or
+              $producer.head_sha -cne $env:K5_DESKTOP_HEAD_SHA -or
+              $producer.status -cne 'completed' -or $producer.conclusion -cne 'failure' -or
+              $upload.Count -ne 1 -or $upload[0].conclusion -cne 'success') {
+            throw 'Exact unqualified candidate producer or artifact identity differs'
+          }
+      - name: Prepare disposable default browser
+        uses: ./.github/actions/prepare-windows-browser
+      - name: Set up development Python outside embedded product runtime
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install unchanged Motion acceptance dependencies before guest clock changes
+        shell: pwsh
+        run: |
+          python -m pip install -e ".[dev]" "playwright==1.58.0"
+          if ($LASTEXITCODE -ne 0) { throw 'Motion acceptance dependency installation failed' }
+      - name: Provision immutable generated-media tools before guest clock changes
+        uses: ./.github/actions/provision-operator-tools
+      - name: Download only the exact unqualified candidate artifact
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          artifact-ids: '14943460713'
+          run-id: '45438720904'
+          github-token: ${{ github.token }}
+          path: motion-input
+          merge-multiple: true
+      - name: Bind exact Setup, unqualified metadata, manifest and decoder policy
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          @'
+          import hashlib,json,os,pathlib
+          root=pathlib.Path.cwd()
+          inputs=root/'motion-input'
+          head='8a60ea86ecb4a95a3cb40ff732d2bd044d2a0fd9'
+          def sha(path):
+              with path.open('rb') as stream:
+                  return hashlib.file_digest(stream,'sha256').hexdigest()
+          package=json.loads((inputs/'desktop-package.json').read_text(encoding='utf-8-sig'))
+          expected={
+              'schema_version':1,'qualification_status':'unqualified',
+              'run_id':45438720904,'run_attempt':1,'head_sha':head,
+              'setup_sha256':'1f3bee03c4ad2e7df678755cdf0be0d14def88b8529d3501b738f15698b6db0c',
+              'setup_bytes':286589363,
+              'launcher_sha256':'3eb50c03fe0b81ee47d5849ee79a8ca0d2aaacad05bf53f65b87564515bff809',
+              'payload_manifest_sha256':'4a293264851152424bc0c10d5129ddbac0d5278bac4c1f6918ef8a6edad14389',
+          }
+          if package!=expected:
+              raise SystemExit('Exact unqualified candidate metadata differs')
+          setup=inputs/'K5VisionSetup.exe'
+          if setup.stat().st_size!=expected['setup_bytes'] or sha(setup)!=expected['setup_sha256']:
+              raise SystemExit('Exact candidate Setup bytes differ')
+          manifest_path=inputs/'payload-manifest.json'
+          if sha(manifest_path)!=expected['payload_manifest_sha256']:
+              raise SystemExit('Exact candidate manifest differs')
+          manifest=json.loads(manifest_path.read_text())
+          if manifest.get('schema_version')!=1 or manifest.get('head_sha')!=head:
+              raise SystemExit('Candidate manifest source differs')
+          pinned={
+              'runtime/Lib/site-packages/k5vision/operator_motion_process.py':('2e9752a7da279ac291447dd62537891ec4440001f2f6d6160f748b1f2f7a69d3',33303),
+              'runtime/Lib/site-packages/cv2/opencv_videoio_ffmpeg500_64.dll':('7aabff029d1fa47cf56ede4dbbe05dc62da3208f07cd16471d4c966a33f9aa31',30876160),
+          }
+          for name,(digest,length) in pinned.items():
+              selected=[entry for entry in manifest['files'] if entry.get('path')==name]
+              if len(selected)!=1 or selected[0].get('sha256')!=digest or selected[0].get('bytes')!=length:
+                  raise SystemExit('Candidate Motion source or decoder binding differs')
+          source=(root/'src/k5vision/operator_motion_process.py').read_bytes().replace(b'\r\n',b'\n')
+          if hashlib.sha256(source).hexdigest()!='04d4e452b03d3f3a72271de42f44354e06d70091d43dbf7c3ab8c91d9ae0b8b7' or hashlib.sha256(source.replace(b'\n',b'\r\n')).hexdigest()!=pinned['runtime/Lib/site-packages/k5vision/operator_motion_process.py'][0]:
+              raise SystemExit('Checked-out Motion repair differs from candidate payload')
+          scope={
+              'schema_version':1,'component_only':True,'component':'installed_motion',
+              'whole_product_gui_qualified':False,'input_qualification_status':'unqualified',
+              'candidate_artifact_id':14943460713,'candidate_producer_run':45438720904,
+              'candidate_producer_attempt':1,'candidate_producer_job':138603546130,
+              'candidate_producer_gui_conclusion':'failure','head_sha':head,
+              'setup_sha256':expected['setup_sha256'],'setup_bytes':expected['setup_bytes'],
+              'manifest_sha256':expected['payload_manifest_sha256'],
+              'harness_head':os.environ['GITHUB_SHA'],
+              'unchanged_test_and_verifier':True,
+              'scope':'Only the unchanged installed Motion component test; no whole-product GUI qualification or release promotion',
+          }
+          (root/'motion-component-scope.json').write_text(json.dumps(scope,indent=2)+'\n')
+          with open(os.environ['GITHUB_ENV'],'a',encoding='utf-8') as output:
+              output.write('K5_DESKTOP_SETUP='+str(setup.resolve())+'\n')
+              output.write('K5_DESKTOP_SETUP_SHA256='+expected['setup_sha256']+'\n')
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { throw 'Motion candidate component binding failed' }
+      - name: Verify unchanged strict Motion admission and generated camera controls
+        shell: pwsh
+        run: |
+          python -m pytest tests/unit/test_windows_motion_recording_receipt.py tests/unit/test_motion_camera_fixture.py -o addopts= --no-cov --tb=short
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Exercise unchanged full installed Motion GUI, service, zones and actual clock corrections
+        timeout-minutes: 8
+        shell: pwsh
+        run: |
+          python -m pytest tests/integration/test_windows_motion_recording.py -o addopts= --no-cov -s --tb=short -o faulthandler_timeout=460 --junitxml=motion-windows.xml
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/verify_windows_motion_recording_receipt.py motion-windows.xml motion-windows-receipt.json --expected-head $env:K5_DESKTOP_HEAD_SHA --installer-sha256 $env:K5_DESKTOP_SETUP_SHA256
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Retain separate component scope and unchanged finite Motion witness
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: component-only-unqualified-8a-motion-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            motion-component-scope.json
+            motion-windows.xml
+            motion-windows-receipt.json
+          if-no-files-found: warn
+          retention-days: 14
