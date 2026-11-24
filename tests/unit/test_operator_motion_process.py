@@ -600,17 +600,25 @@ def test_untrusted_or_excess_progress_is_rejected_without_material_disclosure(wo
     assert worker.processes[0].returncode is not None
 
 
-def test_actual_progress_does_not_refresh_watchdog_and_retains_blocked_decoder_phase(monkeypatch):
+@pytest.mark.parametrize("startup_delay", [0.0, 0.25])
+def test_actual_progress_does_not_refresh_watchdog_and_retains_blocked_decoder_phase(
+    monkeypatch, tmp_path, startup_delay
+):
     real_start = subprocess.Popen
     owned = []
+    ready = tmp_path / "worker-ready"
 
     def start(_args, **_kwargs):
+        headers = (
+            b'{"status":"progress","phase":"native_import"}\n'
+            b'{"status":"progress","phase":"decoder_open"}\n'
+        )
         program = (
-            "import sys,time; "
-            'sys.stdout.buffer.write(b\'{"status":"progress","phase":"native_import"}\\n\'); '
-            "sys.stdout.buffer.flush(); time.sleep(.07); "
-            'sys.stdout.buffer.write(b\'{"status":"progress","phase":"decoder_open"}\\n\'); '
-            "sys.stdout.buffer.flush(); sys.stdin.buffer.read()"
+            "import sys,time; from pathlib import Path; "
+            f"time.sleep({startup_delay!r}); "
+            f"sys.stdout.buffer.write({headers!r}); "
+            f"sys.stdout.buffer.flush(); Path({str(ready)!r}).write_text('ready'); "
+            "sys.stdin.buffer.read()"
         )
         process = real_start(
             [sys.executable, "-I", "-B", "-c", program],
@@ -620,6 +628,17 @@ def test_actual_progress_does_not_refresh_watchdog_and_retains_blocked_decoder_p
             bufsize=0,
         )
         owned.append(process)
+        # Production starts the request watchdog after Popen returns. Order
+        # both asserted phase frames before that boundary; OS interpreter
+        # startup is independent of the blocked request being measured.
+        deadline = time.monotonic() + 3
+        while not ready.exists() and process.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.005)
+        if not ready.exists():
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=2)
+            pytest.fail("Owned watchdog fixture did not become ready")
         return process
 
     monkeypatch.setattr(motion.subprocess, "Popen", start)
@@ -627,12 +646,18 @@ def test_actual_progress_does_not_refresh_watchdog_and_retains_blocked_decoder_p
     instance = motion.LiveMotionWorker(URI)
     arm = instance._deadline.arm
     arms = []
-    instance._deadline.arm = lambda process: (arms.append(process), arm(process))[1]
-    began = time.monotonic()
+    armed_at = []
+
+    def observe_arm(process):
+        arms.append(process)
+        armed_at.append(time.monotonic())
+        return arm(process)
+
+    instance._deadline.arm = observe_arm
     try:
         with pytest.raises(motion.MotionProcessError) as caught:
             instance.sample(policy())
-        elapsed = time.monotonic() - began
+        elapsed = time.monotonic() - armed_at[0]
         assert len(arms) == 1 and 0.12 <= elapsed < 1
         assert caught.value.reason == "request_deadline"
         assert (
@@ -640,7 +665,14 @@ def test_actual_progress_does_not_refresh_watchdog_and_retains_blocked_decoder_p
         )
         assert owned[0].poll() is not None
     finally:
-        instance.close()
+        try:
+            instance.close()
+        finally:
+            # Also own failures before fake_start transfers its process.
+            for process in owned:
+                if process.poll() is None:
+                    process.kill()
+                process.wait(timeout=2)
 
 
 @pytest.mark.parametrize(
