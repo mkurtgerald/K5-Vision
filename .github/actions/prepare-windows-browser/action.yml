@@ -1,0 +1,21 @@
+name: Prepare the disposable Windows CI user's browser
+description: Complete Edge's first-run prerequisite for graphical acceptance on hosted Windows VMs only.
+runs:
+  using: composite
+  steps:
+    - name: Complete the disposable CI user's browser prerequisite
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted' -or $env:RUNNER_OS -ne 'Windows') {
+          throw 'Browser preparation requires a disposable hosted Windows VM'
+        }
+        # Test-runner user only, never an installer or product operation.
+        # Official policy: https://learn.microsoft.com/deployedge/microsoft-edge-browser-policies/hidefirstrunexperience
+        $edgePolicy = 'HKCU:\Software\Policies\Microsoft\Edge'
+        New-Item -Path $edgePolicy -Force | Out-Null
+        New-ItemProperty -Path $edgePolicy -Name HideFirstRunExperience -PropertyType DWord -Value 1 -Force | Out-Null
+        if ((Get-ItemPropertyValue -Path $edgePolicy -Name HideFirstRunExperience) -ne 1) {
+          throw 'Disposable browser prerequisite could not be verified'
+        }
+        Write-Host 'Prepared the disposable CI user for native default-browser acceptance'

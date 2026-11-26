@@ -213,6 +213,18 @@ def _cache_worker(runtime: Path, wheel: Path, name: str, supplied: Path) -> None
     _private_directory(cache)
     _copy_private(supplied, cache / artifact["executable"])
     _copy_private(license_path, cache / "LICENSE")
+    if name == "mediamtx" and manifest["version"] == "v1.21.2-k5-monotonic1":
+        tool_root = os.environ.get("K5_DONOR_TOOL_ROOT")
+        _require(bool(tool_root), "Admitted derivative notice archive root is missing")
+        archive = Path(tool_root) / "mediamtx.zip"
+        _require(
+            archive.is_file()
+            and not archive.is_symlink()
+            and archive.stat().st_size == artifact["archive_bytes"]
+            and _digest(archive) == artifact["sha256"],
+            "Supplied derivative notice archive identity was refused",
+        )
+        _copy_private(archive, cache / "upstream-notices-and-provenance.zip")
 
 
 def _verify_installed_workers(runtime: Path, wheel: Path) -> None:
@@ -233,6 +245,15 @@ def _verify_installed_workers(runtime: Path, wheel: Path) -> None:
             "Installed native worker or license identity was refused",
         )
         expected.update((executable, license_path))
+        if name == "mediamtx" and manifest["version"] == "v1.21.2-k5-monotonic1":
+            notice_archive = cache / "upstream-notices-and-provenance.zip"
+            archive_info = identity_state._regular_file(notice_archive)
+            _require(
+                archive_info.st_size == artifact["archive_bytes"]
+                and _digest(notice_archive) == artifact["sha256"],
+                "Installed derivative notice archive identity was refused",
+            )
+            expected.add(notice_archive)
     _require(
         {path for path in (runtime / "tools").rglob("*") if path.is_file()} == expected,
         "Installed native tools retained unexpected extraction files",

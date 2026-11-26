@@ -1056,8 +1056,16 @@ def test_no_privileged_action_before_canonical_inventory_arrives(workspace):
         page.wait_for_function(
             "document.querySelector('#account-role').textContent === 'administrator'"
         )
-        page.wait_for_timeout(25)
+        # Playwright dispatches route callbacks asynchronously after the role
+        # label appears. Wait for the actual held inventory request, while all
+        # privileged UI controls remain hidden, before releasing the response.
+        for _ in range(40):
+            if state["held_inventory"]:
+                break
+            page.wait_for_timeout(50)
         assert state["held_inventory"]
+        assert page.locator("#admin-tab").is_hidden()
+        assert page.locator("#add-camera-button").is_hidden()
         state["hold_inventory"] = False
         route, payload = state["held_inventory"].pop()
         route.fulfill(status=200, content_type="application/json", body=json.dumps(payload))

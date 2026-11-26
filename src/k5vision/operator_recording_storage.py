@@ -8,6 +8,7 @@ the application's single maintenance worker, outside the event loop.
 
 from __future__ import annotations
 
+import heapq
 import math
 import os
 import re
@@ -74,6 +75,20 @@ class _Scan:
     free_bytes: int
     candidates: tuple[_Segment, ...] = field(repr=False)
     complete: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedInventory:
+    total_bytes: int
+    candidates: tuple[_Segment, ...] = field(repr=False)
+    observed: dict[Path, _Observation] = field(repr=False)
+    progress: dict[str, _PathProgress] = field(repr=False)
+    visited: tuple[tuple[Path, os.stat_result], ...] = field(repr=False)
+    generation: int
+
+
+class _PendingInventory(Exception):
+    pass
 
 
 class _IncompleteStorage(Exception):
@@ -163,6 +178,15 @@ class RecordingStorage:
         self._progress_complete = False
         self._progress_lock = threading.Lock()
         self._lock = threading.RLock()
+        self._scan_walk = None
+        self._scan_ready = None
+        self._scan_waiting = False
+        self._scan_counts_entry = False
+        self._scan_directory = None
+        self._scan_total = 0
+        self._verifying = False
+        self._closed = False
+        self._writers_paused = False
 
     @staticmethod
     def _signature(directory: os.stat_result, file: os.stat_result) -> tuple[int, ...]:
@@ -191,164 +215,263 @@ class RecordingStorage:
         identity_state._windows_admission(path, private=True, directory=True)
         return info
 
+    def _discard_scan(self) -> None:
+        walk, self._scan_walk = self._scan_walk, None
+        try:
+            if walk is not None:
+                walk.close()
+        finally:
+            self._scan_ready = None
+            self._scan_waiting = False
+            self._scan_counts_entry = False
+            self._scan_directory = None
+            self._scan_total = 0
+            self._verifying = False
+
+    def close(self) -> None:
+        """Retire a suspended inventory before the owning service releases storage."""
+        with self._lock:
+            self._closed = True
+            try:
+                self._discard_scan()
+            finally:
+                self._observations.clear()
+                self._scan_generation = 0
+                self._invalidate_progress()
+
+    def confirm_writer_pause(self, *, paused: bool) -> None:
+        """Discard a pre-pause sample once the owned writers actually stopped.
+
+        The service calls this only after all recording gates or the replacement
+        worker's paused configuration have succeeded. Repeated confirmation must
+        not restart the resumed inventory and prevent recovery.
+        """
+        if type(paused) is not bool:
+            raise ValueError("Recording pause state is invalid")
+        with self._lock:
+            if self._closed:
+                raise RecordingStorageError("Recording storage is closed")
+            self._admit_root()
+            changed = paused and not self._writers_paused
+            self._writers_paused = paused
+            if changed:
+                try:
+                    self._discard_scan()
+                except Exception:
+                    self._closed = True
+                    raise RecordingStorageError("Recording inventory cleanup failed") from None
+                self._invalidate_progress()
+
     def _scan(self, deadline: float, remaining_entries: list[int]) -> _Scan:
-        total = 0
+        """Continue one inventory without extending this call's entry/time limits.
+
+        Only a complete inventory can admit recording or authorize deletion.
+        Budget exhaustion suspends the same owned walk; custody failures discard
+        it and all closed-age confidence. At most the root and current camera
+        scandir handles remain open between calls.
+        """
         free = 0
+        if self._closed:
+            return _Scan(0, 0, (), False)
+        try:
+            self._admit_root()
+            if self._scan_directory is not None:
+                identity_state._same_directory(*self._scan_directory)
+            free = _free_bytes(self._root)
+            if self._scan_walk is None and self._scan_ready is None:
+                self._scan_total = 0
+                self._scan_walk = self._walk_scan()
+            while True:
+                if time.monotonic() >= deadline or (
+                    self._scan_waiting and self._scan_counts_entry and remaining_entries[0] <= 0
+                ):
+                    with self._progress_lock:
+                        self._progress_complete = False
+                    return _Scan(self._scan_total, free, (), False)
+                if self._scan_ready is not None:
+                    result = self._publish_inventory(self._scan_ready, deadline)
+                    self._scan_ready = None
+                    return result
+                if self._scan_waiting:
+                    if self._scan_counts_entry:
+                        remaining_entries[0] -= 1
+                    self._scan_waiting = False
+                try:
+                    self._scan_counts_entry = next(self._scan_walk)
+                    self._scan_waiting = True
+                except StopIteration as completed:
+                    self._scan_walk = None
+                    self._scan_waiting = False
+                    self._scan_directory = None
+                    self._scan_ready = completed.value
+        except _PendingInventory:
+            with self._progress_lock:
+                self._progress_complete = False
+            return _Scan(self._scan_total, free, (), False)
+        except Exception:
+            total = self._scan_total
+            try:
+                self._discard_scan()
+            except Exception:
+                self._closed = True
+            self._observations.clear()
+            self._scan_generation = 0
+            self._invalidate_progress()
+            return _Scan(total, free, (), False)
+
+    def _walk_scan(self):
         candidates = []
         observed: dict[Path, _Observation] = {}
-        # Keep queried paths ahead of historic removed-camera directories. The
-        # same entry/time budgets bound both retention and progress observations.
+        visited = []
         with self._progress_lock:
             previous_progress_by_path = dict(self._progress)
             previous_progress_complete = self._progress_complete
         progress = {name: _PathProgress() for name in previous_progress_by_path}
         generation = self._scan_generation + 1
-        try:
-            _budget(deadline)
-            self._admit_root()
-            free = _free_bytes(self._root)
-            with os.scandir(self._root) as directories:
-                for entry in directories:
-                    _budget(deadline)
-                    remaining_entries[0] -= 1
-                    if remaining_entries[0] < 0:
-                        raise _IncompleteStorage
-                    if _PATH_NAME.fullmatch(entry.name) is None:
-                        continue
-                    directory = self._root / entry.name
-                    directory_identity = self._directory(directory)
-                    identity = (directory_identity.st_dev, directory_identity.st_ino)
-                    track_progress = entry.name in progress or len(progress) < MAX_PROGRESS_PATHS
-                    previous_progress = previous_progress_by_path.get(entry.name)
-                    comparable = (
-                        previous_progress_complete
-                        and previous_progress is not None
-                        and previous_progress.directory_identity == identity
-                    )
-                    directory_total = 0
-                    signatures = {}
-                    progressed = False
-                    segments = []
-                    with os.scandir(directory) as files:
-                        for file in files:
-                            _budget(deadline)
-                            remaining_entries[0] -= 1
-                            if remaining_entries[0] < 0:
-                                raise _IncompleteStorage
-                            if not _segment_name(file.name):
-                                continue
-                            path = directory / file.name
-                            info = _file_info(path)
-                            now = time.monotonic()
-                            signature = self._signature(directory_identity, info)
-                            previous = self._observations.get(path)
-                            observation = (
-                                previous
-                                if previous is not None
-                                and previous.signature == signature
-                                and now >= previous.stable_since
-                                else _Observation(
-                                    signature,
-                                    now,
-                                    generation if self._scan_generation else 0,
-                                )
-                            )
-                            observed[path] = observation
-                            total += info.st_size
-                            directory_total += info.st_size
-                            if track_progress:
-                                signatures[file.name] = signature
-                                previous_signature = (
-                                    previous_progress.files.get(file.name) if comparable else None
-                                )
-                                if (
-                                    comparable
-                                    and info.st_size > 0
-                                    and (
-                                        previous_signature is None
-                                        or previous_signature[:4] != signature[:4]
-                                        or info.st_size > previous_signature[4]
-                                    )
-                                ):
-                                    progressed = True
-                            segments.append(
-                                _Segment(
-                                    path,
-                                    directory,
-                                    directory_identity,
-                                    info,
-                                    observation.stable_since,
-                                )
-                            )
-                    identity_state._same_directory(directory, directory_identity)
-                    if track_progress:
-                        now = time.monotonic()
-                        if not math.isfinite(now):
-                            raise _IncompleteStorage
-                        last_progress = previous_progress.last_progress if comparable else None
-                        if progressed:
-                            last_progress = now
-                        elif last_progress is not None and now < last_progress:
-                            last_progress = None
-                        progress[entry.name] = _PathProgress(
-                            identity, directory_total, last_progress, signatures
-                        )
-                    if segments:
-                        now = time.monotonic()
-                        newest = max(
-                            segments,
-                            key=lambda segment: (segment.identity.st_mtime_ns, segment.path.name),
-                        )
-                        latest_change = max(
-                            observed[segment.path].change_generation for segment in segments
-                        )
-                        candidates.extend(
-                            segment
-                            for segment in segments
-                            if segment is not newest
-                            # File timestamps can run backwards. Also protect
-                            # the latest creation/change seen across complete
-                            # scans, retaining ties rather than inventing their
-                            # order from directory enumeration. A cold baseline
-                            # cannot establish creation chronology.
-                            and (
-                                latest_change == 0
-                                or observed[segment.path].change_generation < latest_change
-                            )
-                            and now - segment.stable_since >= MIN_CLOSED_AGE_SECONDS
-                        )
-            self._admit_root()
-            _budget(deadline)
-            ordered = tuple(
-                sorted(
-                    candidates,
-                    key=lambda segment: (
-                        segment.stable_since,
-                        segment.identity.st_mtime_ns,
-                        str(segment.path),
-                    ),
+        with os.scandir(self._root) as directories:
+            for entry in directories:
+                yield True  # The caller charges this entry before admitting it.
+                if _PATH_NAME.fullmatch(entry.name) is None:
+                    continue
+                directory = self._root / entry.name
+                directory_identity = self._directory(directory)
+                self._scan_directory = (directory, directory_identity)
+                visited.append(self._scan_directory)
+                identity = (directory_identity.st_dev, directory_identity.st_ino)
+                track_progress = entry.name in progress or len(progress) < MAX_PROGRESS_PATHS
+                previous_progress = previous_progress_by_path.get(entry.name)
+                comparable = (
+                    previous_progress_complete
+                    and previous_progress is not None
+                    and previous_progress.directory_identity == identity
                 )
-            )
-            _budget(deadline)
-            self._observations = observed
-            self._scan_generation = generation
-            with self._progress_lock:
-                # Queries made while scanning may nominate current cameras in
-                # place of historical directories. Preserve those bounded slots.
-                updated = {name: progress.get(name, _PathProgress()) for name in self._progress}
-                for name, sample in progress.items():
-                    if len(updated) >= MAX_PROGRESS_PATHS:
-                        break
-                    updated.setdefault(name, sample)
-                self._progress = updated
-                self._progress_complete = True
-            return _Scan(total, free, ordered, True)
-        except Exception:
-            # An interrupted or untrusted scan breaks the observation history.
-            self._observations.clear()
-            self._scan_generation = 0
-            self._invalidate_progress()
-            return _Scan(total, free, (), False)
+                directory_total = 0
+                signatures = {}
+                progressed_at = None
+                segments = []
+                with os.scandir(directory) as files:
+                    for file in files:
+                        yield True
+                        if not _segment_name(file.name):
+                            continue
+                        path = directory / file.name
+                        info = _file_info(path)
+                        now = time.monotonic()
+                        signature = self._signature(directory_identity, info)
+                        previous = self._observations.get(path)
+                        observation = (
+                            previous
+                            if previous is not None
+                            and previous.signature == signature
+                            and now >= previous.stable_since
+                            else _Observation(
+                                signature, now, generation if self._scan_generation else 0
+                            )
+                        )
+                        observed[path] = observation
+                        self._scan_total += info.st_size
+                        directory_total += info.st_size
+                        if track_progress:
+                            signatures[file.name] = signature
+                            previous_signature = (
+                                previous_progress.files.get(file.name) if comparable else None
+                            )
+                            if (
+                                comparable
+                                and info.st_size > 0
+                                and (
+                                    previous_signature is None
+                                    or previous_signature[:4] != signature[:4]
+                                    or info.st_size > previous_signature[4]
+                                )
+                            ):
+                                progressed_at = now
+                        segments.append(
+                            _Segment(
+                                path, directory, directory_identity, info, observation.stable_since
+                            )
+                        )
+                identity_state._same_directory(directory, directory_identity)
+                self._scan_directory = None
+                if track_progress:
+                    now = time.monotonic()
+                    if not math.isfinite(now):
+                        raise _IncompleteStorage
+                    last_progress = previous_progress.last_progress if comparable else None
+                    if progressed_at is not None:
+                        last_progress = progressed_at
+                    elif last_progress is not None and now < last_progress:
+                        last_progress = None
+                    progress[entry.name] = _PathProgress(
+                        identity, directory_total, last_progress, signatures
+                    )
+                newest = None
+                latest_change = 0
+                for segment in segments:
+                    yield False
+                    if newest is None or (segment.identity.st_mtime_ns, segment.path.name) > (
+                        newest.identity.st_mtime_ns,
+                        newest.path.name,
+                    ):
+                        newest = segment
+                    latest_change = max(latest_change, observed[segment.path].change_generation)
+                for segment in segments:
+                    yield False
+                    if (
+                        segment is not newest
+                        and (
+                            latest_change == 0
+                            or observed[segment.path].change_generation < latest_change
+                        )
+                        and time.monotonic() - segment.stable_since >= MIN_CLOSED_AGE_SECONDS
+                    ):
+                        heapq.heappush(
+                            candidates,
+                            (
+                                segment.stable_since,
+                                segment.identity.st_mtime_ns,
+                                str(segment.path),
+                                segment,
+                            ),
+                        )
+        ordered = []
+        while candidates:
+            yield False
+            ordered.append(heapq.heappop(candidates)[-1])
+        return _PreparedInventory(
+            self._scan_total, tuple(ordered), observed, progress, tuple(visited), generation
+        )
+
+    def _publish_inventory(self, inventory: _PreparedInventory, deadline: float) -> _Scan:
+        # Never suspend between these checks and publication. A suspended walk
+        # may have observed earlier directories in another maintenance call.
+        # Retry only this final admission if its original time budget runs out;
+        # re-enumerating all files here would recreate the large-inventory trap.
+        def budget():
+            if time.monotonic() >= deadline:
+                raise _PendingInventory
+
+        budget()
+        for directory, info in inventory.visited:
+            budget()
+            identity_state._same_directory(directory, info)
+        budget()
+        self._admit_root()
+        free = _free_bytes(self._root)
+        budget()
+        self._observations = inventory.observed
+        self._scan_generation = inventory.generation
+        with self._progress_lock:
+            updated = {
+                name: inventory.progress.get(name, _PathProgress()) for name in self._progress
+            }
+            for name, sample in inventory.progress.items():
+                if len(updated) >= MAX_PROGRESS_PATHS:
+                    break
+                updated.setdefault(name, sample)
+            self._progress = updated
+            self._progress_complete = True
+        return _Scan(inventory.total_bytes, free, inventory.candidates, True)
 
     def _invalidate_progress(self) -> None:
         with self._progress_lock:
@@ -414,7 +537,10 @@ class RecordingStorage:
         """Report bounded, source-free recording-space admission without deleting."""
         deadline = time.monotonic() + MAX_STORAGE_SECONDS
         with self._lock:
-            return self._status(self._scan(deadline, [MAX_STORAGE_ENTRIES]))
+            scan = self._scan(deadline, [MAX_STORAGE_ENTRIES])
+            if scan.complete:
+                self._verifying = False
+            return self._status(scan)
 
     def configure_policy(
         self, *, max_bytes: int, min_free_bytes: int, retention_seconds: int
@@ -430,6 +556,8 @@ class RecordingStorage:
         ):
             raise ValueError("Recording storage bounds are invalid")
         with self._lock:
+            if self._closed:
+                raise RecordingStorageError("Recording storage is closed")
             self._admit_root()
             self._max_bytes = max_bytes
             self._min_free_bytes = min_free_bytes
@@ -449,8 +577,12 @@ class RecordingStorage:
         deadline = time.monotonic() + MAX_STORAGE_SECONDS
         with self._lock:
             remaining_entries = [MAX_STORAGE_ENTRIES]
+            verifying = self._verifying
             scan = self._scan(deadline, remaining_entries)
             if not scan.complete:
+                return self._status(scan)
+            if verifying:
+                self._verifying = False
                 return self._status(scan)
             cutoff = time.monotonic() - self._retention_seconds
             if self._status(scan).recording_allowed and (
@@ -503,4 +635,8 @@ class RecordingStorage:
                 except Exception:
                     self._invalidate_progress()
                     return StorageStatus(total, free, False, deleted)
-            return self._status(self._scan(deadline, remaining_entries), deleted)
+            self._verifying = True
+            verification = self._scan(deadline, remaining_entries)
+            if verification.complete:
+                self._verifying = False
+            return self._status(verification, deleted)

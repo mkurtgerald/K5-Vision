@@ -1,0 +1,224 @@
+diff --git a/client.go b/client.go
+index 078d251dbba68911eba48845cf4ea9f524041204..88e4082a272b34d4dea04f3fb3324321b6b957cc 100644
+--- a/client.go
++++ b/client.go
+@@ -579,6 +579,7 @@ type Client struct {
+ 	//
+ 
+ 	timeNow              func() time.Time
++	timeMonotonic        func() time.Duration
+ 	senderReportPeriod   time.Duration
+ 	receiverReportPeriod time.Duration
+ 	checkTimeoutPeriod   time.Duration
+@@ -722,6 +723,10 @@ func (c *Client) Start() error {
+ 	if c.timeNow == nil {
+ 		c.timeNow = time.Now
+ 	}
++	if c.timeMonotonic == nil {
++		epoch := time.Now()
++		c.timeMonotonic = func() time.Duration { return time.Since(epoch) }
++	}
+ 	if c.senderReportPeriod == 0 {
+ 		c.senderReportPeriod = 10 * time.Second
+ 	}
+@@ -1394,9 +1399,9 @@ func (c *Client) isInUDPTimeout() bool {
+ }
+ 
+ func (c *Client) isInTCPTimeout() bool {
+-	now := c.timeNow()
+-	lft := time.Unix(c.tcpLastInboundTime.Load(), 0)
+-	return now.Sub(lft) >= c.ReadTimeout
++	now := c.timeMonotonic()
++	last := time.Duration(c.tcpLastInboundTime.Load())
++	return now-last >= c.ReadTimeout
+ }
+ 
+ func (c *Client) doCheckTimeout() error {
+diff --git a/client_reader.go b/client_reader.go
+index eb60de7d0cfa0609681b0ac8e53512fe3d9cc906..beba43ce6015df61e6ede1534022d8b6d08eb503 100644
+--- a/client_reader.go
++++ b/client_reader.go
+@@ -54,8 +54,7 @@ func (r *clientReader) runInner() error {
+ 			return err
+ 		}
+ 
+-		now := r.c.timeNow()
+-		r.c.tcpLastInboundTime.Store(now.Unix())
++		r.c.tcpLastInboundTime.Store(int64(r.c.timeMonotonic()))
+ 
+ 		switch what := what.(type) {
+ 		case *base.Response:
+diff --git a/client_tcp_watchdog_clock_test.go b/client_tcp_watchdog_clock_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..96463f05b3d7f2a2d448407d5553f3f5fad45e09
+--- /dev/null
++++ b/client_tcp_watchdog_clock_test.go
+@@ -0,0 +1,86 @@
++package gortsplib
++
++import (
++	"bufio"
++	"errors"
++	"io"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/bluenviron/gortsplib/v5/pkg/base"
++	"github.com/bluenviron/gortsplib/v5/pkg/conn"
++)
++
++// Exercise the actual packet-reader store, without sockets or a modified
++// watchdog. This file also compiles against the unmodified upstream module.
++func k5TCPWatchdogInbound(t *testing.T, c *Client) {
++	t.Helper()
++	c.chResponse = make(chan *base.Response, 1)
++	c.conn = conn.NewConn(bufio.NewReader(strings.NewReader(
++		"RTSP/1.0 200 OK\r\nCSeq: 1\r\n\r\n")), io.Discard)
++	r := clientReader{c: c, terminate: make(chan struct{})}
++	if err := r.runInner(); !errors.Is(err, io.EOF) {
++		t.Fatalf("packet reader must retain EOF behavior: %v", err)
++	}
++	select {
++	case response := <-c.chResponse:
++		if response.StatusCode != base.StatusOK {
++			t.Fatal("the inbound response was not dispatched")
++		}
++	default:
++		t.Fatal("the inbound response was not dispatched")
++	}
++}
++
++func k5TCPWatchdogClockFixture(t *testing.T, wall *time.Time, timeout time.Duration) *Client {
++	t.Helper()
++	c := &Client{
++		Scheme: "rtsp", Host: "127.0.0.1:8554", ReadTimeout: timeout,
++		timeNow: func() time.Time { return *wall },
++	}
++	if err := c.Start(); err != nil {
++		t.Fatal(err)
++	}
++	// Start initializes the real default clock. Its idle actor is then stopped
++	// before this synchronous reader/watchdog test changes the injected UTC.
++	c.Close()
++	k5TCPWatchdogInbound(t, c)
++	return c
++}
++
++func TestClientTCPWatchdogWallClockForward(t *testing.T) {
++	wall := time.Date(2026, time.November, 22, 0, 0, 0, 0, time.UTC)
++	c := k5TCPWatchdogClockFixture(t, &wall, 30*time.Second)
++	if c.isInTCPTimeout() {
++		t.Fatal("a newly received packet is not idle")
++	}
++	wall = wall.Add(48 * time.Hour)
++	if c.isInTCPTimeout() {
++		t.Fatal("a UTC forward step expired a freshly received TCP packet")
++	}
++	if !c.timeNow().Equal(wall) {
++		t.Fatal("the actual UTC clock must remain available to protocol timestamps")
++	}
++}
++
++func TestClientTCPWatchdogWallClockBackward(t *testing.T) {
++	wall := time.Date(2026, time.November, 22, 0, 0, 0, 0, time.UTC)
++	c := k5TCPWatchdogClockFixture(t, &wall, time.Second)
++	wall = wall.Add(-48 * time.Hour)
++	deadline := time.Now().Add(3 * time.Second)
++	for !c.isInTCPTimeout() && time.Now().Before(deadline) {
++		time.Sleep(10 * time.Millisecond)
++	}
++	if !c.isInTCPTimeout() {
++		t.Fatal("a UTC backward step prevented the configured genuine-idle timeout")
++	}
++	// Another actual response refreshes liveness without correcting UTC.
++	k5TCPWatchdogInbound(t, c)
++	if c.isInTCPTimeout() {
++		t.Fatal("a newly received packet did not refresh liveness")
++	}
++	if !c.timeNow().Equal(wall) {
++		t.Fatal("the actual UTC clock was changed")
++	}
++}
+diff --git a/client_tcp_watchdog_elapsed_test.go b/client_tcp_watchdog_elapsed_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..39e337d9ba7d8ba264db3be6cc9874e2d1e5a709
+--- /dev/null
++++ b/client_tcp_watchdog_elapsed_test.go
+@@ -0,0 +1,76 @@
++package gortsplib
++
++import (
++	"bufio"
++	"errors"
++	"io"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/bluenviron/gortsplib/v5/pkg/conn"
++)
++
++func TestClientTCPWatchdogElapsedDeadline(t *testing.T) {
++	for _, offset := range []time.Duration{-48 * time.Hour, 0, 48 * time.Hour} {
++		t.Run(offset.String(), func(t *testing.T) {
++			elapsed := time.Duration(0)
++			wall := time.Date(2026, time.November, 22, 0, 0, 0, 0, time.UTC).Add(offset)
++			c := &Client{
++				ReadTimeout:   time.Second,
++				timeNow:       func() time.Time { return wall },
++				timeMonotonic: func() time.Duration { return elapsed },
++			}
++			k5TCPWatchdogInbound(t, c)
++			if c.tcpLastInboundTime.Load() != 0 || c.isInTCPTimeout() {
++				t.Fatal("zero elapsed time is a valid fresh packet timestamp")
++			}
++			elapsed = time.Second - time.Nanosecond
++			if c.isInTCPTimeout() {
++				t.Fatal("the configured read timeout was shortened")
++			}
++			elapsed = time.Second
++			if !c.isInTCPTimeout() {
++				t.Fatal("the configured read timeout was extended")
++			}
++			k5TCPWatchdogInbound(t, c)
++			if c.isInTCPTimeout() {
++				t.Fatal("another inbound packet must refresh liveness")
++			}
++			// A concurrent packet can be newer than a checker's sampled clock.
++			c.tcpLastInboundTime.Store(int64(elapsed + time.Nanosecond))
++			if c.isInTCPTimeout() {
++				t.Fatal("a raced newer packet must not appear idle")
++			}
++		})
++	}
++}
++
++func TestClientTCPWatchdogEOFDoesNotRefresh(t *testing.T) {
++	elapsed := time.Duration(0)
++	c := &Client{ReadTimeout: time.Second, timeMonotonic: func() time.Duration { return elapsed }}
++	k5TCPWatchdogInbound(t, c)
++	elapsed = 2 * time.Second
++	c.conn = conn.NewConn(bufio.NewReader(strings.NewReader("")), io.Discard)
++	r := clientReader{c: c, terminate: make(chan struct{})}
++	if err := r.runInner(); !errors.Is(err, io.EOF) {
++		t.Fatalf("socket EOF handling changed: %v", err)
++	}
++	if !c.isInTCPTimeout() {
++		t.Fatal("an EOF refreshed liveness instead of retaining the idle timeout")
++	}
++}
++
++func TestClientTCPWatchdogConcurrentRefresh(t *testing.T) {
++	c := &Client{ReadTimeout: time.Second}
++	c.tcpLastInboundTime.Store(0)
++	c.timeMonotonic = func() time.Duration {
++		// Model a checker yielding during its clock sample while the packet
++		// reader records fresh traffic. The atomic load must follow the clock.
++		c.tcpLastInboundTime.Store(int64(5 * time.Second))
++		return 5 * time.Second
++	}
++	if c.isInTCPTimeout() {
++		t.Fatal("a concurrent inbound refresh was ignored by the timeout checker")
++	}
++}

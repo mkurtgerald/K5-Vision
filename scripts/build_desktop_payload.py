@@ -12,6 +12,7 @@ import gzip
 import hashlib
 import io
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -32,6 +33,23 @@ PERSON_MANIFEST = ROOT / "src/k5vision/data/operator-person-model-manifest.json"
 PERSON_MANIFEST_SHA256 = "b15ac68ec04b1fa9b1c95b320e2694469b8e764049fac544d6986a940f1fd794"
 PERSON_MODEL_ROOT = "runtime/Lib/site-packages/k5vision/data/person-models"
 _BUILD_PHASE = "initialization"
+OPERATOR_WEB_ASSETS = (
+    "index.html",
+    "app.css",
+    "app.js",
+    "wall.css",
+    "wall.js",
+    "timeline.css",
+    "timeline.js",
+    "admin.css",
+    "admin.js",
+    "analytics.css",
+    "analytics.js",
+    "settings.css",
+    "settings.js",
+    "recording-settings.css",
+    "recording-settings.js",
+)
 _BUILD_PHASES = frozenset(
     {
         "initialization",
@@ -41,11 +59,13 @@ _BUILD_PHASES = frozenset(
         "dependency_install",
         "product_wheel_build",
         "product_wheel_install",
+        "operator_web_assets",
         "cpp_runtime",
         "person_model_manifest",
         "person_model_xml",
         "person_model_weights",
         "native_workers",
+        "recorder_service",
         "required_notices",
         "decoder_binary",
         "decoder_source_ffmpeg",
@@ -70,6 +90,22 @@ _SOURCE_PHASES = {
     "aomedia/aom": "decoder_source_libaom",
 }
 
+
+NATIVE_DECODER_CHILD_SMOKE = (
+    "from pathlib import Path\n"
+    "from k5vision.operator_events import _RecordedNativeWorker\n"
+    "from k5vision.operator_analytics_person import load_installed_person_configuration\n"
+    "person = load_installed_person_configuration({})\n"
+    "assert person is not None\n"
+    "worker = _RecordedNativeWorker(person)\n"
+    "try:\n"
+    "    assert worker.request(None) is None\n"
+    "    assert worker._person_ready\n"
+    "    assert worker.request(Path.cwd() / '__k5_missing_native_probe__.mp4') is None\n"
+    "finally:\n"
+    "    worker.close()\n"
+    "print('embedded smoke: native_detector_child', flush=True)\n"
+)
 
 IDENTITY_CRYPTO_SMOKE = (
     "import jwt,cffi,cryptography,base64; "
@@ -133,6 +169,39 @@ def digest(path: Path) -> str:
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
+def admit_operator_web_assets(site_packages: Path) -> list[dict[str, object]]:
+    """Require the actual built wheel to retain every served operator asset.
+
+    Source and installed bytes stay exact; newline adaptation is not part of
+    native payload admission. The final payload manifest seals these files too.
+    """
+    source = ROOT / "src/k5vision/operator_web"
+    installed = site_packages / "k5vision/operator_web"
+    expected = set(OPERATOR_WEB_ASSETS)
+    if {
+        item.name for item in source.iterdir() if item.suffix in {".js", ".css", ".html"}
+    } != expected:
+        raise ValueError("Operator asset source inventory differs")
+    result = []
+    for name in OPERATOR_WEB_ASSETS:
+        original, bundled = source / name, installed / name
+        if any(path.is_symlink() or not path.is_file() for path in (original, bundled)):
+            raise ValueError("Required operator asset is not bundled")
+        if not 0 < original.stat().st_size <= 2 * 1024**2:
+            raise ValueError("Operator source asset is empty or oversized")
+        expected_bytes = original.read_bytes()
+        if bundled.stat().st_size != len(expected_bytes) or bundled.read_bytes() != expected_bytes:
+            raise ValueError("Bundled operator asset bytes differ")
+        result.append(
+            {
+                "path": "k5vision/operator_web/" + name,
+                "bytes": len(expected_bytes),
+                "sha256": hashlib.sha256(expected_bytes).hexdigest(),
+            }
+        )
+    return result
+
+
 def admit(path: Path, identity: dict[str, object]) -> None:
     if path.is_symlink() or not path.is_file():
         raise ValueError("Donor file is not an ordinary file")
@@ -153,6 +222,58 @@ def download(identity: dict[str, object], destination: Path) -> None:
                 raise ValueError("Donor size exceeded")
             stream.write(block)
     admit(destination, identity)
+
+
+def provision_recorder_service(payload: Path, identity: dict[str, object]) -> dict[str, object]:
+    """Bundle the exact WinSW SCM wrapper and its unchanged MIT notice.
+
+    The wrapper is never downloaded by an installed recorder. The build seal
+    covers its bytes, immutable service XML and complete original license.
+    """
+    phase("recorder_service")
+    executable = payload / "K5VisionRecorder.exe"
+    download(identity, executable)
+    notice = ROOT / str(identity["license_path"])
+    if notice.is_symlink() or not notice.is_file() or digest(notice) != identity["license_sha256"]:
+        raise ValueError("Recorder service donor license identity mismatch")
+    destination = payload / "licenses" / "WinSW-MIT.txt"
+    destination.parent.mkdir(exist_ok=True)
+    shutil.copyfile(notice, destination)
+    configuration = ROOT / "windows" / "desktop" / "K5VisionRecorder.xml"
+    if configuration.is_symlink() or not configuration.is_file():
+        raise ValueError("Recorder service configuration missing")
+    shutil.copyfile(configuration, payload / "K5VisionRecorder.xml")
+    return {
+        **identity,
+        "executable": "K5VisionRecorder.exe",
+        "configuration": "K5VisionRecorder.xml",
+        "configuration_sha256": digest(payload / "K5VisionRecorder.xml"),
+        "retained_notice": "licenses/WinSW-MIT.txt",
+        "runtime_downloads": False,
+        "service_name": "K5VisionRecorder",
+        "service_account": "NT SERVICE\\K5VisionRecorder",
+        "automatic_start": True,
+    }
+
+
+def acquire_worker_archive(identity: dict[str, object], archive: Path, name: str) -> None:
+    """Reuse the same hash-admitted CI donor without an unnecessary second download.
+
+    The independent official archive remains mandatory for upstream license
+    admission. A supplied cache with mismatched bytes fails closed; there is
+    no fallback to a different binary, version or unverified source.
+    """
+    if name not in {"mediamtx", "caddy"}:
+        raise ValueError("Worker cache component is not admitted")
+    tool_root = os.environ.get("K5_DONOR_TOOL_ROOT")
+    if tool_root:
+        source = Path(tool_root) / f"{name}.zip"
+        admit(source, identity)
+        with source.open("rb") as existing, archive.open("xb") as target:
+            shutil.copyfileobj(existing, target, length=1024 * 1024)
+        admit(archive, identity)
+    else:
+        download(identity, archive)
 
 
 def extract_python(archive: Path, runtime: Path) -> None:
@@ -296,25 +417,32 @@ def worker_download(source: Path, name: str) -> dict[str, object]:
         raise ValueError("Worker platform identity invalid")
     artifact = artifacts[0]
     admit(source, {"bytes": artifact["executable_bytes"], "sha256": artifact["executable_sha256"]})
+    archive_bytes = artifact.get("archive_bytes")
+    if archive_bytes is None:
+        if name == "mediamtx" and manifest["version"] == "v1.21.2-k5-monotonic1":
+            raise ValueError("Derivative worker archive size pin missing")
+        archive_bytes = {"mediamtx": 28583662, "caddy": 18479498}[name]
+    if type(archive_bytes) is not int or not 0 < archive_bytes <= 1_073_741_824:
+        raise ValueError("Worker archive size pin invalid")
     return {
         "component": manifest["component"],
         "version": manifest["version"],
         "url": artifact["url"],
         "sha256": artifact["sha256"],
-        "bytes": {"mediamtx": 28583662, "caddy": 18479498}[name],
+        "bytes": archive_bytes,
         "executable": artifact["executable"],
         "executable_sha256": artifact["executable_sha256"],
         "executable_bytes": artifact["executable_bytes"],
         "license_sha256": manifest["license_sha256"],
+        "retained_files": artifact.get("retained_files", []),
     }
 
 
-
 def bundle_worker(payload: Path, source: Path, name: str) -> dict[str, object]:
-    """Seal exact official worker bytes and their original license at build time.
+    """Seal exact admitted worker bytes and their original notices at build time.
 
     Network access belongs solely to CI; installed users never fetch workers.
-    Both the supplied CI executable and the independent official archive must
+    Both the supplied CI executable and the independently admitted archive must
     match the existing fixed executable identity before packaging.
     """
     identity = worker_download(source, name)
@@ -324,11 +452,12 @@ def bundle_worker(payload: Path, source: Path, name: str) -> dict[str, object]:
     pin = {"bytes": identity["executable_bytes"], "sha256": identity["executable_sha256"]}
     admit(source, pin)
     archive = payload.parent / ("worker-" + name + "-official.zip")
-    download(identity, archive)
+    acquire_worker_archive(identity, archive, name)
     root = payload / "workers"
     root.mkdir(exist_ok=True)
 
     with ZipFile(archive) as zipped:
+
         def copy_member(member: str, destination: Path, maximum: int, sha: str) -> dict:
             matches = [entry for entry in zipped.infolist() if entry.filename == member]
             if len(matches) != 1:
@@ -364,15 +493,49 @@ def bundle_worker(payload: Path, source: Path, name: str) -> dict[str, object]:
         license_entries = [entry for entry in zipped.infolist() if entry.filename == "LICENSE"]
         if len(license_entries) != 1:
             raise ValueError("Worker upstream license missing")
-        license_info = copy_member(
-            "LICENSE", license_path, 65536, identity["license_sha256"]
-        )
+        license_info = copy_member("LICENSE", license_path, 65536, identity["license_sha256"])
+        retained = []
+        seen = set()
+        retained_files = identity.get("retained_files", [])
+        if not isinstance(retained_files, list) or len(retained_files) > 512:
+            raise ValueError("Worker retained notice inventory invalid")
+        for entry in retained_files:
+            member = entry.get("path")
+            relative = PurePosixPath(member) if isinstance(member, str) else None
+            if (
+                relative is None
+                or relative.is_absolute()
+                or ".." in relative.parts
+                or "\\" in member
+                or ":" in member
+                or relative.as_posix() != member
+                or member in seen
+                or not (
+                    member.startswith(("licenses/", "provenance/"))
+                    or member == "notice-inventory.json"
+                )
+                or type(entry.get("bytes")) is not int
+                or not 0 < entry["bytes"] <= 2_000_000
+                or not isinstance(entry.get("sha256"), str)
+                or not re.fullmatch(r"[0-9a-f]{64}", entry["sha256"])
+            ):
+                raise ValueError("Worker retained notice identity invalid")
+            seen.add(member)
+            destination = payload / "licenses" / name / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            info = copy_member(member, destination, entry["bytes"], entry["sha256"])
+            if info["bytes"] != entry["bytes"]:
+                raise ValueError("Worker retained notice size mismatch")
+            retained.append({"path": destination.relative_to(payload).as_posix(), **info})
+        if identity["version"] == "v1.21.2-k5-monotonic1" and not retained:
+            raise ValueError("Derivative worker retained notices missing")
     admit(binary, pin)
     return {
         **identity,
         "payload_executable": binary.relative_to(payload).as_posix(),
         "payload_license": license_path.relative_to(payload).as_posix(),
         "payload_license_bytes": license_info["bytes"],
+        "payload_retained_files": retained,
     }
 
 
@@ -677,6 +840,8 @@ def build(args: argparse.Namespace) -> None:
         scripts = site_packages / name
         if scripts.exists():
             shutil.rmtree(scripts)
+    phase("operator_web_assets")
+    admit_operator_web_assets(site_packages)
     cpp_runtime = provision_cpp_runtime(payload, donors["cpp_runtime"])
     person_model = provision_person_model(payload)
     phase("native_workers")
@@ -690,7 +855,7 @@ def build(args: argparse.Namespace) -> None:
         newline="\n",
     )
     licenses = payload / "licenses"
-    licenses.mkdir()
+    licenses.mkdir(exist_ok=True)
     phase("required_notices")
     for source in (
         "LICENSE",
@@ -713,6 +878,7 @@ def build(args: argparse.Namespace) -> None:
     identity_crypto = provision_identity_crypto_material(payload, donors["identity_crypto"])
     phase("onvif_notice")
     onvif_adaptation = onvif_source_adaptation(payload)
+    recorder_service = provision_recorder_service(payload, donors["winsw"])
     # The official Windows interpreter explicitly requires external end users
     # to agree to terms protecting its Microsoft Distributable Code. Present
     # these terms in the normal installer license page, with upstream text
@@ -741,6 +907,11 @@ def build(args: argparse.Namespace) -> None:
                 "admin_user_management": True,
                 "role_permissions": True,
                 "camera_access_controls": True,
+                "camera_video_settings": True,
+                "automatic_wall_layout": True,
+                "motion_recording": True,
+                "camera_trigger_zones": True,
+                "writable_video_codecs": ["H264"],
                 "person_analytics_bundled": True,
                 "background_person_events": True,
                 "storage_settings": True,
@@ -753,6 +924,9 @@ def build(args: argparse.Namespace) -> None:
                 "neural_adapter_v2": True,
                 "analytics_event_adapter": True,
                 "shared_neural_host": False,
+                "unattended_recording_service": recorder_service,
+                "windows_service": True,
+                "interactive_client_owns_recording": False,
                 "manual_stream_uri_required": False,
                 "python": donors["python"],
                 "worker_downloads": workers,
@@ -798,9 +972,10 @@ def build(args: argparse.Namespace) -> None:
             "load_installed_person_configuration,_PersonDetector; "
             "person=load_installed_person_configuration({}); assert person is not None; "
             "print('embedded smoke: person_configuration', flush=True); "
-            "detector=_PersonDetector(person); "
+            "detector=_PersonDetector(person, inference_threads=1, fixed_view_input=True); "
             "print('embedded smoke: person_detector', flush=True); "
             "assert detector.infer(bytes(544*320*4),544,320,544*4,0)==(); "
+            "assert detector.infer(bytes(544*306*4),544,306,544*4,0)==(); "
             "print('embedded smoke: person_inference', flush=True); "
             r"assert re.search(r'FFMPEG:\s+YES',cv2.getBuildInformation()); "
             "import importlib.util; "
@@ -810,6 +985,12 @@ def build(args: argparse.Namespace) -> None:
             "assert importlib.util.find_spec('pip') is None",
         ]
     )
+    # Package admission must exercise the sealed model and a subsequent decode
+    # through the real child and Windows Job Object, not just the parent import.
+    # The child primes on synthetic zero pixels; the only path it reads for
+    # decoding is intentionally nonexistent. No camera media is involved.
+    phase("embedded_runtime_execution")
+    run([str(runtime / "python.exe"), "-I", "-B", "-c", NATIVE_DECODER_CHILD_SMOKE])
     generated = output / "PayloadIdentity.generated.cs"
     phase("payload_manifest")
     manifest_sha = write_manifest(payload, args.head_sha, generated)

@@ -17,24 +17,29 @@ AppVersion=0.1 Beta Candidate
 AppPublisher=K5 Vision
 AppPublisherURL=https://github.com/mkurtgerald/K5-Vision
 AppSupportURL=https://github.com/mkurtgerald/K5-Vision/issues
-DefaultDirName={localappdata}\K5VisionDesktop
+DefaultDirName={autopf}\K5 Vision
+UsePreviousAppDir=no
 DefaultGroupName=K5 Vision
 DisableProgramGroupPage=yes
 DisableDirPage=yes
-PrivilegesRequired=lowest
+PrivilegesRequired=admin
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0.17763
 WizardStyle=modern
 SetupLogging=no
-CloseApplications=no
+CloseApplications=yes
+CloseApplicationsFilter=K5Vision.exe
 RestartApplications=no
 UninstallDisplayIcon={app}\K5Vision.exe
 OutputDir={#OutputRoot}
 OutputBaseFilename=K5VisionSetup
-; Favor fast, low-memory extraction for the offline Windows setup; all installed payload hashes remain verified.
+; The native guard is extracted by InitializeSetup *before* the first wizard page.
+; Independent ZIP blocks avoid inflating the entire 200+ MB payload just to
+; reach that guard during an upgrade/reversal. The same sealed-file SHA/ACL
+; admission still runs before install success; no integrity check is skipped.
 Compression=zip/7
-SolidCompression=yes
+SolidCompression=no
 LicenseFile={#PayloadRoot}\licenses\INSTALLATION-LICENSE.txt
 
 [Tasks]
@@ -50,20 +55,33 @@ Source: "{#PayloadRoot}\K5Vision.exe"; DestName: "K5VisionInstallGuard.exe"; Fla
 Source: "{#PayloadRoot}\payload-manifest.json"; DestDir: "{tmp}"; DestName: "k5-install-seal.json"; Flags: deleteafterinstall; AfterInstall: AdmitExtractedPayload
 
 [Icons]
-Name: "{userprograms}\K5 Vision"; Filename: "{app}\K5Vision.exe"; WorkingDir: "{app}"
-Name: "{userdesktop}\K5 Vision"; Filename: "{app}\K5Vision.exe"; WorkingDir: "{app}"; Tasks: desktopicon
+Name: "{commonprograms}\K5 Vision"; Filename: "{app}\K5Vision.exe"; WorkingDir: "{app}"
+Name: "{commondesktop}\K5 Vision"; Filename: "{app}\K5Vision.exe"; WorkingDir: "{app}"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\K5Vision.exe"; Description: "Launch K5 Vision"; Flags: nowait postinstall skipifsilent; Check: InstallationVerified
+Filename: "{app}\K5Vision.exe"; Description: "Launch K5 Vision"; Flags: nowait postinstall skipifsilent runasoriginaluser; Check: InstallationVerified
 
 [Code]
+type
+  TMutexSecurity = record
+    Length: LongWord;
+    Descriptor: THandle;
+    Inherit: Integer;
+  end;
+
 var
   InstallationMutex: THandle;
   InstallationLease: Boolean;
   FinalPayloadVerified: Boolean;
+  FinalFailureStage: String;
+  FinalFailureCode: Integer;
 
-function CreateMutex(Security: Integer; InitialOwner: Integer; Name: String): THandle;
+function CreateMutex(var Security: TMutexSecurity; InitialOwner: Integer; Name: String): THandle;
   external 'CreateMutexW@kernel32.dll stdcall';
+function ConvertSecurityDescriptor(Text: String; Revision: LongWord; var Descriptor: THandle; Size: Integer): Boolean;
+  external 'ConvertStringSecurityDescriptorToSecurityDescriptorW@advapi32.dll stdcall';
+function LocalFree(Handle: THandle): THandle;
+  external 'LocalFree@kernel32.dll stdcall';
 function WaitForSingleObject(Handle: THandle; Milliseconds: LongWord): LongWord;
   external 'WaitForSingleObject@kernel32.dll stdcall';
 function ReleaseMutex(Handle: THandle): Boolean;
@@ -84,20 +102,8 @@ begin
 end;
 
 function ValidMutexName(const Name: String): Boolean;
-var
-  Prefix: String;
-  I: Integer;
 begin
-  Prefix := 'Global\K5VisionDesktop-S-1-';
-  Result := (Length(Name) > Length(Prefix)) and (Length(Name) <= 224) and
-    (Copy(Name, 1, Length(Prefix)) = Prefix);
-  if not Result then exit;
-  for I := Length(Prefix) + 1 to Length(Name) do begin
-    if ((Name[I] < '0') or (Name[I] > '9')) and (Name[I] <> '-') then begin
-      Result := False;
-      exit;
-    end;
-  end;
+  Result := Name = 'Global\K5VisionMachineInstallation';
 end;
 
 function AdmittedGuard(const Filename: String): Boolean;
@@ -106,6 +112,7 @@ var
   IdentityFile, Name: String;
   Identity: AnsiString;
   WaitResult: LongWord;
+  Security: TMutexSecurity;
 begin
   Result := False;
   if CompareText(GetSHA256OfFile(Filename), '{#LauncherSha}') <> 0 then begin
@@ -129,14 +136,22 @@ begin
   DeleteFile(IdentityFile);
   Name := String(Identity);
   if not ValidMutexName(Name) then exit;
-  InstallationMutex := CreateMutex(0, 0, Name);
+  Security.Length := SizeOf(Security);
+  Security.Descriptor := 0;
+  Security.Inherit := 0;
+  if not ConvertSecurityDescriptor('D:P(A;;GA;;;SY)(A;;GA;;;BA)', 1, Security.Descriptor, 0) then exit;
+  try
+    InstallationMutex := CreateMutex(Security, 0, Name);
+  finally
+    LocalFree(Security.Descriptor);
+  end;
   if InstallationMutex = 0 then exit;
   WaitResult := WaitForSingleObject(InstallationMutex, 0);
   // WAIT_OBJECT_0 or WAIT_ABANDONED grants exclusive ownership. Keep this
   // lease throughout every file copy/removal and release it only on exit.
   if (WaitResult <> 0) and (WaitResult <> $80) then begin
     ReleaseInstallationLease();
-    MsgBox('K5 Vision is still running. Choose Stop and Exit in K5 Vision before installing or uninstalling.', mbInformation, MB_OK);
+    MsgBox('Another K5 Vision installation is running. Close that installer before continuing.', mbInformation, MB_OK);
     exit;
   end;
   InstallationLease := True;
@@ -149,6 +164,27 @@ begin
   Result := AdmittedGuard(ExpandConstant('{tmp}\K5VisionInstallGuard.exe'));
 end;
 
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  ExitCode: Integer;
+begin
+  Result := '';
+  if not Exec(ExpandConstant('{tmp}\K5VisionInstallGuard.exe'),
+    '--installation-service-legacy-check', '', SW_HIDE, ewWaitUntilTerminated, ExitCode) or (ExitCode <> 0) then begin
+    Result := 'K5 Vision could not safely inspect existing Windows profiles. No application files or recordings were changed. Sign in with the Windows account that owns the previous K5 site and try again.';
+    exit;
+  end;
+  // Stop only after the operator chooses Install. Never replace live recorder
+  // code, and never execute a prior installation to control an unknown service.
+  if not Exec(ExpandConstant('{tmp}\K5VisionInstallGuard.exe'),
+    '--installation-service-stop', '', SW_HIDE, ewWaitUntilTerminated, ExitCode) or (ExitCode <> 0) then
+    Result := 'K5 Vision could not stop and verify its recording service. No application files were replaced. Your account and recordings are preserved.';
+  if Result = '' then
+    if not Exec(ExpandConstant('{tmp}\K5VisionInstallGuard.exe'),
+      '--installation-service-prepare', '', SW_HIDE, ewWaitUntilTerminated, ExitCode) or (ExitCode <> 0) then
+      Result := 'K5 Vision could not secure its application folder. No application files were replaced. Your account and recordings are preserved.';
+end;
+
 procedure AdmitExtractedPayload();
 var
   ExitCode: Integer;
@@ -157,7 +193,7 @@ begin
   // Check all installed sealed bytes, owner and ACL before log commit.
   // Inno may still have in-flight uninstall files here. The final strict-tree
   // admission below cannot tolerate any unlisted installed file.
-  if not Exec(ExpandConstant('{app}\K5Vision.exe'), '--installation-extraction-check', '',
+  if not Exec(ExpandConstant('{tmp}\K5VisionInstallGuard.exe'), '--installation-machine-extraction-check', '',
     SW_HIDE, ewWaitUntilTerminated, ExitCode) or (ExitCode <> 0) then
     RaiseException('K5 Vision could not verify the installed application. Your account and recordings were preserved.');
 end;
@@ -175,10 +211,45 @@ begin
     // Inno 6.4.3 catches exceptions from this callback and continues. Keep
     // failure latched before Exec, including if Exec itself raises.
     FinalPayloadVerified := False;
+    FinalFailureStage := 'seal';
+    FinalFailureCode := -1;
+    WizardForm.StatusLabel.Caption := 'Securing K5 Vision...';
     try
-      FinalPayloadVerified := Exec(ExpandConstant('{app}\K5Vision.exe'),
-        '--installation-payload-check', '', SW_HIDE, ewWaitUntilTerminated, ExitCode);
+      FinalPayloadVerified := Exec(ExpandConstant('{tmp}\K5VisionInstallGuard.exe'),
+        '--installation-service-seal', '', SW_HIDE, ewWaitUntilTerminated, ExitCode);
+      FinalFailureCode := ExitCode;
       if FinalPayloadVerified then FinalPayloadVerified := ExitCode = 0;
+      // The launcher is excluded from its own payload manifest. Pin its bytes
+      // after private code sealing and before its first elevated execution.
+      if FinalPayloadVerified then begin
+        FinalFailureStage := 'launcher';
+        FinalFailureCode := 1;
+        FinalPayloadVerified := CompareText(GetSHA256OfFile(ExpandConstant('{app}\K5Vision.exe')), '{#LauncherSha}') = 0;
+      end;
+      if FinalPayloadVerified then begin
+        FinalFailureStage := 'payload';
+        WizardForm.StatusLabel.Caption := 'Verifying K5 Vision...';
+        FinalPayloadVerified := Exec(ExpandConstant('{app}\K5Vision.exe'),
+          '--installation-payload-check', '', SW_HIDE, ewWaitUntilTerminated, ExitCode);
+        FinalFailureCode := ExitCode;
+        if FinalPayloadVerified then FinalPayloadVerified := ExitCode = 0;
+      end;
+      if FinalPayloadVerified then begin
+        FinalFailureStage := 'install';
+        WizardForm.StatusLabel.Caption := 'Preparing the recording service...';
+        FinalPayloadVerified := Exec(ExpandConstant('{app}\K5Vision.exe'),
+          '--installation-service-install', '', SW_HIDE, ewWaitUntilTerminated, ExitCode);
+        FinalFailureCode := ExitCode;
+        if FinalPayloadVerified then FinalPayloadVerified := ExitCode = 0;
+      end;
+      if FinalPayloadVerified then begin
+        FinalFailureStage := 'start';
+        WizardForm.StatusLabel.Caption := 'Starting the recording service...';
+        FinalPayloadVerified := Exec(ExpandConstant('{app}\K5Vision.exe'),
+          '--installation-service-start', '', SW_HIDE, ewWaitUntilTerminated, ExitCode);
+        FinalFailureCode := ExitCode;
+        if FinalPayloadVerified then FinalPayloadVerified := ExitCode = 0;
+      end;
     except
       FinalPayloadVerified := False;
     end;
@@ -193,7 +264,8 @@ begin
     // Inno writes its success labels AFTER ssPostInstall. Override them here.
     WizardForm.FinishedHeadingLabel.Caption := 'K5 Vision installation failed';
     WizardForm.FinishedLabel.Caption :=
-      'K5 Vision could not verify the installed application. Do not use this installation. Your account and recordings were preserved.';
+      'K5 Vision could not verify or start the recording service. Run Setup again to repair this installation. Your account and recordings were preserved. ' +
+      'Install check: ' + FinalFailureStage + '/' + IntToStr(FinalFailureCode) + '.';
     WizardForm.RunList.Visible := False;
   end;
 end;
@@ -217,6 +289,7 @@ end;
 function InitializeUninstall(): Boolean;
 var
   Installed, Captured: String;
+  ExitCode: Integer;
 begin
   Result := False;
   Installed := ExpandConstant('{app}\K5Vision.exe');
@@ -237,6 +310,11 @@ begin
   end;
   try
     Result := AdmittedGuard(Captured);
+    if Result then
+      Result := Exec(Captured, '--installation-service-remove', '', SW_HIDE,
+        ewWaitUntilTerminated, ExitCode) and (ExitCode = 0);
+    if not Result then
+      MsgBox('K5 Vision could not safely remove its recording service. Your account and recordings were preserved.', mbError, MB_OK);
   finally
     DeleteFile(Captured);
   end;

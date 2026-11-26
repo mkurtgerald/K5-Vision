@@ -263,15 +263,46 @@ def _onvif_enroll(page, *, name, fixture, reject_wrong=False, run_discovery=Fals
     """Use actual credential/profile controls without entering a stream address."""
     __tracebackhide__ = True
     source_requests = []
+    discovery_completed = False
+    diagnostic = {} if diagnostic is None else diagnostic
+    # A previous camera may have succeeded before this one fails. Never
+    # report that previous camera's HTTP 200 as this camera's response.
+    diagnostic.pop("onvif_profiles_http_status", None)
+    diagnostic["onvif_profiles_request_dispatched"] = False
+    diagnostic["onvif_profiles_response_headers"] = False
+    diagnostic["onvif_profiles_request_finished"] = False
+    diagnostic["onvif_profiles_request_failed"] = False
+
+    def profile_request(request):
+        return (
+            request.method == "POST"
+            and urlsplit(request.url).path == "/api/v1/operator/camera-profiles"
+        )
 
     def observe(request):
         material = request.url + (request.post_data or "")
         if "rtsp://" in material.lower() or '"source_uri"' in material:
             source_requests.append(True)
+        if profile_request(request):
+            diagnostic["onvif_profiles_request_dispatched"] = True
+
+    def observe_profile_response(response):
+        if profile_request(response.request):
+            diagnostic["onvif_profiles_response_headers"] = True
+            diagnostic["onvif_profiles_http_status"] = response.status
+
+    def observe_profile_finished(request):
+        if profile_request(request):
+            diagnostic["onvif_profiles_request_finished"] = True
+
+    def observe_profile_failed(request):
+        if profile_request(request):
+            diagnostic["onvif_profiles_request_failed"] = True
 
     page.on("request", observe)
-    discovery_completed = False
-    diagnostic = {} if diagnostic is None else diagnostic
+    page.on("response", observe_profile_response)
+    page.on("requestfinished", observe_profile_finished)
+    page.on("requestfailed", observe_profile_failed)
     try:
         diagnostic["onvif_enrollment_step"] = "open_dialog"
         page.locator("#add-camera-button").click()
@@ -323,8 +354,16 @@ def _onvif_enroll(page, *, name, fixture, reject_wrong=False, run_discovery=Fals
             )
         ) as profiles:
             page.locator("#test-camera-connection").click()
+        # The public HTTP status is safe qualification evidence; never retain
+        # the authenticated request, private camera endpoint, or SOAP response.
+        diagnostic["onvif_profiles_http_status"] = profiles.value.status
         _require(profiles.value.status == 200, "Actual ONVIF credential/profile request failed")
+        # Receiving HTTP headers does not establish that the installed backend
+        # completed its response body. Mark this boundary without retaining
+        # any camera endpoint, credentials, profile, SOAP, or media payload.
+        diagnostic["onvif_enrollment_step"] = "read_profile_response_body"
         profile_payload = profiles.value.json()
+        diagnostic["onvif_enrollment_step"] = "validate_profile_response"
         _require(
             set(profile_payload) == {"probe_id", "expires_in_seconds", "profiles", "clock"},
             "Profile response left the bounded public contract",
@@ -382,6 +421,9 @@ def _onvif_enroll(page, *, name, fixture, reject_wrong=False, run_discovery=Fals
         return camera, discovery_completed
     finally:
         page.remove_listener("request", observe)
+        page.remove_listener("response", observe_profile_response)
+        page.remove_listener("requestfinished", observe_profile_finished)
+        page.remove_listener("requestfailed", observe_profile_failed)
 
 
 def _rtsp_enroll(
@@ -515,7 +557,7 @@ def _wall_state(page):
                 available:true,viewport:{width:innerWidth,height:innerHeight},
                 scroll:{window:scrollY,main:document.querySelector('.main-content')?.scrollTop??null},
                 panel_visible:visible(document.getElementById('wall-panel')),
-                layout:['1','4','9'].includes(layout)?layout:'unknown',
+                layout:['auto','1','4','9'].includes(layout)?layout:'unknown',
                 visible_warning_count:Array.from(document.querySelectorAll('.warning,[role=alert]'))
                   .filter(visible).length,
                 clock_warning_visible:visible(document.getElementById('recorder-time-warning')),
@@ -577,41 +619,35 @@ def _decoded_video(page, selector, color, *, diagnostic=None):
 def _decoded_video_proof(page, selector, color, diagnostic):
     """Check a particular visible video, including independent camera-wall tiles."""
     __tracebackhide__ = True
-    page.wait_for_function(
-        """selector => {
+    sample = page.wait_for_function(
+        """({selector, color}) => {
           const video = document.querySelector(selector);
-          return video && video.getBoundingClientRect().width > 0 &&
+          const ready = video && video.getBoundingClientRect().width > 0 &&
             video.readyState >= 2 && !video.paused && video.videoWidth === 320 &&
-            video.videoHeight === 240 && video.currentTime > 0.15 &&
-            video.getVideoPlaybackQuality().totalVideoFrames >= 4;
-        }""",
-        arg=selector,
-        timeout=25_000,
-    )
-    diagnostic["video_phase"] = "pixels"
-    decoded = page.evaluate(
-        """selector => {
-          const video = document.querySelector(selector);
+            video.videoHeight === 240 && video.currentTime > 0.15;
+          if (!ready) return false;
+          const frames = video.getVideoPlaybackQuality().totalVideoFrames;
+          if (!(frames >= 4)) return false;
           const canvas = document.createElement('canvas');
           canvas.width = canvas.height = 1;
           const context = canvas.getContext('2d');
           context.drawImage(video, 0, 0, 1, 1);
-          return {
-            frames: video.getVideoPlaybackQuality().totalVideoFrames,
-            rgb: Array.from(context.getImageData(0, 0, 1, 1).data).slice(0, 3)
-          };
+          const rgb = Array.from(context.getImageData(0, 0, 1, 1).data).slice(0, 3);
+          const [red, green, blue] = rgb;
+          const isolated = color === 'red' ? red > 180 && green < 70 && blue < 70
+            : color === 'blue' ? blue > 180 && red < 70 && green < 70
+              : color === 'lime' ? green > 180 && red < 70 && blue < 70
+                : color === 'yellow' ? red > 180 && green > 180 && blue < 70 : false;
+          return isolated ? {frames, rgb} : false;
         }""",
-        selector,
+        arg={"selector": selector, "color": color},
+        timeout=25_000,
     )
+    try:
+        decoded = sample.json_value()
+    finally:
+        sample.dispose()
     diagnostic.update(video_decoded_frames=decoded["frames"], video_rgb=decoded["rgb"])
-    red, green, blue = decoded["rgb"]
-    isolated = {
-        "red": red > 180 and green < 70 and blue < 70,
-        "blue": blue > 180 and red < 70 and green < 70,
-        "lime": green > 180 and red < 70 and blue < 70,
-        "yellow": red > 180 and green > 180 and blue < 70,
-    }.get(color, False)
-    _require(isolated, "Decoded video did not match the selected generated camera")
     diagnostic["video_phase"] = "complete"
     return decoded["frames"]
 
@@ -786,7 +822,7 @@ def test_timeline_clip_selects_playable_span_after_short_recording_fragment(inte
     assert _playable_timeline_span(intervals) == expected
 
 
-def _seed_recorded_history(recording_directory, ffmpeg, parent, *, color="red"):
+def _seed_recorded_history(recording_directory, ffmpeg, parent, *, color="red", prepare_file=None):
     """Create real donor-readable historical media, not a mocked history response.
 
     Eighteen ten-minute files provide three hours of decodable footage with an
@@ -848,6 +884,8 @@ def _seed_recorded_history(recording_directory, ffmpeg, parent, *, color="red"):
             if os.name == "posix":
                 os.fchmod(output.fileno(), 0o600)
             output.write(payload)
+        if prepare_file is not None:
+            prepare_file(destination)
         files.append(destination)
     return {
         "first": first,
@@ -1670,6 +1708,8 @@ def test_camera_setup_preserves_next_dialog_during_previous_media_completion():
                     "analytics.css": "text/css",
                     "settings.js": "application/javascript",
                     "settings.css": "text/css",
+                    "recording-settings.js": "application/javascript",
+                    "recording-settings.css": "text/css",
                 }[name]
                 route.fulfill(
                     status=200,
@@ -1942,6 +1982,7 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
     outage_diagnostic = {}
     recording_diagnostic = {}
     switch_diagnostic = {}
+    logout_diagnostic = {"logout_check": "not_started"}
     started = time.monotonic()
     receipt = {
         "schema_version": "1",
@@ -2156,8 +2197,9 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
         page.wait_for_function("""() => {
             const status = document.getElementById('service-status').textContent;
             const storage = document.getElementById('storage-status').textContent;
+            const alerts = document.getElementById('recorder-alerts');
             return status === 'Media service ready' && storage.includes('recording limit') &&
-              storage.includes('disk free');
+              storage.includes('disk free') && alerts !== null && alerts.hidden;
         }""")
         diagnostics = client.json("/api/v1/operator/status")
         _require(
@@ -2169,12 +2211,26 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
                 "analytics_status",
                 "server_utc",
                 "clock",
+                "recorder_alerts",
             }
             and diagnostics["worker_status"] == "ready"
             and diagnostics["analytics_status"] == "disabled"
             and diagnostics["max_recording_bytes"] == 20 * 1024**3
             and diagnostics["storage"]["recording_allowed"] is True,
             "Operator service and storage status was incomplete",
+        )
+        alerts = diagnostics["recorder_alerts"]
+        _require(
+            type(alerts) is dict
+            and set(alerts) == {"visible", "available", "monitoring", "active", "history"}
+            and alerts["visible"] is True
+            and alerts["available"] is True
+            and alerts["monitoring"] is True
+            and type(alerts["active"]) is list
+            and alerts["active"] == []
+            and type(alerts["history"]) is list
+            and alerts["history"] == [],
+            "Recorder alert monitoring was not ready on the fresh site",
         )
         _assert_recorder_time_health(page, client)
         receipt["recorder_time_health_displayed"] = True
@@ -2898,40 +2954,63 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
         )
         logout_recording_before = _camera_recording_bytes(product, camera_ids)
         stage = "logout_revocation"
+        logout_diagnostic["logout_check"] = "sign_out_request"
         page.locator("#sign-out-button").click()
         page.locator("#sign-in").wait_for(state="visible")
+        logout_diagnostic["logout_check"] = "media_revocation"
+        logout_diagnostic["logout_media_checked"] = 0
         for url in (*live_urls, *playback_urls):
-            _require(
-                context.request.get(client.origin + url).status == 401,
-                "Sign-out left cached camera media authorized",
-            )
-        _require(
-            client.get("/api/v1/operator/cameras")[0] == 401,
-            "Sign-out did not revoke the browser human session",
+            # Retain only a bounded count/status, never a camera media URL.
+            status = context.request.get(client.origin + url).status
+            logout_diagnostic["logout_last_media_status"] = status if 100 <= status <= 599 else 0
+            _require(status == 401, "Sign-out left cached camera media authorized")
+            logout_diagnostic["logout_media_checked"] += 1
+        logout_diagnostic["logout_check"] = "human_revocation"
+        session_status = client.get("/api/v1/operator/cameras")[0]
+        logout_diagnostic["logout_session_status"] = (
+            session_status if 100 <= session_status <= 599 else 0
         )
         _require(
+            session_status == 401,
+            "Sign-out did not revoke the browser human session",
+        )
+        logout_diagnostic["logout_check"] = "media_teardown"
+        logout_diagnostic["logout_visible_media_cleared"] = (
             page.locator("#live-video").get_attribute("src") is None
             and page.locator("#playback-video").get_attribute("src") is None
-            and page.locator("#wall-panel video").count() == 0,
+            and page.locator("#wall-panel video").count() == 0
+        )
+        _require(
+            logout_diagnostic["logout_visible_media_cleared"],
             "Sign-out did not reset visible media",
         )
         receipt["logout_destroyed_wall_tiles"] = True
-        runtime._wait(
-            lambda: all(
+        logout_diagnostic["logout_check"] = "background_recording_growth"
+
+        def signed_out_recording_advances():
+            growth = [
                 after > before
                 for after, before in zip(
                     _camera_recording_bytes(product, camera_ids),
                     logout_recording_before,
                     strict=True,
                 )
-            ),
+            ]
+            logout_diagnostic["logout_recording_growth_flags"] = growth
+            return all(growth)
+
+        runtime._wait(
+            signed_out_recording_advances,
             label="Signing out stops wall players and preserves background recording",
             product=product,
             timeout=15,
         )
         receipt["logout_background_recording_continues"] = True
+        logout_diagnostic["logout_check"] = "browser_storage"
         _assert_no_browser_storage(page)
+        logout_diagnostic["logout_check"] = "script_errors"
         _require(not script_errors, "Operator browser raised an uncaught script error")
+        logout_diagnostic["logout_check"] = "complete"
         receipt["logout_revoked_media_and_session"] = True
         receipt["browser_script_errors"] = 0
         stage = "browser_closing"
@@ -2993,6 +3072,7 @@ def test_real_browser_two_camera_live_history_playback_and_logout(
             **outage_diagnostic,
             **recording_diagnostic,
             **switch_diagnostic,
+            **logout_diagnostic,
             "cleanup_failure_codes": cleanup_failures,
             "product_thread_alive": bool(product and product.thread.is_alive()),
             "product_thread_failed": bool(product and product.failed),

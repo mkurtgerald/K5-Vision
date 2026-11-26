@@ -374,6 +374,7 @@ def install_operator_onvif_api(
                 management_port=probe.port,
                 management_secure=probe.secure,
                 source_uri=profile.source_uri,
+                profile_key=hashlib.sha256(profile.token.encode("utf-8")).hexdigest(),
                 session=session,
                 onvif=True,
                 before_store=lambda: vault.claimed(payload.probe_id, probe, session),

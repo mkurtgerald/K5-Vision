@@ -61,11 +61,22 @@ class _Client:
         self.token = ""
         self.transport_failure = None
         self.last_http_status = None
+        self.last_api_error_code = None
 
-    def get(self, route, *, method="GET", data=None, media=False, max_bytes=1_048_576):
+    def get(
+        self,
+        route,
+        *,
+        method="GET",
+        data=None,
+        media=False,
+        max_bytes=1_048_576,
+        request_deadline_seconds=None,
+    ):
         __tracebackhide__ = True
         self.transport_failure = None
         self.last_http_status = None
+        self.last_api_error_code = None
         headers = {"Origin": self.origin}
         if self.token and not media:
             headers["Authorization"] = "Bearer " + self.token
@@ -74,9 +85,15 @@ class _Client:
             payload = json.dumps(data).encode()
             headers["Content-Type"] = "application/json"
         request = Request(self.origin + route, data=payload, headers=headers, method=method)
+        if request_deadline_seconds is not None and (
+            type(request_deadline_seconds) is not int or request_deadline_seconds != 7
+        ):
+            raise ValueError("Explicit preview deadline must be exactly seven seconds")
         began = time.monotonic()
         try:
-            response = self.opener.open(request, timeout=3)
+            response = self.opener.open(
+                request, timeout=3 if request_deadline_seconds is None else 7
+            )
         except HTTPError as error:
             response = error
         except OSError as error:
@@ -105,11 +122,21 @@ class _Client:
         with response:
             status = response.code
             self.last_http_status = status
-            deadline = time.monotonic() + 15
+            deadline = time.monotonic() + 15 if request_deadline_seconds is None else began + 7
             body = bytearray()
             while len(body) <= max_bytes:
-                if time.monotonic() >= deadline:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
                     pytest.fail("Local operator response exceeded its deadline")
+                if request_deadline_seconds is not None:
+                    native = response.fp if isinstance(response, HTTPError) else response
+                    stream = getattr(native, "fp", None)
+                    if stream is not None:
+                        connection = getattr(getattr(stream, "raw", None), "_sock", None)
+                        if connection is None:
+                            raise RuntimeError("Explicit response deadline socket is unavailable")
+                        if connection.fileno() >= 0:
+                            connection.settimeout(remaining)
                 part = response.read1(min(65_536, max_bytes + 1 - len(body)))
                 if not part:
                     break
@@ -121,6 +148,28 @@ class _Client:
     def json(self, route, *, expected=200, **kwargs):
         __tracebackhide__ = True
         status, body, _ = self.get(route, **kwargs)
+        if status != expected and route.endswith("/motion-preview"):
+            try:
+                detail = json.loads(body).get("detail")
+            except (ValueError, AttributeError, TypeError):
+                detail = None
+            self.last_api_error_code = (
+                detail
+                if type(detail) is str
+                and detail
+                in {
+                    "motion_invalid_request",
+                    "motion_policy_conflict",
+                    "motion_source_changed",
+                    "motion_preview_expired",
+                    "motion_preview_unavailable",
+                    "motion_zones_empty",
+                    "motion_policy_unavailable",
+                    "motion_busy",
+                    "motion_permission_changed",
+                }
+                else "other"
+            )
         assert status == expected, "Operator API returned an unexpected status"
         return json.loads(body)
 
@@ -512,6 +561,21 @@ def test_assembled_operator_product_login_live_recording_logout_and_restart(
             record_testsuite_property(
                 "operator_product_transport_failure",
                 json.dumps(client.transport_failure, sort_keys=True),
+            )
+            # Failure-only independent health probe. Do not retry the failed
+            # authentication or extend its original three-second budget.
+            # Distinguishes a blocked login path from loss of control-plane
+            # responsiveness during a real native restart. Never retain the
+            # request, response body, credentials, paths or source addresses.
+            health_class = "unreachable"
+            try:
+                health_status, _body, _headers = _Client(product_ports[0]).get("/api/v1/health")
+                health_class = "healthy" if health_status == 200 else "non_200"
+            except RuntimeError:
+                pass
+            record_testsuite_property(
+                "operator_product_failure_health",
+                json.dumps({"independent_health": health_class}, sort_keys=True),
             )
         print("Product phase: stop and reap owned application and fixtures", flush=True)
         cleanup_failures = 0

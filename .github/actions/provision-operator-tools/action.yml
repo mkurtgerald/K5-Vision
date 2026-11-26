@@ -1,21 +1,29 @@
 name: Prepare pinned native operator acceptance tools
-description: Admit official MediaMTX/Caddy archives and development-only FFmpeg by immutable hashes.
+description: Admit pinned MediaMTX/Caddy archives and development-only FFmpeg by immutable hashes.
+inputs:
+  manifest-root:
+    description: Checked-out source directory containing the exact donor manifests to provision.
+    required: false
+    default: .
 runs:
   using: composite
   steps:
     - name: Verify and provision pinned native development tools
       shell: pwsh
+      env:
+        K5_TOOL_MANIFEST_ROOT: ${{ inputs.manifest-root }}
       run: |
         $ErrorActionPreference = "Stop"
-        $mediaManifest = Get-Content -LiteralPath src/k5vision/data/mediamtx-donor-manifest.json -Raw | ConvertFrom-Json
+        $manifestRoot = (Resolve-Path -LiteralPath (Join-Path $env:GITHUB_WORKSPACE $env:K5_TOOL_MANIFEST_ROOT)).Path
+        $mediaManifest = Get-Content -LiteralPath (Join-Path $manifestRoot 'src/k5vision/data/mediamtx-donor-manifest.json') -Raw | ConvertFrom-Json
         $mediaArtifacts = @($mediaManifest.artifacts | Where-Object { $_.platform -eq "windows_amd64" })
         if ($mediaArtifacts.Count -ne 1) { throw "Expected one pinned native Windows MediaMTX archive" }
         $mediaArtifact = $mediaArtifacts[0]
-        $caddyManifest = Get-Content -LiteralPath src/k5vision/data/caddy-donor-manifest.json -Raw | ConvertFrom-Json
+        $caddyManifest = Get-Content -LiteralPath (Join-Path $manifestRoot 'src/k5vision/data/caddy-donor-manifest.json') -Raw | ConvertFrom-Json
         $caddyArtifacts = @($caddyManifest.artifacts | Where-Object { $_.platform -eq "windows_amd64" })
         if ($caddyArtifacts.Count -ne 1) { throw "Expected one pinned native Windows Caddy archive" }
         $caddyArtifact = $caddyArtifacts[0]
-        $testTools = Get-Content -LiteralPath src/k5vision/data/mediamtx-donor-test-tools.json -Raw | ConvertFrom-Json
+        $testTools = Get-Content -LiteralPath (Join-Path $manifestRoot 'src/k5vision/data/mediamtx-donor-test-tools.json') -Raw | ConvertFrom-Json
         foreach ($field in @("url", "sha256", "version", "license", "source")) {
           if ([string]::IsNullOrWhiteSpace([string]$testTools.$field)) {
             throw "Development tool manifest is incomplete"
@@ -25,12 +33,67 @@ runs:
         New-Item -ItemType Directory -Path $toolRoot | Out-Null
         "K5_DONOR_TOOL_ROOT=$toolRoot" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
 
+        function Get-ReleaseAssetFallback {
+          param([string]$Url, [string]$ExpectedHash, [string]$Archive)
+          # Only official GitHub release assets qualify. A transient transport fault
+          # never licenses different bytes or a changed provenance digest.
+          if ($Url -cnotmatch '^https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/releases/download/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+\.zip)$') {
+            throw "Pinned archive has no admitted release API fallback"
+          }
+          $owner, $repository, $tag, $filename = $Matches[1], $Matches[2], $Matches[3], $Matches[4]
+          $headers = @{
+            "Accept" = "application/vnd.github+json"
+            "User-Agent" = "K5-Vision-pinned-artifact-admission"
+            "X-GitHub-Api-Version" = "2022-11-28"
+          }
+          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$owner/$repository/releases/tags/$tag" -Headers $headers -TimeoutSec 30
+          if ([string]$release.tag_name -cne $tag) { throw "Pinned release identity differs" }
+          $expectedDigest = "sha256:" + $ExpectedHash.ToLowerInvariant()
+          $assets = @($release.assets | Where-Object {
+            $_.name -ceq $filename -and
+            $_.browser_download_url -ceq $Url -and
+            $_.digest -ceq $expectedDigest
+          })
+          if ($assets.Count -ne 1 -or [long]$assets[0].id -le 0) {
+            throw "Pinned release asset metadata or digest differs"
+          }
+          $headers["Accept"] = "application/octet-stream"
+          $assetId = [long]$assets[0].id
+          Invoke-WebRequest -Uri "https://api.github.com/repos/$owner/$repository/releases/assets/$assetId" -Headers $headers -OutFile $Archive -TimeoutSec 180
+        }
+
         function Get-VerifiedArchive {
           param([string]$Url, [string]$ExpectedHash, [string]$Archive, [string]$Destination)
           if ($Url -notmatch '^https://[^\s]+$' -or $ExpectedHash -notmatch '^[a-fA-F0-9]{64}$') {
             throw "Native tool archive identity is invalid"
           }
-          Invoke-WebRequest -Uri $Url -OutFile $Archive -TimeoutSec 180
+          # Only retry finite transport outages. Manifest/hash mismatches are
+          # always terminal, and neither archive URLs nor response text enter logs.
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            try {
+              Invoke-WebRequest -Uri $Url -OutFile $Archive -TimeoutSec 180
+              break
+            } catch {
+              $response = $_.Exception.Response
+              $status = if ($null -ne $response) { [int]$response.StatusCode } else { 0 }
+              Remove-Item -LiteralPath $Archive -Force -ErrorAction SilentlyContinue
+              if ($status -notin @(408, 429, 502, 503, 504)) {
+                throw "Native tool archive download was refused"
+              }
+              if ($attempt -eq 3) {
+                Write-Host "Pinned archive direct transport exhausted (HTTP $status); trying verified upstream release API"
+                try {
+                  Get-ReleaseAssetFallback -Url $Url -ExpectedHash $ExpectedHash -Archive $Archive
+                } catch {
+                  Remove-Item -LiteralPath $Archive -Force -ErrorAction SilentlyContinue
+                  throw "Pinned archive and verified release API transport unavailable"
+                }
+                break
+              }
+              Write-Host "Pinned archive transport HTTP $status; retrying bounded download"
+              Start-Sleep -Seconds (2 * $attempt)
+            }
+          }
           $actualHash = (Get-FileHash -LiteralPath $Archive -Algorithm SHA256).Hash
           if (-not [string]::Equals($actualHash, $ExpectedHash, [StringComparison]::OrdinalIgnoreCase)) {
             throw "Native tool archive SHA256 mismatch"

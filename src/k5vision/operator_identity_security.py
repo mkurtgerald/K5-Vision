@@ -403,19 +403,28 @@ class AccountSecurityService:
             epoch = self._epochs.get(account.id, 0)
             if epoch > started_epoch:
                 raise AccountSecurityError("Account authentication changed")
-            return self._current(_Pending(account, version, self._elapsed(), epoch=epoch))
+            pending = _Pending(account, version, self._elapsed(), epoch=epoch)
+        return self._current(pending)
 
     def validate_primary_proof(self, account, version, epoch, authority_check=None):
-        with self._lock:
-            return self._current(
-                _Pending(
-                    account, version, self._elapsed(), epoch=epoch, authority_check=authority_check
-                )
+        return self._current(
+            _Pending(
+                account, version, self._elapsed(), epoch=epoch, authority_check=authority_check
             )
+        )
 
-    def _current(self, pending: _Pending):
+    def _require_epoch(self, pending: _Pending):
+        """Compare only in-memory revocation state while the state lock is held."""
         if pending.epoch != self._epochs.get(pending.account.id, 0):
             raise AccountSecurityError("Account authentication changed")
+
+    def _current(self, pending: _Pending):
+        # A login worker can wait on durable credential/provider state. The
+        # synchronous session-revocation listener must still be able to advance
+        # its epoch and clear pending authentication on the HTTP event loop.
+        # External authority callbacks can perform I/O too (for example OIDC).
+        with self._lock:
+            self._require_epoch(pending)
         if pending.authority_check is not None and not pending.authority_check():
             raise AccountSecurityError("Account authentication changed")
         try:
@@ -424,6 +433,8 @@ class AccountSecurityService:
             raise AccountSecurityUnavailable("Account security state unavailable") from None
         if current is None:
             raise AccountSecurityError("Account authentication changed")
+        with self._lock:
+            self._require_epoch(pending)
         return current
 
     def _password(self, account, password):
@@ -472,17 +483,24 @@ class AccountSecurityService:
     ) -> int:
         """Called before *any* password-authenticated session is issued."""
         with self._lock:
-            if started_epoch is not None:
-                self.primary_current(account, credential_version, started_epoch)
+            epoch = self._epochs.get(account.id, 0)
+            if started_epoch is not None and epoch > started_epoch:
+                raise AccountSecurityError("Account authentication changed")
             pending = _Pending(
                 account,
                 credential_version,
                 self._elapsed() + _LIFETIME,
-                epoch=self._epochs.get(account.id, 0),
+                epoch=epoch,
                 authority_check=authority_check,
             )
-            self._current(pending)
-            status = self.store.status(account.id)
+        if started_epoch is not None:
+            self._current(_Pending(account, credential_version, self._elapsed(), epoch=epoch))
+        self._current(pending)
+        status = self.store.status(account.id)
+        with self._lock:
+            # Keep the original proof epoch: a logout during either durable
+            # read must not be recaptured as a new authenticated attempt.
+            self._require_epoch(pending)
             if not status["mfa_enabled"]:
                 return pending.epoch
             self._prune()

@@ -13,13 +13,17 @@ import struct
 from dataclasses import dataclass
 from pathlib import PureWindowsPath
 from threading import Lock
+from uuid import UUID
 
 _ADMINISTRATORS = "S-1-5-32-544"
 _SYSTEM = "S-1-5-18"
+_USERS = "S-1-5-32-545"
+_RECORDER_ACCOUNT = "NT SERVICE\\K5VisionRecorder"
 _OWNER_RIGHTS = "S-1-3-4"
 _CREATOR_OWNER = "S-1-3-0"
 _TRUSTED_INSTALLER = "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"
 _ANCESTOR_MUTATION = 0x010D0150  # DELETE, WRITE_DAC/OWNER, DELETE_CHILD, WRITE_EA/ATTRIBUTES, SACL
+_CONTAINER_METADATA = 0x00000110  # WRITE_EA and WRITE_ATTRIBUTES only.
 _FILE_ALL = 0x001F01FF
 _GENERIC = (
     (0x80000000, 0x00120089),
@@ -101,6 +105,7 @@ def _check_policy(
     private: bool,
     require_file_inheritance: bool,
     trusted_installer_verified: bool,
+    recorder_program_data: bool = False,
 ) -> None:
     trusted = {current_user, _ADMINISTRATORS, _SYSTEM}
     if not private and trusted_installer_verified:
@@ -120,7 +125,18 @@ def _check_policy(
         elif sid == _CREATOR_OWNER and inherit_only:
             sid = current_user  # Future files are created by this process, not an unknown owner.
         mask = _expanded_mask(entry.mask)
-        if sid not in trusted and mask & (0xFFFFFFFF if private else _ANCESTOR_MUTATION):
+        forbidden = 0xFFFFFFFF if private else _ANCESTOR_MUTATION
+        if (
+            not private
+            and recorder_program_data
+            and sid == _USERS
+            and not entry.mask & 0x50000000  # Never admit GENERIC_WRITE or GENERIC_ALL.
+        ):
+            # Windows' native shared ProgramData container grants Users 0x116.
+            # Only its metadata bits differ from ordinary ancestor admission;
+            # namespace replacement and security changes remain forbidden.
+            forbidden &= ~_CONTAINER_METADATA
+        if sid not in trusted and mask & forbidden:
             raise WindowsIdentitySecurityError("Windows identity path grants unsafe access")
         if sid in trusted and entry.flags & 0x01 and mask & 0x03 == 0x03:
             file_inheritance = True
@@ -283,6 +299,58 @@ def check_windows_volume(path: str | os.PathLike[str]) -> None:
         raise WindowsIdentitySecurityError("Windows identity volume aliases are unsupported")
 
 
+def _known_program_data() -> PureWindowsPath:
+    """Resolve the native shared container without trusting an environment value."""
+    shell = ctypes.WinDLL("shell32", use_last_error=True)
+    ole = ctypes.WinDLL("ole32", use_last_error=True)
+    shell.SHGetKnownFolderPath.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    shell.SHGetKnownFolderPath.restype = ctypes.c_int32
+    ole.CoTaskMemFree.argtypes = [ctypes.c_void_p]
+    ole.CoTaskMemFree.restype = None
+    identifier = ctypes.create_string_buffer(UUID("62ab5d82-fdc1-4dc3-a9dd-070d1d495d97").bytes_le)
+    result = ctypes.c_void_p()
+    try:
+        if shell.SHGetKnownFolderPath(identifier, 0, None, ctypes.byref(result)) != 0:
+            raise WindowsIdentitySecurityError("Windows known container is unavailable")
+        if not result.value:
+            raise WindowsIdentitySecurityError("Windows known container is unavailable")
+        path = PureWindowsPath(ctypes.wstring_at(result))
+        if not path.is_absolute() or not re.fullmatch(r"[A-Za-z]:", path.drive):
+            raise WindowsIdentitySecurityError("Windows known container is unsupported")
+        return path
+    finally:
+        if result.value:
+            ole.CoTaskMemFree(result)
+
+
+def _recorder_program_data_ancestor(path, native, current_user: str) -> bool:
+    """Scope metadata admission to the real recorder token and exact known folder."""
+    try:
+        sid_size, domain_size, use = ctypes.c_uint32(68), ctypes.c_uint32(256), ctypes.c_uint32()
+        sid, domain = ctypes.create_string_buffer(68), ctypes.create_unicode_buffer(256)
+        if not native.security.LookupAccountNameW(
+            None,
+            _RECORDER_ACCOUNT,
+            sid,
+            ctypes.byref(sid_size),
+            domain,
+            ctypes.byref(domain_size),
+            ctypes.byref(use),
+        ):
+            return False
+        if current_user != native.sid(ctypes.addressof(sid)):
+            return False
+        return PureWindowsPath(path) == _known_program_data()
+    except (WindowsIdentitySecurityError, OSError, ValueError, TypeError, AttributeError):
+        # Failed evidence never creates an alternate trust path.
+        return False
+
+
 def check_windows_security(
     path: str | os.PathLike[str],
     *,
@@ -295,11 +363,24 @@ def check_windows_security(
     installer_used = owner == _TRUSTED_INSTALLER or any(
         entry.sid == _TRUSTED_INSTALLER for entry in entries
     )
+    current_user = native.current_user()
+    recorder_program_data = (
+        not private
+        and any(
+            entry.kind == 0
+            and not entry.flags & 0x08
+            and entry.sid == _USERS
+            and _expanded_mask(entry.mask) & _CONTAINER_METADATA
+            for entry in entries
+        )
+        and _recorder_program_data_ancestor(path, native, current_user)
+    )
     _check_policy(
         owner,
         entries,
-        native.current_user(),
+        current_user,
         private=private,
         require_file_inheritance=require_file_inheritance,
         trusted_installer_verified=not private and installer_used and native.trusted_installer(),
+        recorder_program_data=recorder_program_data,
     )

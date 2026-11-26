@@ -12,7 +12,14 @@ from pathlib import Path
 _TRUE = {
     "native_windows_time_administration",
     "real_native_supervisor",
-    "native_payload_private_staging",
+    "native_programfiles_installed_payload",
+    "actual_gui_installer",
+    "actual_gui_account_setup",
+    "installed_service_session_zero",
+    "installed_service_api",
+    "native_gui_time_approval",
+    "native_approval_helper_observed",
+    "no_console_windows",
     "native_configuration_readback",
     "native_resync_requested",
     "native_invalid_action_rejected",
@@ -27,7 +34,12 @@ _TRUE = {
     "utc_restored",
     "independent_restoration_watchdog",
 }
-_FALSE = {"user_terminal_required", "absolute_accuracy_certified", "physical_camera_acceptance"}
+_FALSE = {
+    "user_terminal_required",
+    "absolute_accuracy_certified",
+    "physical_camera_acceptance",
+    "interactive_uac_consent_observed",
+}
 _BOOL = {
     "native_resync_succeeded",
     "upstream_unavailable",
@@ -52,10 +64,16 @@ def _unique(pairs):
 
 
 def verify(
-    report: Path, *, expected_head: str, supervisor_sha256: str, payload_manifest_sha256: str
+    report: Path,
+    *,
+    expected_head: str,
+    installer_sha256: str,
+    supervisor_sha256: str,
+    payload_manifest_sha256: str,
 ):
     _require(re.fullmatch(r"[a-f0-9]{40}", expected_head) is not None)
     _require(_HASH.fullmatch(supervisor_sha256) is not None)
+    _require(_HASH.fullmatch(installer_sha256) is not None)
     _require(_HASH.fullmatch(payload_manifest_sha256) is not None)
     _require(0 < report.stat().st_size <= 1024**2)
     root = ET.fromstring(report.read_bytes())
@@ -86,8 +104,9 @@ def verify(
     _require(len(values) == 1)
     receipt = json.loads(values[0], object_pairs_hook=_unique, parse_constant=lambda _: None)
     _require(type(receipt) is dict)
-    _require(type(receipt.get("schema_version")) is int and receipt["schema_version"] == 1)
+    _require(type(receipt.get("schema_version")) is int and receipt["schema_version"] == 2)
     _require(receipt.get("head_sha") == expected_head)
+    _require(receipt.get("installer_sha256") == installer_sha256)
     _require(receipt.get("supervisor_sha256") == supervisor_sha256)
     _require(receipt.get("payload_manifest_sha256") == payload_manifest_sha256)
     _require(all(receipt.get(key) is True for key in _TRUE))
@@ -111,6 +130,7 @@ def verify(
         | {
             "schema_version",
             "head_sha",
+            "installer_sha256",
             "supervisor_sha256",
             "payload_manifest_sha256",
             "duration_seconds",
@@ -124,12 +144,14 @@ def main():
     parser.add_argument("report", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--expected-head", required=True)
+    parser.add_argument("--installer-sha256", required=True)
     parser.add_argument("--supervisor-sha256", required=True)
     parser.add_argument("--payload-manifest-sha256", required=True)
     args = parser.parse_args()
     receipt = verify(
         args.report,
         expected_head=args.expected_head,
+        installer_sha256=args.installer_sha256,
         supervisor_sha256=args.supervisor_sha256,
         payload_manifest_sha256=args.payload_manifest_sha256,
     )

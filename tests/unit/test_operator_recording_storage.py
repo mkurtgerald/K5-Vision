@@ -548,7 +548,7 @@ def test_simultaneously_observed_changes_are_all_protected_without_scan_order_gu
     assert pre_step.exists() and all(path.exists() for path in changed)
 
 
-def test_complete_scans_prune_observation_map_and_incomplete_scan_discards_age_confidence(
+def test_complete_scans_prune_observation_map_and_budget_pause_keeps_private_confidence(
     root, monkeypatch, clock
 ) -> None:
     _free(monkeypatch, 500)
@@ -567,9 +567,15 @@ def test_complete_scans_prune_observation_map_and_incomplete_scan_discards_age_c
         limited.setattr(storage_module, "MAX_STORAGE_ENTRIES", 2)
         status = storage.prune()
     assert not status.recording_allowed and status.deleted_segments == 0
-    assert storage._observations == {} and closed.exists()
-    assert storage.prune().deleted_segments == 0
-    clock.now += 20
+    assert set(storage._observations) == {closed, newest} and closed.exists()
+    assert storage.recording_files(closed.parent.name) is None
+    # A bounded pause publishes no partial inventory. The same resumed walk
+    # may use prior complete monotonic observations only after full admission.
+    # The re-created file is the latest observed change despite its older
+    # timestamp; a budget pause must not erase that newest-file protection.
+    assert storage.prune().deleted_segments == 0 and closed.exists()
+    newest.write_bytes(b"new latest bytes")
+    storage.inspect()
     assert storage.prune().deleted_segments == 1 and not closed.exists() and newest.exists()
 
 
@@ -727,7 +733,7 @@ def test_progress_age_ignores_wall_clock_and_metadata_only_changes(root, monkeyp
 
 
 @pytest.mark.parametrize("failure", ["budget", "ownership"])
-def test_incomplete_scan_invalidates_progress_until_new_complete_observations(
+def test_budget_pause_hides_inventory_and_custody_failure_discards_progress(
     root, monkeypatch, clock, failure
 ):
     _free(monkeypatch, 500)
@@ -752,12 +758,14 @@ def test_incomplete_scan_invalidates_progress_until_new_complete_observations(
             refused.setattr(identity_state, "_windows_admission", deny_file)
         assert not storage.inspect().recording_allowed
     sample = storage.recording_progress(active.parent.name)
-    assert sample["inspection_complete"] is False and sample["observed"] is False
-    assert sample["last_progress_age_seconds"] is None
+    assert sample["inspection_complete"] is False
+    assert storage.recording_files(active.parent.name) is None
+    assert sample["observed"] is (failure == "budget")
+    assert sample["last_progress_age_seconds"] == (0 if failure == "budget" else None)
     storage.inspect()
     sample = storage.recording_progress(active.parent.name)
     assert sample["observed"] is True and sample["observed_bytes"] == 10
-    assert sample["last_progress_age_seconds"] is None
+    assert sample["last_progress_age_seconds"] == (0 if failure == "budget" else None)
     active.write_bytes(b"x" * 11)
     clock.now += 1
     storage.inspect()

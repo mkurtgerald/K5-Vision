@@ -10,7 +10,7 @@ import pytest
 _VERIFIER = runpy.run_path(
     str(Path(__file__).parents[2] / "scripts/verify_windows_time_administration_receipt.py")
 )
-_HEAD, _SUPERVISOR, _MANIFEST = "a" * 40, "b" * 64, "c" * 64
+_HEAD, _INSTALLER, _SUPERVISOR, _MANIFEST = "a" * 40, "d" * 64, "b" * 64, "c" * 64
 
 
 def _receipt():
@@ -18,8 +18,9 @@ def _receipt():
         **{key: True for key in _VERIFIER["_TRUE"]},
         **{key: False for key in _VERIFIER["_FALSE"]},
         **{key: False for key in _VERIFIER["_BOOL"]},
-        "schema_version": 1,
+        "schema_version": 2,
         "head_sha": _HEAD,
+        "installer_sha256": _INSTALLER,
         "supervisor_sha256": _SUPERVISOR,
         "payload_manifest_sha256": _MANIFEST,
         "duration_seconds": 45.0,
@@ -60,7 +61,11 @@ def _report(tmp_path, receipt, *, failed=False, skipped=False):
 
 def _verify(path):
     return _VERIFIER["verify"](
-        path, expected_head=_HEAD, supervisor_sha256=_SUPERVISOR, payload_manifest_sha256=_MANIFEST
+        path,
+        expected_head=_HEAD,
+        installer_sha256=_INSTALLER,
+        supervisor_sha256=_SUPERVISOR,
+        payload_manifest_sha256=_MANIFEST,
     )
 
 
@@ -97,7 +102,9 @@ def test_integer_truth_values_cannot_replace_typed_time_proof_booleans(tmp_path,
         _verify(_report(tmp_path, receipt))
 
 
-@pytest.mark.parametrize("field", ["head_sha", "supervisor_sha256", "payload_manifest_sha256"])
+@pytest.mark.parametrize(
+    "field", ["head_sha", "installer_sha256", "supervisor_sha256", "payload_manifest_sha256"]
+)
 def test_different_source_or_binary_or_payload_is_rejected(tmp_path, field):
     receipt = _receipt()
     receipt[field] = "0" * len(receipt[field])
@@ -109,6 +116,7 @@ def test_different_source_or_binary_or_payload_is_rejected(tmp_path, field):
     "mutation",
     [
         {"schema_version": True},
+        {"schema_version": 1},
         {"duration_seconds": True},
         {"duration_seconds": 0},
         {"duration_seconds": 241},

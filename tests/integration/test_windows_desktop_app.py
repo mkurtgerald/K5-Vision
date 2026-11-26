@@ -9,8 +9,11 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
+import http.client
 import importlib.util
+import itertools
 import json
+import math
 import os
 import platform
 import re
@@ -25,9 +28,9 @@ from concurrent.futures import ThreadPoolExecutor
 from ctypes import wintypes
 from datetime import UTC, datetime, timedelta
 from importlib.metadata import version
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from types import SimpleNamespace
-from urllib.parse import quote, urlencode, urlsplit
+from urllib.parse import parse_qs, quote, urlencode, urlsplit
 from uuid import UUID, uuid4
 
 import psutil
@@ -65,11 +68,36 @@ _DESKTOP_CAMERAS = (
     ("Generated desktop yellow camera", "127.0.0.2", "yellow"),
 )
 
+# A native completion callback must outlive an outstanding cross-process send,
+# even when a failed installer is killed before its handler replies. Owners are
+# released only after PeekMessage delivers their final acknowledgment.
+_INSTALLER_COMMAND_OWNERS = []
+
 
 def _require(condition, message):
     __tracebackhide__ = True
     if not condition:
         pytest.fail(message, pytrace=False)
+
+
+def _remove_owned_temporary_tree(parent):
+    """Remove the proof tree even if an exiting child removes a descendant.
+
+    Python 3.12 can raise when a child disappears between rmtree's directory
+    scan and unlink. Only that already-completed descendant removal is benign;
+    failures at the owned root and all other errors remain qualification failures.
+    """
+
+    def removed_descendant(_operation, path, error):
+        if isinstance(error, FileNotFoundError):
+            descendant = Path(path)
+            if descendant != parent and descendant.is_relative_to(parent):
+                return
+        raise error
+
+    shutil.rmtree(parent, onexc=removed_descendant)
+    if parent.exists():
+        raise OSError("Owned temporary proof directory remains after removal")
 
 
 def _helpers(name):
@@ -88,6 +116,12 @@ class _Windows:
     def __init__(self):
         self.api = ctypes.WinDLL("user32", use_last_error=True)
         self.callback = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        self.click_callback_type = ctypes.WINFUNCTYPE(
+            None, wintypes.HWND, wintypes.UINT, ctypes.c_size_t, wintypes.LPARAM
+        )
+        self._clicks = {}
+        self._click_serial = itertools.count(1)
+        self._click_callback = self.click_callback_type(self._acknowledge_click)
         signatures = {
             "EnumWindows": ([self.callback, wintypes.LPARAM], wintypes.BOOL),
             "EnumChildWindows": ([wintypes.HWND, self.callback, wintypes.LPARAM], wintypes.BOOL),
@@ -104,6 +138,27 @@ class _Windows:
             "GetDlgCtrlID": ([wintypes.HWND], ctypes.c_int),
             "PostMessageW": (
                 [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM],
+                wintypes.BOOL,
+            ),
+            "SendMessageCallbackW": (
+                [
+                    wintypes.HWND,
+                    wintypes.UINT,
+                    wintypes.WPARAM,
+                    wintypes.LPARAM,
+                    self.click_callback_type,
+                    ctypes.c_size_t,
+                ],
+                wintypes.BOOL,
+            ),
+            "PeekMessageW": (
+                [
+                    ctypes.POINTER(wintypes.MSG),
+                    wintypes.HWND,
+                    wintypes.UINT,
+                    wintypes.UINT,
+                    wintypes.UINT,
+                ],
                 wintypes.BOOL,
             ),
             "SendMessageTimeoutW": (
@@ -210,7 +265,7 @@ class _Windows:
         self.message(window, 0x00F5)  # BM_CLICK
 
     def post_click(self, window):
-        """Queue a real button event whose handler may perform lengthy installation."""
+        """Send one asynchronous native click and retain its completion witness."""
         __tracebackhide__ = True
         _require(
             bool(window)
@@ -219,10 +274,48 @@ class _Windows:
             and self.api.IsWindowEnabled(window),
             "Expected enabled desktop button is unavailable",
         )
-        _require(
-            bool(self.api.PostMessageW(window, 0x00F5, 0, 0)),  # BM_CLICK
-            "Native desktop button click could not be queued",
+        ticket = SimpleNamespace(identifier=next(self._click_serial), completed=False)
+        self._clicks[ticket.identifier] = ticket
+        if self not in _INSTALLER_COMMAND_OWNERS:
+            _INSTALLER_COMMAND_OWNERS.append(self)
+        accepted = self.api.SendMessageCallbackW(
+            window,
+            0x00F5,
+            0,
+            0,
+            self._click_callback,
+            ticket.identifier,  # BM_CLICK
         )
+        if not accepted:
+            self._clicks.pop(ticket.identifier)
+            if not self._clicks:
+                _INSTALLER_COMMAND_OWNERS.remove(self)
+        _require(bool(accepted), "Native desktop button click could not be dispatched")
+        return ticket
+
+    def _acknowledge_click(self, _window, _message, identifier, _result):
+        ticket = self._clicks.get(identifier)
+        if ticket is not None:
+            ticket.completed = True
+
+    def click_completed(self, ticket):
+        """Pump sent-message callbacks without removing unrelated queued messages."""
+        message = wintypes.MSG()
+        self.api.PeekMessageW(ctypes.byref(message), None, 0, 0, 0)  # PM_NOREMOVE
+        if not ticket.completed:
+            return False
+        self._clicks.pop(ticket.identifier, None)
+        if not self._clicks and self in _INSTALLER_COMMAND_OWNERS:
+            _INSTALLER_COMMAND_OWNERS.remove(self)
+        return True
+
+    def button_caption(self, window):
+        """Read a fresh GUI-thread response under the existing control deadline."""
+        value = ctypes.create_unicode_buffer(512)
+        self.message(
+            window, 0x000D, ctypes.cast(value, ctypes.c_void_p).value, parameter=len(value)
+        )
+        return _normalized_caption(value.value)
 
     def close(self, form):
         __tracebackhide__ = True
@@ -236,26 +329,341 @@ class _Windows:
 
 
 class _Cohort:
-    """Observe only processes descended from this test's desktop executable."""
+    """Observe explicit GUI and installed-SCM process roots owned by this test."""
 
     def __init__(self, api):
         self.api = api
+        self.native = _helpers("windows_process_identity").NativeProcessTree()
         self.roots = []
         self.processes = {}
+        self.native_identities = {}
+        self.root_roles = {}
+        self.ownership_records = {}
+        self.console_pins = {}
+        self.parent_pins = {}
+        self.console_individual_termination_used = False
         self.console_seen = False
         self.failed = False
+        self.first_failure = None
+        self.last_cleanup_observation = None
+        self.service = None
+        self.service_stopped = True
         self.stop = threading.Event()
         self.lock = threading.Lock()
         self.thread = threading.Thread(target=self._observe, daemon=True)
         self.thread.start()
 
-    def add(self, process):
+    def _record_ownership(self, identity, note, *, role):
+        if len(self.ownership_records) >= 4096 and identity not in self.ownership_records:
+            self.failed = True
+            raise RuntimeError("Native ownership inventory exceeded its bound")
+        self.ownership_records[identity] = {**note, "role": role}
+
+    def _record_failure(self, error, phase):
+        if getattr(self, "first_failure", None) is not None:
+            return
+        allowed = {
+            "RuntimeError",
+            "OSError",
+            "PermissionError",
+            "ProcessLookupError",
+            "NoSuchProcess",
+            "AccessDenied",
+            "TimeoutError",
+            "Failed",
+            "AssertionError",
+            "AttributeError",
+            "ValueError",
+            "TypeError",
+            "OwnershipFailure",
+            "ArgumentError",
+            "OverflowError",
+        }
+        phases = {
+            "observer_snapshot",
+            "observer_windows",
+            "candidate_admission",
+            "finish_snapshot",
+            "finish_stop",
+            "finish_drain",
+            "finish_pin_exit",
+            "finish_pin_close",
+        }
+        source = None
+        trace = error.__traceback__
+        while trace is not None:
+            code = trace.tb_frame.f_code
+            filename = Path(code.co_filename).name
+            if filename in {"test_windows_desktop_app.py", "windows_process_identity.py"}:
+                source = {
+                    "file": filename,
+                    "function": code.co_name[:80],
+                    "line": min(20000, trace.tb_lineno),
+                }
+            trace = trace.tb_next
+        native_code = getattr(error, "winerror", None)
+        if type(native_code) is not int:
+            details = getattr(error, "diagnostic", None)
+            native_code = details.get("native_code") if type(details) is dict else None
+        self.first_failure = {
+            "phase": phase if phase in phases else "other",
+            "exception_type": type(error).__name__ if type(error).__name__ in allowed else "other",
+            "source": source,
+            "native_code": native_code
+            if type(native_code) is int and 0 <= native_code <= 65535
+            else None,
+        }
+
+    def _admit_service(self, identity, *, root=False):
+        helper = _helpers("windows_process_identity")
+        images = {
+            str(PureWindowsPath(self.service.installed / relative)).casefold(): kind
+            for relative, kind in (
+                ("K5VisionRecorder.exe", "wrapper"),
+                ("K5Vision.exe", "host"),
+                ("runtime/python.exe", "python"),
+                ("workers/mediamtx.exe", "mediamtx"),
+                ("workers/caddy.exe", "caddy"),
+            )
+        }
+        try:
+            details = self.native.details(identity)
+            if (
+                not root
+                and PureWindowsPath(details["image"]).name.casefold() == "conhost.exe"
+                and details["sid"] == self.native.service_sid()
+            ):
+                # This exact edge was checked while both original identities
+                # were live in the completed descendant traversal. A later
+                # parent exit does not change the retained process object.
+                parent = self.native.last_identity_edges.get(identity)
+                admitted_parent = self.ownership_records.get(parent)
+                parent_pin = self.parent_pins.get(parent)
+                if (
+                    parent is None
+                    or parent_pin is None
+                    or admitted_parent is None
+                    or not admitted_parent["accepted"]
+                    or admitted_parent["role"] != "service"
+                    or admitted_parent["kind"] not in {"python", "mediamtx", "caddy"}
+                ):
+                    raise RuntimeError("Console host parent identity was not positively admitted")
+                pin = self.native.admit_console_host(
+                    identity,
+                    parent,
+                    admitted_parent["kind"],
+                    self.native.service_sid(),
+                    parent_pin=parent_pin,
+                )
+                self.console_pins[identity] = pin
+                note = {
+                    "pid": identity[0],
+                    "created_100ns": identity[1],
+                    "parent_pid": parent[0],
+                    "kind": "console_host",
+                    "sid_role": "service",
+                    "session": 0,
+                    "accepted": True,
+                    "outcome": "admitted",
+                    "console_facts": dict(pin.facts),
+                }
+                self._record_ownership(identity, note, role="service")
+                return True
+            note = helper.service_candidate(
+                details,
+                self.native.service_sid(),
+                images,
+                root=root,
+                diagnose_image=helper.image_diagnostic,
+            )
+            if note["accepted"] and note["kind"] in {"python", "mediamtx", "caddy"}:
+                if identity not in self.parent_pins:
+                    expected_image = next(
+                        path for path, kind in images.items() if kind == note["kind"]
+                    )
+                    self.parent_pins[identity] = self.native.pin_service_parent(
+                        identity, note["kind"], self.native.service_sid(), expected_image
+                    )
+        except ProcessLookupError:
+            return False
+        except helper.OwnershipFailure as error:
+            self._record_ownership(identity, error.diagnostic, role="service")
+            self.failed = True
+            raise
+        except (OSError, ValueError, TypeError, RuntimeError) as error:
+            self._record_failure(error, "candidate_admission")
+            note = {
+                "pid": identity[0],
+                "created_100ns": identity[1],
+                "parent_pid": self.native.last_parents.get(identity[0], 0),
+                "kind": "unavailable",
+                "sid_role": "unavailable",
+                "session": None,
+                "accepted": False,
+                "outcome": "proof_unavailable",
+            }
+            self._record_ownership(identity, note, role="service")
+            self.failed = True
+            raise RuntimeError("Native service ownership proof was unavailable") from None
+        self._record_ownership(identity, note, role="service")
+        return note["accepted"]
+
+    def ownership_diagnostic(self):
+        with self.lock:
+            records = [
+                {**note, "pinned_exit": self.console_pins[identity].cached_exit}
+                if identity in self.console_pins
+                else dict(note)
+                for identity, note in self.ownership_records.items()
+            ]
+        rejected = {}
+        for note in records:
+            if not note["accepted"]:
+                outcome = note["outcome"]
+                rejected[outcome] = rejected.get(outcome, 0) + 1
+        refused = sorted(
+            (v for v in records if not v["accepted"]),
+            key=lambda value: value["outcome"] == "foreign_token",
+        )
+        admitted = [v for v in records if v["accepted"]]
+        return {
+            "candidate_count": len(records),
+            "rejected_counts": rejected,
+            "instances": refused[:16] + admitted[-(32 - min(16, len(refused))) :],
+            "first_failure": getattr(self, "first_failure", None),
+            "last_cleanup": getattr(self, "last_cleanup_observation", None),
+        }
+
+    def ownership_receipt(self):
+        with self.lock:
+            records = [v for v in self.ownership_records.values() if v["role"] == "service"]
+        admitted = [v for v in records if v["accepted"]]
+        payload = [v for v in admitted if v["kind"] != "console_host"]
+        consoles = [v for v in admitted if v["kind"] == "console_host"]
+        images = sorted({v["kind"] for v in payload})
+        unreadable = sum(v["outcome"] == "proof_unavailable" for v in records)
+        unexpected = sum(v["outcome"] == "unexpected_service_image" for v in records)
+        exited = sum(
+            pin.cached_exit is not None and pin.cached_exit["exited"] is True
+            for pin in self.console_pins.values()
+        )
+        console_receipt = {
+            "observed_count": len(consoles),
+            "exited_count": exited,
+            "system_file_identity_verified": all(
+                v["console_facts"]["system_file_identity_verified"] for v in consoles
+            ),
+            "trusted_code_custody_verified": all(
+                v["console_facts"]["trusted_code_custody_verified"] for v in consoles
+            ),
+            "admitted_parent_identity_verified": all(
+                v["console_facts"]["admitted_parent_identity_verified"] for v in consoles
+            ),
+            "pinned_native_exit_verified": len(self.console_pins) == len(consoles) == exited
+            and all(pin.handle is None for pin in self.console_pins.values()),
+            "individual_termination_used": self.console_individual_termination_used,
+        }
+        _require(
+            images == ["caddy", "host", "mediamtx", "python", "wrapper"]
+            and unreadable == unexpected == 0
+            and not self.failed
+            and all(v["sid_role"] == "service" and v["session"] == 0 for v in admitted),
+            "Installed service cleanup ownership proof was incomplete",
+        )
+        _require(
+            all(v is True for k, v in console_receipt.items() if k.endswith("verified"))
+            and not console_receipt["individual_termination_used"],
+            "Console host lifetime ownership proof was incomplete",
+        )
+        return {
+            "service_token_verified": bool(admitted),
+            "session_zero_verified": bool(admitted),
+            "installed_images_verified": bool(admitted),
+            "admitted_service_images": images,
+            "admitted_service_count": len(payload),
+            "rejected_foreign_count": sum(v["outcome"] == "foreign_token" for v in records),
+            "unreadable_identity_count": unreadable,
+            "unexpected_service_image_count": unexpected,
+            "console_hosts": console_receipt,
+        }
+
+    def add(self, process, *, role="gui", expected_identity=None):
+        _require(role in {"gui", "service", "time_helper"}, "Unknown native ownership root role")
         try:
             root = psutil.Process(process.pid)
+            birth = self.native.birth(root.pid, handle=getattr(process, "_handle", None))
+            if birth is None or self.native.birth(root.pid) != birth or not root.is_running():
+                return
+            if expected_identity is not None and expected_identity != (root.pid, birth):
+                raise RuntimeError("Explicit native root identity changed before admission")
         except psutil.NoSuchProcess:
             return
         with self.lock:
-            self.roots.append(root)
+            identity = (root.pid, birth)
+            if role == "service":
+                _require(
+                    self.service is not None, "SCM ownership lacks its installed service identity"
+                )
+                if not self._admit_service(identity, root=True):
+                    return
+            else:
+                try:
+                    details = self.native.details(identity)
+                    if role == "time_helper":
+                        if expected_identity is None:
+                            raise RuntimeError("Time helper lacks its explicit observed identity")
+                        current = self.native.details((os.getpid(), self.native.birth(os.getpid())))
+                        allowed = {
+                            str(PureWindowsPath(_machine_paths()[0] / "K5Vision.exe")).casefold(),
+                            str(
+                                PureWindowsPath(self.native.system_directory()) / "w32tm.exe"
+                            ).casefold(),
+                        }
+                        if (
+                            str(PureWindowsPath(details["image"])).casefold() not in allowed
+                            or details["sid"] != current["sid"]
+                            or details["session"] != current["session"]
+                            or details["elevated"] is not True
+                        ):
+                            raise RuntimeError("Time helper native authority was not admitted")
+                    self._record_ownership(
+                        identity,
+                        {
+                            "pid": identity[0],
+                            "created_100ns": identity[1],
+                            "parent_pid": details["parent_pid"],
+                            "kind": "gui_client" if role == "gui" else "time_helper",
+                            "sid_role": "explicit_root" if role == "gui" else "current_admin",
+                            "session": details["session"],
+                            "accepted": True,
+                            "outcome": "admitted",
+                        },
+                        role=role,
+                    )
+                except ProcessLookupError:
+                    return
+                except (OSError, ValueError, TypeError, RuntimeError):
+                    self.failed = True
+                    self._record_ownership(
+                        identity,
+                        {
+                            "pid": identity[0],
+                            "created_100ns": identity[1],
+                            "parent_pid": self.native.last_parents.get(identity[0], 0),
+                            "kind": "unavailable",
+                            "sid_role": "unavailable",
+                            "session": None,
+                            "accepted": False,
+                            "outcome": "proof_unavailable",
+                        },
+                        role=role,
+                    )
+                    raise RuntimeError("Explicit root ownership proof was unavailable") from None
+            self.roots.append(identity)
+            self.root_roles[identity] = role
+            self.processes[identity] = root
+            self.native_identities[id(root)] = identity
+            return identity
 
     def snapshot(self):
         with self.lock:
@@ -263,33 +671,153 @@ class _Cohort:
 
     def _snapshot(self):
         for root in list(self.roots):
+            if self.root_roles[root] != "service":
+                continue  # GUI and elevated helpers are explicit roots only.
             try:
-                cohort = [root, *root.children(recursive=True)]
-            except psutil.NoSuchProcess:
-                continue
-            for process in cohort:
+                candidates = self.native.descendants(root)
+            except (OSError, RuntimeError) as error:
+                note = getattr(error, "diagnostic", None)
+                if note is None:
+                    note = {
+                        "pid": root[0],
+                        "created_100ns": root[1],
+                        "parent_pid": self.native.last_parents.get(root[0], 0),
+                        "kind": "unavailable",
+                        "sid_role": "unavailable",
+                        "session": None,
+                        "accepted": False,
+                        "outcome": "proof_unavailable",
+                    }
+                self._record_ownership((note["pid"], note["created_100ns"]), note, role="service")
+                self.failed = True
+                raise
+            for identity in candidates:
+                if identity in self.processes:
+                    continue
                 try:
-                    self.processes[(process.pid, process.create_time())] = process
+                    previous = self.ownership_records.get(identity)
+                    if previous is not None and not previous["accepted"]:
+                        if previous["outcome"] != "foreign_token":
+                            raise RuntimeError("Native service ownership previously failed")
+                        continue
+                    if not self._admit_service(identity):
+                        continue
+                    process = psutil.Process(identity[0])
+                    if self.native.birth(process.pid) != identity[1] or not process.is_running():
+                        continue
+                    self.processes[identity] = process
+                    self.native_identities[id(process)] = identity
                 except psutil.NoSuchProcess:
                     continue
-        return list(self.processes.values())
+        # Keep exited identities for the existing cleanup witness, but never
+        # return a historical PID's new occupant as owned by this journey.
+        return [
+            process
+            for identity, process in self.processes.items()
+            if identity in self.console_pins
+            or not process.is_running()
+            or self.native.birth(identity[0]) == identity[1]
+        ]
+
+    def is_owned_running(self, process):
+        identity = self.native_identities.get(id(process))
+        if identity in self.console_pins:
+            return not self.console_pins[identity].exited()
+        return bool(
+            identity is not None
+            and self.native.birth(identity[0]) == identity[1]
+            and process.is_running()
+        )
+
+    def is_service_owned(self, process):
+        identity = self.native_identities.get(id(process))
+        note = self.ownership_records.get(identity)
+        return bool(note and note["accepted"] and note["role"] == "service")
+
+    def terminate_owned(self, process):
+        identity = self.native_identities.get(id(process))
+        if identity in self.console_pins:
+            if not self.console_pins[identity].exited():
+                self.failed = True
+                raise RuntimeError("A console host survived its owned engine shutdown")
+            return False
+        if self.is_owned_running(process):
+            process.kill()
+            process.wait(timeout=10)
+            return True
+        return False
 
     def _observe(self):
+        phase = "observer_snapshot"
         try:
             while not self.stop.wait(0.05):
-                pids = {process.pid for process in self.snapshot() if process.is_running()}
+                phase = "observer_snapshot"
+                pids = {
+                    process.pid for process in self.snapshot() if self.is_owned_running(process)
+                }
+                phase = "observer_windows"
                 if any(
                     self.api.pid(window) in pids
                     and self.api.class_name(window) == "ConsoleWindowClass"
                     for window in self.api.windows()
                 ):
                     self.console_seen = True
-        except Exception:
+        except Exception as error:
+            self._record_failure(error, phase)
             self.failed = True
 
     def finish(self):
         self.stop.set()
         self.thread.join(timeout=5)
+        cleanup_observed = False
+        # A failed UI journey must not kill the wrapper and let SCM restart an
+        # unobserved engine. Stop the actual installed service before retiring
+        # process identities. GUI-only exit is tested by the dedicated lane.
+        if self.service is not None and not self.service_stopped:
+            try:
+                self.snapshot()
+            except BaseException as error:
+                self._record_failure(error, "finish_snapshot")
+                self.failed = True
+            try:
+                phase = "finish_stop"
+                _service_control(self.service.installed, "stop")
+                self.service_stopped = True
+                cleanup_observed = True
+                phase = "finish_drain"
+                _wait_owned_cleanup(self, service_only=True)
+            except BaseException as error:
+                self._record_failure(error, phase)
+                self.failed = True
+        if self.console_pins:
+            try:
+                if not cleanup_observed:
+                    _wait_owned_cleanup(self, service_only=True)
+            except BaseException as error:
+                self._record_failure(error, "finish_drain")
+                self.failed = True
+            finally:
+                for pin in self.console_pins.values():
+                    try:
+                        if not pin.exited():
+                            self.failed = True
+                    except BaseException as error:
+                        self._record_failure(error, "finish_pin_exit")
+                        self.failed = True
+                    finally:
+                        try:
+                            pin.close()
+                        except BaseException as error:
+                            self._record_failure(error, "finish_pin_close")
+                            self.failed = True
+        # Parent query references outlive every console-child admission and
+        # exit check; closing them cannot terminate any process.
+        for pin in self.parent_pins.values():
+            try:
+                pin.close()
+            except BaseException as error:
+                self._record_failure(error, "finish_pin_close")
+                self.failed = True
 
 
 def _wait(condition, label, *, timeout=30, process=None):
@@ -405,6 +933,162 @@ def _classify_installed_seal_refusal(installed):
         return "bounded_inspection_incomplete"
 
 
+def _installer_page_signature(api, controls):
+    """Ephemeral native wizard-page identity, never written to diagnostics.
+
+    The same Next control is reused across pages. A queued native click must
+    not be queued again until actual visible wizard controls change.
+    """
+    return tuple(
+        sorted(
+            (api.api.GetDlgCtrlID(window), api.class_name(window), api.text(window))
+            for window in controls
+        )
+    )
+
+
+def _installer_timeout_activity(process):
+    """Bounded process-only witness for a graphical Setup deadline failure.
+
+    Retain only CPU metrics and fixed operation flags from owned native guard
+    processes. Their argv is inspected in memory; executable paths, supplied
+    arguments, handles, environment and output are never retained. CPU time
+    distinguishes extraction work from a process awaiting a control response.
+    """
+    try:
+        root = psutil.Process(process.pid)
+        processes = [root, *root.children(recursive=True)]
+        seconds = 0.0
+        observed = 0
+        operations = {}
+        allowed_operations = {
+            "--installation-identity",
+            "--installation-machine-extraction-check",
+            "--installation-payload-check",
+            "--installation-service-legacy-check",
+            "--installation-service-stop",
+            "--installation-service-prepare",
+            "--installation-service-seal",
+            "--installation-service-install",
+            "--installation-service-start",
+            "--installation-service-remove",
+        }
+        for item in processes[:64]:
+            try:
+                usage = item.cpu_times()
+                seconds += usage.user + usage.system
+                observed += 1
+            except (psutil.Error, OSError):
+                continue
+            try:
+                image = PureWindowsPath(item.exe()).name.casefold()
+                if image not in {
+                    "k5vision.exe",
+                    "k5visioninstallguard.exe",
+                    "k5visionuninstallguard.exe",
+                }:
+                    continue
+                arguments = item.cmdline()
+                if 2 <= len(arguments) <= 3 and arguments[1] in allowed_operations:
+                    operation = arguments[1]
+                    if len(arguments) == (3 if operation == "--installation-identity" else 2):
+                        operations[operation] = min(64, operations.get(operation, 0) + 1)
+            except (psutil.Error, OSError, AttributeError, TypeError, ValueError):
+                continue
+        result = {
+            "observed_processes": observed,
+            "processes_capped": len(processes) > 64,
+            "aggregate_cpu_seconds": round(min(seconds, 3600.0), 2),
+            "root_running": root.is_running(),
+        }
+        if operations:
+            result["owned_guard_operations"] = operations
+        return result
+    except (psutil.Error, OSError):
+        return {"observation": "unavailable"}
+
+
+def _clock_live_gateway_probe(live_url, token, *, dial=None):
+    """Classify one failed clock-step live request without retaining any media.
+
+    Runs only *after* the original five-second browser request has failed.
+    The sole target is the same local media gateway and the same authorized
+    opaque session; the response body is never read, copied or logged.
+    This must not retry the acceptance request or replace its result.
+    """
+    try:
+        target = urlsplit(live_url)
+        port = target.port
+        valid = (
+            target.scheme == "http"
+            and target.hostname == "127.0.0.1"
+            and port is not None
+            and not target.username
+            and not target.password
+            and not target.query
+            and not target.fragment
+            and re.fullmatch(r"/media/live/k5_[0-9a-f]{64}/index\.m3u8", target.path)
+            and isinstance(token, str)
+            and re.fullmatch(r"[A-Za-z0-9_-]{32,128}", token)
+        )
+    except (AttributeError, ValueError):
+        valid = False
+    if not valid:
+        return {"classification": "refused"}
+    connection = None
+    started = time.monotonic()
+    try:
+        connector = http.client.HTTPConnection if dial is None else dial
+        connection = connector("127.0.0.1", port, timeout=2.0)
+        connection.request(
+            "GET",
+            target.path,
+            headers={"Cookie": "k5_operator_media=" + token},
+        )
+        response = connection.getresponse()
+        return {
+            "classification": "response",
+            "http_status": int(response.status),
+            "elapsed_ms": min(2_000, int((time.monotonic() - started) * 1_000)),
+        }
+    except TimeoutError:
+        return {
+            "classification": "timeout",
+            "elapsed_ms": min(2_000, int((time.monotonic() - started) * 1_000)),
+        }
+    except (OSError, http.client.HTTPException):
+        return {
+            "classification": "transport_error",
+            "elapsed_ms": min(2_000, int((time.monotonic() - started) * 1_000)),
+        }
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def _installer_finish_refusal(captions, diagnostic):
+    """Retain only fixed refusal stages and numeric codes from a failed Finish."""
+    text = " ".join(str(value).casefold()[:2048] for value in list(captions)[:128])
+    if (
+        "k5 vision installation failed" not in text
+        and "k5 vision could not verify or start the recording service" not in text
+    ):
+        return False
+    diagnostic["installer_action"] = "final_admission_refused"
+    diagnostic["installer_failed_stage"] = "unclassified"
+    match = re.search(r"install check: (seal|launcher|payload|install|start)/(-?\d{1,10})\.", text)
+    if match:
+        value = int(match[2])
+        if -2 <= value <= 2147483647:
+            diagnostic["installer_failed_stage"] = match[1]
+            diagnostic["installer_guard_exit_code"] = value
+            phase = value >> 16
+            if phase in {10, 11, 12, 13, 14, 15, 16, 20, 21, 22, 23, 24, 25, 26, 27, 28}:
+                diagnostic["installer_guard_phase"] = phase
+                diagnostic["installer_guard_win32"] = value & 65535
+    return True
+
+
 def _install_gui(setup, installed, api, *, diagnostic=None):
     """Drive the actual Inno wizard without suppressing its user interface."""
     __tracebackhide__ = True
@@ -429,9 +1113,16 @@ def _install_gui(setup, installed, api, *, diagnostic=None):
         stderr=subprocess.DEVNULL,
     )
     deadline, clicked, launch_unchecked = time.monotonic() + 90, set(), False
+    last_next_page = None
+    pending_click = None
     try:
         while process.poll() is None:
-            _require(time.monotonic() < deadline, "Actual installer wizard exceeded its deadline")
+            if time.monotonic() >= deadline:
+                diagnostic["installer_timeout_activity"] = _installer_timeout_activity(process)
+                pytest.fail("Actual installer wizard exceeded its deadline", pytrace=False)
+            waiting_for_click = pending_click is not None and not api.click_completed(pending_click)
+            if not waiting_for_click:
+                pending_click = None
             root = psutil.Process(process.pid)
             pids = {root.pid, *(child.pid for child in root.children(recursive=True))}
             forms = [window for window in api.windows() if api.pid(window) in pids]
@@ -442,6 +1133,9 @@ def _install_gui(setup, installed, api, *, diagnostic=None):
                         _classify_installed_seal_refusal(installed)
                     )
                     pytest.fail("Installer refused its extracted sealed payload", pytrace=False)
+            if waiting_for_click:
+                time.sleep(0.2)
+                continue
             for form in forms:
                 controls = [
                     window
@@ -449,6 +1143,11 @@ def _install_gui(setup, installed, api, *, diagnostic=None):
                     if api.api.IsWindowVisible(window) and api.api.IsWindowEnabled(window)
                 ]
                 captions = {_normalized_caption(api.text(window)): window for window in controls}
+                if _installer_finish_refusal(captions, diagnostic):
+                    pytest.fail(
+                        "Installer failed its " + diagnostic["installer_failed_stage"] + " check",
+                        pytrace=False,
+                    )
                 if any(
                     caption.startswith("k5 vision could not verify the installed application")
                     for caption in captions
@@ -456,8 +1155,10 @@ def _install_gui(setup, installed, api, *, diagnostic=None):
                     diagnostic["installer_action"] = "payload_admission_refused"
                     pytest.fail("Installer rejected the extracted sealed payload", pytrace=False)
                 if "i accept the agreement" in captions:
-                    diagnostic["installer_action"] = "accept_license"
-                    api.click(captions["i accept the agreement"])
+                    agreement = captions["i accept the agreement"]
+                    if api.message(agreement, 0x00F0) != 1:  # BM_GETCHECK / BST_CHECKED
+                        diagnostic["installer_action"] = "accept_license"
+                        api.click(agreement)
                 if "launch k5 vision" in captions and not launch_unchecked:
                     diagnostic["installer_action"] = "uncheck_launch"
                     checkbox = captions["launch k5 vision"]
@@ -470,15 +1171,19 @@ def _install_gui(setup, installed, api, *, diagnostic=None):
                     _require(launch_unchecked, "Installer launch checklist was unavailable")
                 for caption in ("finish", "install", "next >", "next"):
                     if caption in captions:
+                        # The Next HWND is also Inno's Install/Finish button.
+                        # Never dispatch an action from an earlier caption map.
+                        if api.button_caption(captions[caption]) != caption:
+                            break
                         if caption == "install":
                             if not diagnostic["installer_install_posted"]:
                                 diagnostic["installer_action"] = "install_dispatch"
                                 # Inno extracts the entire offline payload inside
                                 # its Install handler. A synchronous BM_CLICK's
                                 # five-second reply deadline is not an extraction
-                                # deadline. Queue it once, then observe the real
+                                # deadline. Dispatch it once, then observe the real
                                 # wizard and process under the existing 90s gate.
-                                api.post_click(captions[caption])
+                                pending_click = api.post_click(captions[caption])
                                 diagnostic["installer_install_posted"] = True
                                 diagnostic["installer_action"] = "install_wait"
                         else:
@@ -486,10 +1191,24 @@ def _install_gui(setup, installed, api, *, diagnostic=None):
                                 "finish" if caption == "finish" else "next"
                             )
                             if caption.startswith("next"):
+                                # Inno's Next handler can synchronously prepare
+                                # an offline payload. SendMessageTimeout's 5s
+                                # control deadline is not an install deadline.
+                                # Await this actual handler's completion before
+                                # observing another page or sending any command.
+                                # The unchanged 90s gate bounds that wait.
+                                page = _installer_page_signature(api, controls)
+                                if page == last_next_page:
+                                    break
                                 diagnostic["installer_next_clicks"] += 1
-                            api.click(captions[caption])
+                                pending_click = api.post_click(captions[caption])
+                                last_next_page = page
+                            else:
+                                api.click(captions[caption])
                         clicked.add(caption)
                         break
+                if pending_click is not None:
+                    break
             time.sleep(0.2)
         _require(process.returncode == 0, "Actual GUI installer did not complete successfully")
         _require("install" in clicked and "finish" in clicked, "Installer wizard was not exercised")
@@ -571,6 +1290,114 @@ def _verify_installed_worker_bundle(installed: Path) -> None:
     _require(seen == set(expected), "Installed native worker set is incomplete")
 
 
+def _machine_paths():
+    """Use the same protected, fixed locations as the installed product."""
+    return (
+        Path(os.environ.get("ProgramW6432", os.environ["ProgramFiles"])) / "K5 Vision",
+        Path(os.environ["PROGRAMDATA"]) / "K5Vision",
+    )
+
+
+def _profile_identity(profile):
+    """Read generated fixture identity as an elevated administrator.
+
+    Production admission must run under the service token. Calling its private
+    owner checks under the test runner would wrongly treat the service SID as
+    a foreign principal; this test-only bounded read grants no product trust.
+    """
+    if os.name != "nt" or Path(profile) != _machine_paths()[1]:
+        return identity_state.load_identity_state(Path(profile) / "identity")
+    path = Path(profile) / "identity" / "identity.json"
+    raw = path.read_bytes()
+    _require(0 < len(raw) <= 1024, "Installed identity manifest exceeded its bound")
+    value = json.loads(raw)
+    _require(
+        type(value) is dict
+        and set(value) == {"schema_version", "site_id"}
+        and type(value["schema_version"]) is int
+        and value["schema_version"] == 1
+        and type(value["site_id"]) is str
+        and re.fullmatch(r"install-[a-f0-9]{32}", value["site_id"]) is not None,
+        "Installed generated identity manifest was invalid",
+    )
+    return SimpleNamespace(site_id=value["site_id"])
+
+
+def _service_control(installed, action):
+    _require(action in {"start", "stop"}, "Unsupported acceptance service action")
+    result = subprocess.run(
+        [str(Path(installed) / "K5Vision.exe"), "--installation-service-" + action],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=70 if action == "stop" else 35,
+        check=False,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    _require(result.returncode == 0, "Installed SCM controller refused " + action)
+
+
+def _prepare_generated_recording(path):
+    """Give test-created archive media a normally admitted administrator owner.
+
+    Real service recordings retain their service owner. The generated archive
+    is written by the elevated test runner, whose user SID the service must
+    correctly refuse; only these explicit new fixture files are adjusted.
+    """
+    path = Path(path)
+    _require(
+        path.is_file() and path.is_relative_to(_machine_paths()[1] / "recordings"),
+        "Generated archive ownership target is outside the fixture recording root",
+    )
+    security = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    security.ConvertStringSidToSidW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_void_p)]
+    security.ConvertStringSidToSidW.restype = wintypes.BOOL
+    security.SetNamedSecurityInfoW.argtypes = [
+        wintypes.LPWSTR,
+        ctypes.c_int,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+    ]
+    security.SetNamedSecurityInfoW.restype = wintypes.DWORD
+    kernel.LocalFree.argtypes, kernel.LocalFree.restype = [ctypes.c_void_p], ctypes.c_void_p
+    owner = ctypes.c_void_p()
+    _require(
+        security.ConvertStringSidToSidW("S-1-5-32-544", ctypes.byref(owner)),
+        "Generated archive administrator SID could not be prepared",
+    )
+    try:
+        _require(
+            security.SetNamedSecurityInfoW(str(path), 1, 1, owner, None, None, None) == 0,
+            "Generated archive administrator ownership could not be established",
+        )
+    finally:
+        kernel.LocalFree(owner)
+
+
+def _attach_installed_service(installed, cohort):
+    service = _helpers("windows_service_acceptance").InstalledService(installed)
+    state = service.status()
+    if state["state"] == 1:
+        _service_control(installed, "start")
+    _wait(lambda: service.status()["state"] == 4, "Installed SCM recorder running", timeout=30)
+    configuration = service.configuration()
+    _require(
+        configuration["service_type"] == 0x10
+        and configuration["start_type"] == 2
+        and configuration["account"].casefold() == r"NT SERVICE\K5VisionRecorder".casefold()
+        and configuration["installed_executable_verified"] is True,
+        "Installed recorder SCM configuration was not admitted",
+    )
+    root = psutil.Process(service.status()["pid"])
+    _require(service.session(root) == 0, "Installed recorder is outside Session 0")
+    cohort.service, cohort.service_stopped = service, False
+    cohort.add(root, role="service")
+
+
 def _start_app(installed, profile, port, cohort):
     environment = dict(os.environ)
     environment["PATH"] = os.pathsep.join(
@@ -578,22 +1405,29 @@ def _start_app(installed, profile, port, cohort):
     )
     environment["PYTHONHOME"] = str(profile.parent / "no external Python")
     environment["PYTHONPATH"] = str(profile.parent / "no external modules")
+    command = [str(installed / "K5Vision.exe")]
+    wrapper_present = (installed / "K5VisionRecorder.exe").is_file()
+    machine_paths_requested = (installed, profile) == _machine_paths()
+    if wrapper_present or machine_paths_requested:
+        _require(
+            wrapper_present and machine_paths_requested and port == 8000,
+            "Machine service acceptance tried to redirect protected state or port",
+        )
+        _attach_installed_service(installed, cohort)
+    else:
+        # Retain the historical baseline launcher protocol for the separately
+        # scoped cross-revision migration test; it is never SCM evidence.
+        command += ["--profile", str(profile), "--port", str(port)]
+    command.append("--no-browser")
     process = subprocess.Popen(
-        [
-            str(installed / "K5Vision.exe"),
-            "--profile",
-            str(profile),
-            "--port",
-            str(port),
-            "--no-browser",
-        ],
+        command,
         cwd=installed,
         env=environment,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    cohort.add(process)
+    cohort.add(process, role="gui")
     return process
 
 
@@ -746,6 +1580,36 @@ def _retire_temporary_browser_processes(owned):
     _require(not remaining, "Native browser handoff left owned processes running")
 
 
+def _operator_document_observation(port):
+    """Inspect the fixed recorder HTML route; retain no body, headers or title."""
+    observed = {
+        "operator_document_http_status": 0,
+        "operator_document_html": False,
+        "operator_document_expected_title": False,
+    }
+    connection = None
+    try:
+        if type(port) is not int or not 1 <= port <= 65535:
+            return observed
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+        connection.request("GET", "/operator/", headers={"Accept-Encoding": "identity"})
+        response = connection.getresponse()
+        observed["operator_document_http_status"] = response.status
+        observed["operator_document_html"] = (
+            response.getheader("Content-Type", "").split(";", 1)[0].strip().casefold()
+            == "text/html"
+        )
+        body = response.read(1024 * 1024 + 1)
+        title = re.search(rb"<title\b[^>]*>([^<]{0,256})</title>", body, re.IGNORECASE)
+        observed["operator_document_expected_title"] = bool(title and b"K5 Vision" in title[1])
+    except (OSError, http.client.HTTPException, ValueError):
+        pass
+    finally:
+        if connection is not None:
+            connection.close()
+    return observed
+
+
 def _default_browser_handoff(api, form, port, *, diagnostic=None):
     """Observe real OS dispatch, origin traffic and the new product browser window."""
     diagnostic = {} if diagnostic is None else diagnostic
@@ -768,19 +1632,31 @@ def _default_browser_handoff(api, form, port, *, diagnostic=None):
         api.click(api.control(form, _OPEN))
 
         def browser_window():
+            categories = {
+                "new_product": 0,
+                "existing_product": 0,
+                "new_other": 0,
+                "existing_other": 0,
+            }
+            found = None
             for window in api.windows():
-                if (
-                    window not in previous_windows
-                    and api.api.IsWindowVisible(window)
-                    and "K5 Vision" in api.text(window)
-                ):
-                    try:
-                        process = psutil.Process(api.pid(window))
-                        if process.name().casefold() in {"msedge.exe", "chrome.exe"}:
-                            return window
-                    except psutil.NoSuchProcess:
-                        pass
-            return None
+                if not api.api.IsWindowVisible(window):
+                    continue
+                try:
+                    process = psutil.Process(api.pid(window))
+                    if process.name().casefold() not in {"msedge.exe", "chrome.exe"}:
+                        continue
+                    product = "K5 Vision" in api.text(window)
+                    category = ("existing_" if window in previous_windows else "new_") + (
+                        "product" if product else "other"
+                    )
+                    categories[category] = min(64, categories[category] + 1)
+                    if window not in previous_windows and product and found is None:
+                        found = window
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+            diagnostic["browser_handoff_window_counts"] = categories
+            return found
 
         opened = _wait(browser_window, "Actual default-browser K5 window", timeout=25)
         process = psutil.Process(api.pid(opened))
@@ -838,7 +1714,15 @@ def _default_browser_handoff(api, form, port, *, diagnostic=None):
         }
     finally:
         watcher_finished = watcher.finish()
+        if diagnostic.get("browser_handoff_stage") != "dispatch_origin_window_verified":
+            diagnostic.update(_operator_document_observation(port))
         diagnostic["browser_handoff_observer_stopped"] = watcher_finished
+        diagnostic.update(
+            native_launch_argument_matched=watcher.argument_matched,
+            browser_handoff_new_browser_processes=min(64, len(watcher.observed)),
+            browser_handoff_cached_origin_records=min(64, len(watcher.origin_ancestries)),
+            browser_handoff_observer_failed=watcher.failed,
+        )
         if opened and api.api.IsWindow(opened):
             api.close(opened)
         # Existing browsers are not owned. Only new descendants observed
@@ -868,7 +1752,7 @@ def test_native_browser_handoff_rejects_unreaped_descendants(monkeypatch):
         _retire_temporary_browser_processes({(123, 456): child})
 
 
-def _wait_owned_cleanup(cohort, *, timeout=10, diagnostic=None):
+def _wait_owned_cleanup(cohort, *, timeout=10, diagnostic=None, service_only=False):
     """Wait for owned process identities, never a historical PID's later occupant."""
     __tracebackhide__ = True
     diagnostic = {} if diagnostic is None else diagnostic
@@ -883,14 +1767,21 @@ def _wait_owned_cleanup(cohort, *, timeout=10, diagnostic=None):
         "caddy.exe": "caddy",
     }
     while True:
-        tracked = cohort.snapshot()
+        try:
+            tracked = cohort.snapshot()
+            if service_only:
+                tracked = [p for p in tracked if cohort.is_service_owned(p)]
+        finally:
+            if hasattr(cohort, "ownership_diagnostic"):
+                diagnostic["process_ownership"] = cohort.ownership_diagnostic()
         counts = {kind: 0 for kind in ("desktop", "python", "mediamtx", "caddy", "other")}
         for process in tracked:
             try:
                 # psutil.wait_procs()/Process.wait() can reopen a recycled PID
                 # without checking its original creation identity. is_running()
                 # verifies (PID, creation time) and rejects that later occupant.
-                if process.is_running():
+                alive = getattr(cohort, "is_owned_running", lambda item: item.is_running())
+                if alive(process):
                     counts[names.get(process.name().casefold(), "other")] += 1
             except psutil.NoSuchProcess:
                 continue
@@ -901,6 +1792,13 @@ def _wait_owned_cleanup(cohort, *, timeout=10, diagnostic=None):
             stop_identity_checks=checks,
             stop_wait_seconds=round(time.monotonic() - started, 3),
         )
+        if hasattr(cohort, "last_cleanup_observation"):
+            cohort.last_cleanup_observation = {
+                "scope": "service" if service_only else "all",
+                "live_counts": dict(counts),
+                "checks": checks,
+                "elapsed_seconds": diagnostic["stop_wait_seconds"],
+            }
         if not any(counts.values()):
             return
         remaining = deadline - time.monotonic()
@@ -969,6 +1867,11 @@ def _stop_app(process, form, api, cohort, *, diagnostic=None):
     __tracebackhide__ = True
     api.click(api.control(form, _STOP))
     _require(process.wait(timeout=40) == 0, "Desktop stop and quit did not finish successfully")
+    if cohort.service is not None and not cohort.service_stopped:
+        # Intentional engine shutdown for reinstall/restart and closed-file
+        # inspection is a separate SCM operation, never a client exit effect.
+        _service_control(cohort.service.installed, "stop")
+        cohort.service_stopped = True
     _wait_owned_cleanup(cohort, diagnostic=diagnostic)
 
 
@@ -1112,7 +2015,8 @@ def _cohort_diagnostic(cohort):
     }
     for process in cohort.snapshot():
         try:
-            if process.is_running():
+            alive = getattr(cohort, "is_owned_running", lambda item: item.is_running())
+            if alive(process):
                 counts[allowed.get(process.name().casefold(), "other")] += 1
         except psutil.NoSuchProcess:
             continue
@@ -1157,6 +2061,11 @@ def _desktop_probe(api, form):
         if status in {"none", "ready", "new", "refused", "running", "stopped"}
         else "unclassified"
     )
+    if data.get("browser_dispatch") in {"not_requested", "dispatched", "failed"}:
+        result["browser_dispatch"] = data["browser_dispatch"]
+    for key, maximum in (("browser_attempts", 1000), ("browser_native_error", 65535)):
+        if type(data.get(key)) is int and 0 <= data[key] <= maximum:
+            result[key] = data[key]
     return result
 
 
@@ -1558,7 +2467,10 @@ def _desktop_nvr_journey(
     publishers[1] = _publish_fixture(parent, ffmpeg, sources[1], helpers, color="blue")
     processes.append(publishers[1])
     browser_helpers._decoded_video(
-        page, f'#wall-panel [data-camera-id="{camera_ids[1]}"] video', "blue"
+        page,
+        f'#wall-panel [data-camera-id="{camera_ids[1]}"] video',
+        "blue",
+        diagnostic=diagnostic,
     )
     recovered = sizes()
     _wait(lambda: all_progress(recovered), "Installed camera recording recovery", process=app)
@@ -1607,10 +2519,66 @@ def _desktop_nvr_journey(
         > before_live,
         "Pausing recording interrupted installed live video",
     )
-    _require(
-        bool(client.json(f"/api/v1/operator/cameras/{camera_ids[0]}/history")["spans"]),
-        "Pausing recording removed installed recording history",
-    )
+    history_entered_utc, history_started = datetime.now(UTC), time.monotonic()
+    history_route = f"/api/v1/operator/cameras/{camera_ids[0]}/history"
+    history_original_get = client.get
+    history_original_response = None
+    history_response_metadata = {}
+    paused_history = None
+
+    def observed_history_get(route, *args, **kwargs):
+        nonlocal history_original_response
+        try:
+            result = history_original_get(route, *args, **kwargs)
+        except BaseException:
+            if route == history_route:
+                history_response_metadata["get_failed"] = True
+            raise
+        if route == history_route:
+            history_response_metadata["get_completed"] = True
+            history_original_response = result
+        return result
+
+    try:
+        try:
+            client.get = observed_history_get
+        except BaseException:  # noqa: BLE001 - observation cannot prevent the original request.
+            history_response_metadata["projection_failed"] = True
+        paused_history = client.json(f"/api/v1/operator/cameras/{camera_ids[0]}/history")
+        _require(
+            bool(paused_history["spans"]),
+            "Pausing recording removed installed recording history",
+        )
+    except BaseException as history_error:
+        try:
+            history_helper = _helpers("installed_history_diagnostic")
+            if history_original_response is not None:
+                try:
+                    history_response_metadata.update(
+                        history_helper.response_metadata(history_original_response)
+                    )
+                except BaseException:  # noqa: BLE001 - preserve the original GET/status failure.
+                    history_response_metadata["projection_failed"] = True
+            diagnostic["paused_history"] = history_helper.observe_failure(
+                client=client,
+                profile=profile,
+                directory=camera_directories[0],
+                entered_utc=history_entered_utc,
+                completed_utc=datetime.now(UTC),
+                elapsed=time.monotonic() - history_started,
+                response=paused_history,
+                original_response=history_response_metadata,
+                error=history_error,
+            )
+        except BaseException:  # noqa: BLE001 - preserve the original assertion and cleanup.
+            diagnostic["paused_history"] = {"probe_failed": True}
+        raise
+    finally:
+        try:
+            client.get = history_original_get
+        except BaseException:  # noqa: BLE001 - diagnostic restoration cannot replace a failure.
+            pass  # noqa: S110 - preserve the original request/assertion result.
+        history_original_response = None
     browser_helpers._recording_control_diagnostic(None, True, diagnostic)
     with page.expect_response(
         lambda response: response.request.method == "PUT" and response.url.endswith(recording_route)
@@ -1629,7 +2597,16 @@ def _desktop_nvr_journey(
     evidence["resumed_recording_bytes"] = sizes()[0]
 
     mark_nvr_phase("historical_navigation")
-    seeded = browser_helpers._seed_recorded_history(camera_directories[0], ffmpeg, parent)
+    seeded = browser_helpers._seed_recorded_history(
+        camera_directories[0],
+        ffmpeg,
+        parent,
+        prepare_file=(
+            _prepare_generated_recording
+            if os.name == "nt" and Path(profile) == _machine_paths()[1]
+            else None
+        ),
+    )
     evidence.update(
         browser_helpers._recording_navigation_journey(
             page, device_id=camera_ids[0], seeded=seeded, diagnostic=diagnostic
@@ -1737,16 +2714,915 @@ def _installed_person_fixture(parent, ffmpeg):
     return video
 
 
-def _installed_person_events(client, route, diagnostic):
-    """Keep the event-poll status before any later diagnostic request replaces it."""
+def _installed_sampled_person_boxes(page, camera_id, client, browser_helpers, diagnostic):
+    """Prove native boxes are visible on the same transient installed browser frame.
+
+    No sampled pixels, camera URI, request body, screenshot or bearer token is
+    copied to CI evidence. A painted native rectangle is required, not merely a
+    successful person-detection API response.
+    """
+    __tracebackhide__ = True
+    diagnostic["analytics_sample_stage"] = "open_live"
+    browser_helpers._open_camera_watch(page, camera_id)
     try:
-        return client.json(route)["events"]
+        diagnostic["analytics_sample_stage"] = "panel_visible"
+        page.locator("#person-view-panel").wait_for(state="visible")
+        diagnostic["analytics_sample_stage"] = "live_decoded"
+        page.wait_for_function(
+            """() => {
+              const video = document.getElementById('live-video');
+              return video && !video.paused && video.readyState >= 2 &&
+                video.videoWidth > 0 && video.videoHeight > 0 &&
+                video.getVideoPlaybackQuality().totalVideoFrames >= 4;
+            }""",
+            timeout=25_000,
+        )
+    except Exception:
+        # Keep only finite player and control states; never inspect or retain
+        # the source URL, session, request body, video frame or screenshot.
+        try:
+            diagnostic["analytics_sample_live_state"] = page.evaluate(
+                """() => {
+                  const video = document.getElementById('live-video');
+                  const panel = document.getElementById('person-view-panel');
+                  const quality = video?.getVideoPlaybackQuality?.();
+                  const frames = quality?.totalVideoFrames;
+                  return {
+                    panel_visible: !!panel && !panel.hidden,
+                    live_visible: !document.getElementById('live-panel')?.hidden,
+                    paused: video?.paused ?? null,
+                    ready_state: video?.readyState ?? null,
+                    has_dimensions: !!video && video.videoWidth > 0 && video.videoHeight > 0,
+                    decoded_frames: Number.isSafeInteger(frames) ?
+                      Math.min(frames, 1000000) : null,
+                    video_error: video?.error?.code ?? null,
+                    retry_visible: !document.getElementById('retry-live')?.hidden,
+                    play_visible: !document.getElementById('play-live')?.hidden,
+                    sample_button_enabled: !document.getElementById('toggle-person-view')?.disabled
+                  };
+                }"""
+            )
+        except Exception:
+            diagnostic["analytics_sample_live_state"] = {"available": False}
+        raise
+    # Native decoding and authoritative camera status can become ready in
+    # adjacent browser tasks. Require the real enabled control, not a stale
+    # instantaneous disabled-button snapshot.
+    diagnostic["analytics_sample_stage"] = "control_ready"
+    try:
+        page.wait_for_function(
+            """() => {
+              const button = document.getElementById('toggle-person-view');
+              const video = document.getElementById('live-video');
+              const panel = document.getElementById('person-view-panel');
+              return !!button && !button.disabled && !!panel && !panel.hidden
+                && !!video && !video.paused && video.readyState >= 2
+                && video.videoWidth > 0 && video.videoHeight > 0;
+            }""",
+            timeout=5_000,
+        )
+    except Exception:
+        # Enumerated control/player evidence only; no camera identifiers, URLs,
+        # browser exceptions, sampled frames, request data or response bodies.
+        try:
+            diagnostic["analytics_sample_control_state"] = page.evaluate(
+                """() => {
+                  const video = document.getElementById('live-video');
+                  const button = document.getElementById('toggle-person-view');
+                  const panel = document.getElementById('person-view-panel');
+                  const frames = video?.getVideoPlaybackQuality?.().totalVideoFrames;
+                  const ready = video?.readyState;
+                  return {
+                    control_present: !!button,
+                    control_enabled: !!button && !button.disabled,
+                    panel_visible: !!panel && !panel.hidden,
+                    camera_online_badge: !!document.getElementById('connection-badge')
+                      ?.classList.contains('online'),
+                    live_playing: !!video && !video.paused && ready >= 2,
+                    has_dimensions: !!video && video.videoWidth > 0 && video.videoHeight > 0,
+                    ready_state: Number.isInteger(ready) && ready >= 0 && ready <= 4
+                      ? ready : null,
+                    decoded_frames: Number.isSafeInteger(frames) && frames >= 0
+                      ? Math.min(frames, 1000000) : null
+                  };
+                }"""
+            )
+        except Exception:
+            diagnostic["analytics_sample_control_state"] = {"available": False}
+        raise
+    button = page.locator("#toggle-person-view")
+    _require(button.is_enabled(), "Installed sampled-person control was not enabled")
+    route = f"/api/v1/operator/cameras/{camera_id}/person-view"
+    diagnostic["analytics_sample_stage"] = "native_frame_request"
+    # Observe only route identity and bounded finite counts/statuses. Never
+    # retain URLs, query parameters, upload pixels or request/response bodies.
+    traffic = {"requests": 0, "responses": 0, "failed": 0, "http_status": 0}
+    first_sent_at = [None]
+    control_probe = {}
+    control_thread = [None]
+
+    def measure_control_plane():
+        # A single independent, unauthenticated loopback health request during
+        # the sampled POST distinguishes gateway/backend starvation from a
+        # slow person handler. Never retain response bodies or local addresses.
+        began = time.monotonic()
+        try:
+            time.sleep(0.75)
+            independent = client.__class__(urlsplit(client.origin).port)
+            status, body, _ = independent.get("/api/v1/health", max_bytes=1024)
+            control_probe["status"] = status if status in {200, 404, 503, 504} else 0
+            try:
+                healthy = status == 200 and json.loads(body).get("status") == "ok"
+            except (TypeError, ValueError, AttributeError):
+                healthy = False
+            control_probe["healthy"] = healthy
+        except Exception:
+            control_probe["status"] = "transport_unavailable"
+            control_probe["healthy"] = False
+        finally:
+            control_probe["elapsed_ms"] = min(
+                30_000, max(0, int((time.monotonic() - began) * 1000))
+            )
+
+    def is_sample(request):
+        return request.method == "POST" and urlsplit(request.url).path == route
+
+    def observed_request(request):
+        if is_sample(request):
+            traffic["requests"] = min(5, traffic["requests"] + 1)
+            if first_sent_at[0] is None:
+                first_sent_at[0] = time.monotonic()
+                control_thread[0] = threading.Thread(target=measure_control_plane, daemon=True)
+                control_thread[0].start()
+
+    def observed_response(response):
+        if is_sample(response.request):
+            traffic["responses"] = min(5, traffic["responses"] + 1)
+            # HTTP status and elapsed time are finite transport evidence, not
+            # response content. Preserve unexpected 5xx classes to distinguish
+            # proxy/backend faults from a native inference refusal.
+            traffic["http_status"] = response.status if 100 <= response.status <= 599 else 0
+            if response.status == 429:
+                phase = response.headers.get("x-k5-person-phase")
+                traffic["busy_phase"] = phase if phase in {"capacity", "preparing"} else "other"
+            if first_sent_at[0] is not None:
+                elapsed_ms = min(120000, max(0, int((time.monotonic() - first_sent_at[0]) * 1000)))
+                # The first reply is authoritative for backend responsiveness.
+                # Do not overwrite it with the last 429/retry response.
+                traffic.setdefault("first_response_ms", elapsed_ms)
+                traffic["last_response_ms"] = elapsed_ms
+
+    def observed_failure(request):
+        if is_sample(request):
+            traffic["failed"] = min(5, traffic["failed"] + 1)
+            if first_sent_at[0] is not None:
+                traffic["first_failure_ms"] = min(
+                    120000, max(0, int((time.monotonic() - first_sent_at[0]) * 1000))
+                )
+            # Preserve only a finite transport classification, never the
+            # request URL, uploaded frame, headers or browser exception text.
+            failure = request.failure
+            traffic["failure_class"] = (
+                "aborted"
+                if failure == "net::ERR_ABORTED"
+                else "timed_out"
+                if failure == "net::ERR_TIMED_OUT"
+                else "connection_closed"
+                if failure in {"net::ERR_CONNECTION_CLOSED", "net::ERR_CONNECTION_RESET"}
+                else "other"
+            )
+
+    page.on("request", observed_request)
+    page.on("response", observed_response)
+    page.on("requestfailed", observed_failure)
+    try:
+        with page.expect_response(
+            # The product explicitly treats transient HTTP 429 as busy and retries.
+            # Only accept a real successful inference response; the positive
+            # same-frame box and canvas checks below remain mandatory.
+            lambda response: is_sample(response.request) and response.status == 200,
+            timeout=27_000,
+        ) as first:
+            button.click()
+        response = first.value
+    except Exception:
+        diagnostic["analytics_sample_request_traffic"] = dict(traffic)
+        # The API client already carries the operator's bearer authorization.
+        # Only the finite preparation phase enters evidence, never headers,
+        # credentials, server diagnostics, exception strings, or camera media.
+        try:
+            status_report = client.json("/api/v1/operator/status", max_bytes=8192)
+            preparation_phase = (
+                status_report.get("person_preparation_phase")
+                if type(status_report) is dict
+                else None
+            )
+            diagnostic["analytics_sample_backend_preparation"] = (
+                preparation_phase
+                if preparation_phase in {"not_requested", "preparing", "ready", "failed", "closed"}
+                else "unknown"
+            )
+        except Exception:
+            diagnostic["analytics_sample_backend_preparation"] = "unavailable"
+        try:
+            diagnostic["analytics_sample_request_state"] = page.evaluate(
+                """() => {
+                  const message = document.getElementById('person-view-message')?.textContent || '';
+                  const video = document.getElementById('live-video');
+                  const button = document.getElementById('toggle-person-view');
+                  // Only finite, locally defined categories are admitted to
+                  // failure evidence. Never retain DOM text, camera identifiers,
+                  // source addresses, request data, credentials or sampled pixels.
+                  const liveState = document.getElementById('live-state')?.textContent || '';
+                  const liveTitleNode = document.getElementById('live-placeholder-title');
+                  const liveTitle = liveTitleNode?.textContent || '';
+                  const cameraListNode = document.getElementById('camera-list-message');
+                  const cameraListMessage = cameraListNode?.textContent || '';
+                  const liveStatusClass = liveState.startsWith('Disconnected')
+                    ? 'disconnected'
+                    : liveState.startsWith('Reconnecting') ? 'reconnecting'
+                    : liveState.startsWith('Restoring media access') ? 'restoring_access'
+                    : liveState.startsWith('Live view unavailable') ? 'access_unavailable'
+                    : liveState.startsWith('Buffering live video') ? 'buffering'
+                    : liveState.startsWith('Unsupported video') ? 'unsupported_codec'
+                    : liveState.startsWith('Ready') ? 'ready'
+                    : liveState.startsWith('Connecting') ? 'connecting'
+                    : liveState.startsWith('Playing') ? 'playing'
+                    : 'other';
+                  const livePlaceholderClass = liveTitle.startsWith('Live view disconnected')
+                    ? 'disconnected'
+                    : liveTitle.startsWith('Reconnecting') ? 'reconnecting'
+                    : liveTitle.startsWith('Restoring media access') ? 'restoring_access'
+                    : liveTitle.startsWith('Media access unavailable') ? 'access_unavailable'
+                    : liveTitle.startsWith('Video format unavailable') ? 'unsupported_codec'
+                    : liveTitle.startsWith('Opening live view') ? 'opening'
+                    : 'other';
+                  const classification = message.startsWith('Processing a sampled frame')
+                    ? 'processing'
+                    : message.startsWith('Person detection is busy') ? 'busy'
+                    : message.startsWith('Person detection is unavailable') ? 'unavailable'
+                    : message.startsWith('Sampled view stopped while live video is paused')
+                      ? 'paused'
+                    : message.startsWith('Sampled view stopped while live video is buffering')
+                      ? 'buffering'
+                    : message.startsWith('Sampled view stopped while live video is unavailable')
+                      ? 'video_unavailable'
+                    : message.startsWith('Sampled view stopped while the camera is unavailable')
+                      ? 'camera_unavailable'
+                    : message.startsWith('Sampled view stopped') ? 'stopped_other'
+                    : message.startsWith('Select Start sampled view') ? 'reset_default'
+                    : message.includes(' in this sample') ? 'sample_received'
+                    : 'other';
+                  return {
+                    message_class: classification,
+                    live_status_class: liveStatusClass,
+                    live_placeholder_class: livePlaceholderClass,
+                    camera_list_error: cameraListMessage.includes('Camera list unavailable'),
+                    capabilities_tab_hidden: !!document.getElementById('live-tab')?.hidden,
+                    live_panel_visible: !document.getElementById('live-panel')?.hidden,
+                    retry_visible: !document.getElementById('retry-live')?.hidden,
+                    workspace_visible: !document.getElementById('workspace')?.hidden,
+                    enabled: button?.getAttribute('aria-pressed') === 'true',
+                    sample_button_enabled: !!button && !button.disabled,
+                    live_playing: !!video && !video.paused && video.readyState >= 2,
+                    canvas_visible: !document.getElementById('person-view-canvas')?.hidden
+                  };
+                }"""
+            )
+        except Exception:
+            diagnostic["analytics_sample_request_state"] = {"available": False}
+        raise
     finally:
-        diagnostic["analytics_events_http_status"] = client.last_http_status
-        if client.transport_failure is not None:
-            diagnostic["analytics_events_transport"] = dict(client.transport_failure)
-        else:
-            diagnostic.pop("analytics_events_transport", None)
+        page.remove_listener("request", observed_request)
+        page.remove_listener("response", observed_response)
+        page.remove_listener("requestfailed", observed_failure)
+        if control_thread[0] is not None:
+            control_thread[0].join(timeout=0.1)
+        diagnostic["analytics_sample_concurrent_health"] = (
+            dict(control_probe) if "elapsed_ms" in control_probe else {"completed": False}
+        )
+    diagnostic["analytics_sample_request_traffic"] = dict(traffic)
+    diagnostic["analytics_sample_response_no_store"] = (
+        response.headers.get("cache-control") == "no-store"
+    )
+    _require(
+        response.status == 200 and response.headers.get("cache-control") == "no-store",
+        "Installed sampled-person response was refused or could be cached",
+    )
+    query = parse_qs(urlsplit(response.url).query, strict_parsing=True)
+    _require(
+        set(query) == {"width", "height", "frame_id"}
+        and all(len(values) == 1 for values in query.values()),
+        "Installed person frame used an unexpected bounded request contract",
+    )
+    width, height, frame_id = (int(query[name][0]) for name in ("width", "height", "frame_id"))
+    received = response.json()
+    payload = response.request.post_data_buffer
+    # Restrict failure evidence to the server's finite status and booleans.
+    # Neither transient frames nor response bodies enter the CI receipt.
+    native_status = received.get("status") if type(received) is dict else None
+    diagnostic["analytics_sample_response_contract"] = {
+        "native_status": (
+            native_status
+            if type(native_status) is str and native_status in {"active", "busy", "unavailable"}
+            else "invalid"
+        ),
+        "frame_correlated": (type(received) is dict and received.get("frame_id") == frame_id),
+        "post_bytes_valid": isinstance(payload, bytes) and len(payload) == width * height * 4,
+        "box_count": (
+            min(33, len(received["boxes"]))
+            if type(received) is dict and type(received.get("boxes")) is list
+            else -1
+        ),
+    }
+    _require(
+        1 <= width <= 544
+        and 1 <= height <= 320
+        and 1 <= frame_id < 2**31
+        and isinstance(payload, bytes)
+        and len(payload) == width * height * 4
+        and type(received) is dict
+        and set(received) == {"status", "frame_id", "boxes"}
+        and received["frame_id"] == frame_id
+        and received["status"] in {"active", "busy"}
+        and type(received["boxes"]) is list
+        and len(received["boxes"]) <= 32,
+        "Installed native person sampling did not bind to the captured live frame",
+    )
+    diagnostic["analytics_sample_stage"] = "same_frame_canvas"
+    # Inspect only finite booleans, geometry and the number of the precise
+    # RGB stroke pixels used by the shipped renderer. Never snapshot media.
+    painted = page.wait_for_function(
+        """() => {
+          const canvas = document.getElementById('person-view-canvas');
+          const video = document.getElementById('live-video');
+          const message = document.getElementById('person-view-message')?.textContent || '';
+          if (!canvas || canvas.hidden || !video || video.paused ||
+              video.getVideoPlaybackQuality().totalVideoFrames < 4 ||
+              canvas.width <= 0 || canvas.height <= 0 ||
+              canvas.width > 544 || canvas.height > 320 ||
+              !message.includes(' in this sample') || message.startsWith('0 ')) return false;
+          const pixels = canvas.getContext('2d').getImageData(
+            0, 0, canvas.width, canvas.height).data;
+          let green = 0;
+          for (let i = 0; i < pixels.length; i += 4) {
+            if (pixels[i] === 104 && pixels[i + 1] === 210 &&
+                pixels[i + 2] === 164 && pixels[i + 3] === 255) green++;
+          }
+          if (green < 12) return false;
+          return {
+            overlay_pixels: green,
+            live_frames: video.getVideoPlaybackQuality().totalVideoFrames
+          };
+        }""",
+        timeout=30_000,
+    ).json_value()
+    _require(
+        type(painted) is dict
+        and type(painted.get("overlay_pixels")) is int
+        and 12 <= painted["overlay_pixels"] <= 544 * 320
+        and type(painted.get("live_frames")) is int
+        and 4 <= painted["live_frames"] <= 1_000_000,
+        "Installed person rectangle was not painted over its immutable sample",
+    )
+    diagnostic["analytics_sample_stage"] = "clear_sample"
+    button.click()
+    page.wait_for_function(
+        """() => {
+          const canvas = document.getElementById('person-view-canvas');
+          return canvas && canvas.hidden && canvas.width === 0 && canvas.height === 0;
+        }""",
+        timeout=5_000,
+    )
+    browser_helpers._open_camera_recordings(page, camera_id)
+    diagnostic["analytics_sample_stage"] = "complete"
+    return {
+        "analytics_sampled_native_boxes": True,
+        "analytics_sampled_same_frame_overlay": True,
+        "analytics_sampled_canvas_cleared": True,
+        "analytics_sampled_overlay_pixels": painted["overlay_pixels"],
+        "analytics_sampled_live_decoded_frames": painted["live_frames"],
+    }
+
+
+def _poll_installed_person_event(client, route, diagnostic):
+    """Tolerate only bounded gateway reconnection during the original 25s gate.
+
+    The real positive person-event and same-frame box requirements remain
+    mandatory. Retain only a finite HTTP status, never any response content.
+    """
+    status, body, _ = client.get(route + "/events")
+    if status != 200:
+        diagnostic["analytics_event_poll_status"] = (
+            status if status in {401, 403, 404, 429, 500, 502, 503, 504} else "other"
+        )
+        if status in {502, 503, 504}:
+            return None
+        _require(False, "Installed person-event endpoint refused its authenticated poll")
+    diagnostic["analytics_event_poll_status"] = 200
+    payload = json.loads(body)
+    _require(
+        type(payload) is dict and type(payload.get("events")) is list,
+        "Installed person-event endpoint returned an invalid event envelope",
+    )
+    if not payload["events"]:
+        return None
+    _require(
+        type(payload["events"][0]) is dict,
+        "Installed person-event endpoint returned an invalid event",
+    )
+    return payload["events"][0]
+
+
+_NATIVE_FAILURE_WORKERS = {"ready", "unavailable", "disk_full"}
+_NATIVE_FAILURE_CAMERAS = {"live", "connecting", "disconnected", "unavailable"}
+_NATIVE_FAILURE_RECORDINGS = {"waiting", "recording", "paused", "stalled", "error"}
+_NATIVE_FAILURE_REASONS = {
+    "worker_unavailable",
+    "operator_paused",
+    "storage_paused",
+    "camera_unavailable",
+    "configuration_mismatch",
+    "storage_inspection",
+    "disk_progress",
+    "no_disk_progress",
+    "awaiting_disk_progress",
+}
+
+
+def _native_failure_count(value):
+    return value if type(value) is int and 0 <= value <= 2**63 - 1 else None
+
+
+def _native_failure_signed_seconds(value, *, limit=86400):
+    if type(value) not in (int, float):
+        return None
+    try:
+        return round(min(limit, max(-limit, value)), 3) if math.isfinite(value) else None
+    except OverflowError:
+        return None
+
+
+def _native_failure_seconds(value):
+    if type(value) not in (int, float):
+        return None
+    try:
+        return round(min(86400, max(0, value)), 3) if math.isfinite(value) else None
+    except OverflowError:
+        return None
+
+
+def _native_failure_enum(value, allowed):
+    return value if type(value) is str and value in allowed else "unknown"
+
+
+def _native_clock_response_note(response):
+    value = response.status
+    note = {"status": value if type(value) is int and 100 <= value <= 599 else None}
+    try:
+        header = response.headers.get("content-type", "")
+        mime = header.split(";", 1)[0].strip().lower() if type(header) is str else ""
+        note["content_type"] = {
+            "": "missing",
+            "text/plain": "text_plain",
+            "application/json": "application_json",
+            "text/html": "text_html",
+        }.get(mime, "other")
+        body = response.body()
+        if type(body) is not bytes:
+            raise ValueError("body admission")
+        note["body_bytes"] = min(2**32 - 1, len(body))
+        note["body_class"] = (
+            "media_access_denied"
+            if body == b"Media access denied"
+            else "empty"
+            if not body
+            else "other"
+        )
+    except BaseException:
+        note["body_probe_failed"] = True
+    return note
+
+
+def _native_failure_public_json(client, route, label, result):
+    status, body, _ = client.get(route, max_bytes=32768)
+    result[label + "_http_status"] = (
+        status if type(status) is int and 100 <= status <= 599 else None
+    )
+    if type(body) is not bytes or len(body) > 32768:
+        raise ValueError("public response admission")
+    value = json.loads(body)
+    if status != 200:
+        detail = value.get("detail") if type(value) is dict else None
+        if type(detail) is dict:
+            detail = detail.get("code")
+        codes = {
+            "Operator identity unavailable": "identity_unavailable",
+            "Camera state unavailable": "camera_state_unavailable",
+            "roles_unavailable": "roles_unavailable",
+            "Media unavailable": "media_unavailable",
+        }
+        result[label + "_error_code"] = (
+            codes.get(detail, "other") if type(detail) is str else "other"
+        )
+        raise ValueError("public status admission")
+    return value
+
+
+def _native_clock_post_snapshot(client, camera_id, cohort, *, received_at=None):
+    """These are later observations, not an atomic snapshot of the failed response."""
+    result = {"timing": "post_response"}
+    began = time.monotonic() if received_at is None else received_at
+
+    def elapsed_ms():
+        return min(90000, max(0, round((time.monotonic() - began) * 1000)))
+
+    transport_failure = getattr(client, "transport_failure", None)
+    try:
+        with cohort.lock:
+            owned = tuple(itertools.islice(cohort.processes.values(), 64))
+            truncated = len(cohort.processes) > len(owned)
+        result["owned_identity_sample_count"] = len(owned)
+        result["owned_identity_sample_truncated"] = truncated
+        names = {
+            "k5vision.exe": "desktop",
+            "python.exe": "python",
+            "pythonw.exe": "python",
+            "mediamtx.exe": "mediamtx",
+            "caddy.exe": "caddy",
+        }
+        counts = dict.fromkeys(["desktop", "python", "mediamtx", "caddy", "other"], 0)
+        failed = not_running = 0
+        for process in owned:
+            try:
+                if process.is_running():
+                    counts[names.get(process.name().casefold(), "other")] += 1
+                else:
+                    not_running += 1
+            except BaseException:
+                failed += 1
+        result["owned_process_counts"] = counts
+        result["owned_identity_inspection_failed_count"] = failed
+        result["owned_identity_not_running_count"] = not_running
+    except BaseException:
+        result["cohort_probe_failed"] = True
+    result["owned_process_observed_after_response_ms"] = elapsed_ms()
+    try:
+        try:
+            status = _native_failure_public_json(
+                client, "/api/v1/operator/status", "status", result
+            )
+            if type(status) is not dict:
+                raise ValueError("status admission")
+            storage = status.get("storage")
+            clock = status.get("clock")
+            result["worker_status"] = _native_failure_enum(
+                status.get("worker_status"), _NATIVE_FAILURE_WORKERS
+            )
+            if type(storage) is dict:
+                result["storage"] = {
+                    "reason": _native_failure_enum(
+                        storage.get("reason"), {"ready", "free_space", "capacity", "inspection"}
+                    ),
+                    "recording_allowed": storage.get("recording_allowed") is True,
+                    "recording_bytes": _native_failure_count(storage.get("recording_bytes")),
+                }
+            if type(clock) is dict:
+                result["clock"] = {
+                    "status": _native_failure_enum(
+                        clock.get("status"), {"observing", "changed", "unavailable"}
+                    ),
+                    "change_count": _native_failure_count(clock.get("change_count")),
+                }
+        except BaseException:
+            result["status_probe_failed"] = True
+        result["status_observed_after_response_ms"] = elapsed_ms()
+        try:
+            response = _native_failure_public_json(
+                client, "/api/v1/operator/cameras", "cameras", result
+            )
+            cameras = response.get("cameras") if type(response) is dict else None
+            if type(cameras) is not list or len(cameras) > 64:
+                raise ValueError("camera admission")
+            states = {key: 0 for key in sorted(_NATIVE_FAILURE_CAMERAS | {"unknown"})}
+            for camera in cameras:
+                if type(camera) is dict:
+                    states[_native_failure_enum(camera.get("status"), _NATIVE_FAILURE_CAMERAS)] += 1
+            result["camera_status_counts"] = states
+            target = next(
+                (
+                    item
+                    for item in cameras
+                    if type(item) is dict and item.get("device_id") == camera_id
+                ),
+                None,
+            )
+            if target is not None:
+                recording = target.get("recording_status")
+                result["target"] = {
+                    "status": _native_failure_enum(target.get("status"), _NATIVE_FAILURE_CAMERAS),
+                    "recording": target.get("recording") is True,
+                    "recording_enabled": target.get("recording_enabled") is True,
+                    "recording_state": _native_failure_enum(
+                        target.get("recording_state"), _NATIVE_FAILURE_RECORDINGS
+                    ),
+                }
+                if type(recording) is dict:
+                    result["target"].update(
+                        reason=_native_failure_enum(
+                            recording.get("reason"), _NATIVE_FAILURE_REASONS
+                        ),
+                        observed_bytes=_native_failure_count(recording.get("observed_bytes")),
+                        last_progress_age_seconds=_native_failure_seconds(
+                            recording.get("last_progress_age_seconds")
+                        ),
+                    )
+        except BaseException:
+            result["camera_probe_failed"] = True
+        result["cameras_observed_after_response_ms"] = elapsed_ms()
+    finally:
+        client.transport_failure = transport_failure
+    return result
+
+
+def _native_failure_frames(error):
+    source_root = Path(__file__).resolve().parents[2]
+    locations = {
+        (source_root / "tests/integration/test_windows_desktop_app.py").resolve(): (
+            "desktop",
+            {
+                "_installed_analytics_journey",
+                "_installed_person_fixture",
+                "_wait",
+                "_vm_clock_phase",
+                "test_native_windows_click_install_account_browser_tray_restart_uninstall",
+                "_closed_hashes",
+                "_recorded_segment_frames",
+                "_desktop_nvr_journey",
+                "_stop_app",
+                "_service_control",
+                "click",
+                "message",
+            },
+        ),
+        (source_root / "tests/integration/test_windows_vm_clock_qualification.py").resolve(): (
+            "clock",
+            {"test_native_windows_vm_clock_qualification"},
+        ),
+        (source_root / "tests/integration/test_operator_beta_browser.py").resolve(): (
+            "browser",
+            {
+                "_open_camera_recordings",
+                "_open_camera_watch",
+                "_decoded_color",
+                "_decoded_video",
+                "_decoded_video_proof",
+            },
+        ),
+    }
+    frames = []
+    current = error.__traceback__
+    while current is not None:
+        code = current.tb_frame.f_code
+        location = locations.get(Path(code.co_filename).resolve())
+        if location is not None and code.co_name in location[1]:
+            frames.append(
+                {
+                    "file": location[0],
+                    "function": code.co_name,
+                    "line": min(10000, max(1, current.tb_lineno)),
+                }
+            )
+            frames = frames[-4:]
+        current = current.tb_next
+    return frames
+
+
+def _native_failure_ui(page, *, occurred=None):
+    event_ms = event_age = None
+    if isinstance(occurred, datetime) and occurred.tzinfo is not None:
+        try:
+            if occurred.utcoffset() is not None:
+                candidate = occurred.timestamp() * 1000
+                if math.isfinite(candidate):
+                    event_ms = candidate
+                    event_age = _native_failure_signed_seconds(
+                        (datetime.now(UTC) - occurred).total_seconds()
+                    )
+        except (ValueError, OverflowError, OSError):
+            pass
+    raw = page.wait_for_function(
+        """eventEpochMs => {
+      const visible = id => {
+        const node = document.getElementById(id);
+        return Boolean(node && !node.hidden && node.getClientRects().length);
+      };
+      const result = {
+        history_visible: visible('history-panel'), live_visible: visible('live-panel'),
+        wall_visible: visible('wall-panel'),
+        event_button_count:
+          document.querySelectorAll('#analytics-events button[data-event-id]').length,
+        history_item_count: document.querySelectorAll('.history-item').length
+      };
+      for (const name of ['playback', 'live']) {
+        const video = document.getElementById(name + '-video');
+        result[name + '_present'] = Boolean(video);
+        if (!video) continue;
+        result[name + '_ready_state'] = video.readyState;
+        result[name + '_paused'] = video.paused;
+        result[name + '_time_seconds'] = Number.isFinite(video.currentTime)
+          ? video.currentTime : null;
+        result[name + '_duration_seconds'] = Number.isFinite(video.duration)
+          ? video.duration : null;
+        result[name + '_width'] = video.videoWidth;
+        result[name + '_height'] = video.videoHeight;
+        result[name + '_decoded_frames'] = video.getVideoPlaybackQuality().totalVideoFrames;
+        result[name + '_error_code'] = video.error ? video.error.code : null;
+        result[name + '_has_source'] = Boolean(video.getAttribute('src') || video.currentSrc);
+      }
+      const historyStart = document.getElementById('history-start');
+      const parsedStart = historyStart ? Date.parse(historyStart.value + 'Z') : NaN;
+      const historyEnd = document.getElementById('history-end');
+      const parsedEnd = historyEnd ? Date.parse(historyEnd.value + 'Z') : NaN;
+      result.history_end_age_seconds = Number.isFinite(parsedEnd)
+        ? (Date.now() - parsedEnd) / 1000 : null;
+      const validRange = Number.isFinite(parsedStart) && Number.isFinite(parsedEnd)
+        && parsedEnd > parsedStart && parsedEnd - parsedStart <= 86400000;
+      const validEvent = typeof eventEpochMs === 'number' && Number.isFinite(eventEpochMs);
+      result.event_within_displayed_range = validRange && validEvent
+        ? parsedStart <= eventEpochMs && eventEpochMs < parsedEnd : null;
+      result.history_end_minus_event_ms = validRange && validEvent
+        ? parsedEnd - eventEpochMs : null;
+      const playback = document.getElementById('playback-video');
+      result.playback_utc_start_present = Boolean(playback && playback.dataset.utcStart);
+      return result;
+    }""",
+        arg=event_ms,
+        timeout=2000,
+    ).json_value()
+    if type(raw) is not dict:
+        return {"available": False}
+    result = {"available": True, "event_age_seconds": event_age}
+    within = raw.get("event_within_displayed_range")
+    result["event_within_displayed_range"] = within if type(within) is bool else None
+    result["history_end_minus_event_ms"] = _native_failure_signed_seconds(
+        raw.get("history_end_minus_event_ms"), limit=86400000
+    )
+    age = raw.get("history_end_age_seconds")
+    try:
+        result["history_end_age_seconds"] = (
+            round(min(86400, max(-86400, age)), 3)
+            if type(age) in (int, float) and math.isfinite(age)
+            else None
+        )
+    except OverflowError:
+        result["history_end_age_seconds"] = None
+    bools = {"history_visible", "live_visible", "wall_visible", "playback_utc_start_present"}
+    bools.update(
+        name + suffix
+        for name in ("playback", "live")
+        for suffix in ("_present", "_paused", "_has_source")
+    )
+    for key in bools:
+        result[key] = raw.get(key) if type(raw.get(key)) is bool else None
+    for key in ("event_button_count", "history_item_count"):
+        value = raw.get(key)
+        result[key] = value if type(value) is int and 0 <= value <= 256 else None
+    for name in ("playback", "live"):
+        for suffix, maximum in (
+            ("_ready_state", 4),
+            ("_error_code", 4),
+            ("_width", 16384),
+            ("_height", 16384),
+            ("_decoded_frames", 2**32 - 1),
+        ):
+            key, value = name + suffix, raw.get(name + suffix)
+            result[key] = value if type(value) is int and 0 <= value <= maximum else None
+        for suffix in ("_time_seconds", "_duration_seconds"):
+            result[name + suffix] = _native_failure_seconds(raw.get(name + suffix))
+    return result
+
+
+def _native_clock_failure_snapshot(response, *, client, camera_id, cohort):
+    began = time.monotonic()
+    result = _native_clock_response_note(response)
+    result["post_response"] = _native_clock_post_snapshot(
+        client, camera_id, cohort, received_at=began
+    )
+    result["post_response"]["elapsed_after_response_ms"] = min(
+        90000, max(0, round((time.monotonic() - began) * 1000))
+    )
+    return result
+
+
+def _installed_analytics_failure_snapshot(*, client, camera_id, publishers, cohort, diagnostic):
+    """Failure-only public state; never include IDs, paths, addresses or error text."""
+
+    def count(value):
+        return value if type(value) is int and 0 <= value <= 2**63 - 1 else None
+
+    def seconds(value, minimum=0):
+        if type(value) not in (int, float) or not math.isfinite(value):
+            return None
+        return round(min(86400, max(minimum, value)), 3)
+
+    def timestamp_age(value):
+        if type(value) is not str:
+            return None
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                return None
+            return seconds((datetime.now(UTC) - parsed).total_seconds(), -86400)
+        except (ValueError, OverflowError):
+            return None
+
+    snapshot = {}
+    diagnostic["analytics_failure_snapshot"] = snapshot
+    transport_failure = getattr(client, "transport_failure", None)
+    try:
+        status = client.json(f"/api/v1/operator/cameras/{camera_id}/analytics")
+        if type(status) is not dict:
+            raise ValueError
+        allowed = {"disabled", "unavailable", "starting", "waiting", "active"}
+        snapshot["analytics"] = {
+            "status": status.get("status") if status.get("status") in allowed else "unknown",
+            "processed_frames": count(status.get("processed_frames")),
+            "event_count": count(status.get("event_count")),
+            "last_sample_age_seconds": timestamp_age(status.get("last_sample_at")),
+            "last_event_age_seconds": timestamp_age(status.get("last_event_at")),
+        }
+    except BaseException:
+        snapshot["analytics_probe_failed"] = True
+    try:
+        response = client.json("/api/v1/operator/cameras")
+        cameras = response.get("cameras") if type(response) is dict else None
+        if type(cameras) is not list or len(cameras) > 64:
+            raise ValueError
+        camera = next(
+            (item for item in cameras if type(item) is dict and item.get("device_id") == camera_id),
+            None,
+        )
+        if camera is None:
+            raise ValueError
+        recording = camera.get("recording_status")
+        if type(recording) is not dict:
+            raise ValueError
+        connection_states = {"live", "connecting", "disconnected", "unavailable"}
+        recording_states = {"waiting", "recording", "paused", "stalled", "error"}
+        reasons = {
+            "worker_unavailable",
+            "operator_paused",
+            "storage_paused",
+            "camera_unavailable",
+            "configuration_mismatch",
+            "storage_inspection",
+            "disk_progress",
+            "no_disk_progress",
+            "awaiting_disk_progress",
+        }
+        snapshot["camera"] = {
+            "status": camera.get("status")
+            if camera.get("status") in connection_states
+            else "unknown",
+            "recording": camera.get("recording") is True,
+            "recording_enabled": camera.get("recording_enabled") is True,
+            "recording_state": camera.get("recording_state")
+            if camera.get("recording_state") in recording_states
+            else "unknown",
+            "reason": recording.get("reason") if recording.get("reason") in reasons else "unknown",
+            "observed_bytes": count(recording.get("observed_bytes")),
+            "last_progress_age_seconds": seconds(recording.get("last_progress_age_seconds")),
+        }
+    except BaseException:
+        snapshot["camera_probe_failed"] = True
+    finally:
+        client.transport_failure = transport_failure
+    try:
+        code = publishers[0].poll()
+        snapshot["publisher_running"] = code is None
+        snapshot["publisher_exit_code"] = (
+            code if type(code) is int and -(2**31) <= code <= 2**32 - 1 else None
+        )
+    except BaseException:
+        snapshot["publisher_probe_failed"] = True
+    try:
+        # Reuse the cohort's remembered process/birth identities. Never look up a
+        # possibly recycled PID or discover fresh descendants after the failure.
+        with cohort.lock:
+            owned = tuple(cohort.processes.values())
+        decoder_count = 0
+        for process in owned:
+            try:
+                if not process.is_running():
+                    continue
+                if "k5vision.operator_events_decoder" in process.cmdline():
+                    decoder_count += 1
+            except (psutil.Error, OSError):
+                continue
+        snapshot["decoder_running_count"] = min(32, decoder_count)
+    except BaseException:
+        snapshot["decoder_probe_failed"] = True
 
 
 def _installed_analytics_journey(
@@ -1762,6 +3638,7 @@ def _installed_analytics_journey(
     helpers,
     browser_helpers,
     app,
+    cohort,
     publisher_credentials,
     diagnostic,
 ):
@@ -1807,13 +3684,14 @@ def _installed_analytics_journey(
         credentials=publisher_credentials,
     )
     processes.append(publishers[0])
+    positive_source_switched_at = datetime.now(UTC)
     detected = {}
 
     def positive_event():
-        result = _installed_person_events(client, route + "/events", diagnostic)
-        if not result:
+        event = _poll_installed_person_event(client, route, diagnostic)
+        if event is None:
             return False
-        detected.update(result[0])
+        detected.update(event)
         return (
             detected.get("camera_id") == camera_id
             and type(detected.get("person_count")) is int
@@ -1830,101 +3708,163 @@ def _installed_analytics_journey(
             timeout=25,
         )
     except BaseException:
+        try:
+            _installed_analytics_failure_snapshot(
+                client=client,
+                camera_id=camera_id,
+                publishers=publishers,
+                cohort=cohort,
+                diagnostic=diagnostic,
+            )
+        except BaseException:
+            diagnostic["analytics_failure_probe_failed"] = True
         # Distinguish a detector startup fault from a healthy but lagging
         # recorder using only typed, credential-free backend status.
         try:
             state = client.json(route + "/analytics")
+            sampled_at = state.get("last_sample_at")
+            try:
+                fresh_sample = (
+                    datetime.fromisoformat(sampled_at.replace("Z", "+00:00"))
+                    >= positive_source_switched_at
+                )
+            except (AttributeError, TypeError, ValueError):
+                fresh_sample = False
             diagnostic["analytics_failure_state"] = {
-                key: state.get(key) for key in ("status", "processed_frames", "event_count")
+                key: state.get(key)
+                for key in (
+                    "status",
+                    "processed_frames",
+                    "event_count",
+                    "sample_attempts",
+                    "sample_phase",
+                    "last_completed_phase",
+                    "native_write_cause",
+                )
             }
+            diagnostic["analytics_failure_state"]["sample_after_source_switch"] = fresh_sample
         except Exception:
             diagnostic["analytics_failure_state"] = {"available": False}
+        try:
+            inventory = client.json("/api/v1/operator/cameras")
+            camera = next(
+                item for item in inventory["cameras"] if item.get("device_id") == camera_id
+            )
+            recording = camera.get("recording_status") or {}
+            observed = recording.get("observed_bytes")
+            progress_age = recording.get("last_progress_age_seconds")
+            recording_state = camera.get("recording_state")
+            diagnostic["analytics_failure_recorder"] = {
+                "publisher_running": publishers[0].poll() is None,
+                "camera_live": camera.get("status") == "live",
+                "state": recording_state
+                if recording_state in {"recording", "waiting", "paused", "stalled", "error"}
+                else "other",
+                "observed_bytes_positive": type(observed) is int and observed > 0,
+                "recent_disk_progress": type(progress_age) in (int, float)
+                and 0 <= progress_age <= 15,
+            }
+        except Exception:
+            diagnostic["analytics_failure_recorder"] = {"available": False}
         raise
     occurred = datetime.fromisoformat(detected["occurred_at"].replace("Z", "+00:00"))
     _require(
         abs((datetime.now(UTC) - occurred).total_seconds()) < 30,
         "Person event was not mapped to the fresh recording's UTC timestamp",
     )
+    sampled_evidence = _installed_sampled_person_boxes(
+        page, camera_id, client, browser_helpers, diagnostic
+    )
     diagnostic["analytics_stage"] = "event_recording_navigation"
-    diagnostic["analytics_navigation_step"] = "history_range_click"
-    page.locator("#last-24-hours").click()
-    diagnostic["analytics_navigation_step"] = "events_refresh_click"
-    page.locator("#analytics-refresh").click()
-    expected_ms = (
-        datetime.fromisoformat(detected["playback_at"].replace("Z", "+00:00")).timestamp() * 1000
-    )
-
-    def navigation_snapshot():
-        # Only bounded browser state, never video source URLs or bearer values.
-        return page.evaluate(
-            """expected => {
-              const video=document.getElementById('playback-video');
-              const start=Date.parse(video?.dataset.utcStart || '');
-              const from=Date.parse(document.getElementById('history-start')?.value || '');
-              const to=Date.parse(document.getElementById('history-end')?.value || '');
-              return {
-                history_visible:!document.getElementById('history-panel')?.hidden,
-                history_start_delta_seconds:Number.isFinite(from)?Math.round((from-expected)/1000):null,
-                history_end_delta_seconds:Number.isFinite(to)?Math.round((to-expected)/1000):null,
-                history_intervals:document.querySelectorAll('#history-list button').length,
-                person_event_buttons:document.querySelectorAll('#analytics-events button').length,
-                playback_start_delta_ms:Number.isFinite(start)?Math.round(start-expected):null,
-                playback_ready_state:video?.readyState ?? null,
-                playback_frame_count:video?.getVideoPlaybackQuality?.().totalVideoFrames ?? null,
-                playback_paused:video?.paused ?? null,
-                playback_error_code:video?.error?.code ?? null,
-                playback_source_present:!!video?.currentSrc
-              };
-            }""",
-            expected_ms,
+    try:
+        diagnostic["analytics_navigation_step"] = "history_range_click"
+        page.locator("#last-24-hours").click()
+        diagnostic["analytics_navigation_step"] = "events_refresh_click"
+        page.locator("#analytics-refresh").click()
+        expected_ms = (
+            datetime.fromisoformat(detected["playback_at"].replace("Z", "+00:00")).timestamp()
+            * 1000
         )
 
-    diagnostic["analytics_navigation_step"] = "event_button_visible"
-    event_button = page.locator(f'#analytics-events button[data-event-id="{detected["id"]}"]')
-    try:
-        event_button.wait_for(state="visible", timeout=15_000)
-    except Exception:
-        diagnostic["analytics_navigation_snapshot"] = navigation_snapshot()
-        raise
-    diagnostic["analytics_navigation_step"] = "event_button_click"
-    event_button.click()
-    diagnostic["analytics_navigation_step"] = "playback_frames"
-    try:
-        page.wait_for_function(
-            """chosen => {
-              const video=document.getElementById('playback-video');
-              return Math.abs(Date.parse(video.dataset.utcStart || '')-chosen)<1000 &&
-                video.readyState>=2 && !video.paused &&
-                video.getVideoPlaybackQuality().totalVideoFrames>=4;
-            }""",
-            arg=expected_ms,
-            timeout=20_000,
+        def navigation_snapshot():
+            # Only bounded browser state, never video source URLs or bearer values.
+            return page.evaluate(
+                """expected => {
+                  const video=document.getElementById('playback-video');
+                  const start=Date.parse(video?.dataset.utcStart || '');
+                  const from=Date.parse(document.getElementById('history-start')?.value || '');
+                  const to=Date.parse(document.getElementById('history-end')?.value || '');
+                  return {
+                    history_visible:!document.getElementById('history-panel')?.hidden,
+                    history_start_delta_seconds:Number.isFinite(from)?Math.round((from-expected)/1000):null,
+                    history_end_delta_seconds:Number.isFinite(to)?Math.round((to-expected)/1000):null,
+                    history_intervals:document.querySelectorAll('#history-list button').length,
+                    person_event_buttons:
+                      document.querySelectorAll('#analytics-events button').length,
+                    playback_start_delta_ms:Number.isFinite(start)?Math.round(start-expected):null,
+                    playback_ready_state:video?.readyState ?? null,
+                    playback_frame_count:
+                      video?.getVideoPlaybackQuality?.().totalVideoFrames ?? null,
+                    playback_paused:video?.paused ?? null,
+                    playback_error_code:video?.error?.code ?? null,
+                    playback_source_present:!!video?.currentSrc
+                  };
+                }""",
+                expected_ms,
+            )
+
+        diagnostic["analytics_navigation_step"] = "event_button_visible"
+        event_button = page.locator(f'#analytics-events button[data-event-id="{detected["id"]}"]')
+        try:
+            event_button.wait_for(state="visible", timeout=15_000)
+        except Exception:
+            diagnostic["analytics_navigation_snapshot"] = navigation_snapshot()
+            raise
+        diagnostic["analytics_navigation_step"] = "event_button_click"
+        event_button.click()
+        diagnostic["analytics_navigation_step"] = "playback_frames"
+        try:
+            page.wait_for_function(
+                """chosen => {
+                  const video=document.getElementById('playback-video');
+                  return Math.abs(Date.parse(video.dataset.utcStart || '')-chosen)<1000 &&
+                    video.readyState>=2 && !video.paused &&
+                    video.getVideoPlaybackQuality().totalVideoFrames>=4;
+                }""",
+                arg=expected_ms,
+                timeout=20_000,
+            )
+        except Exception:
+            diagnostic["analytics_navigation_snapshot"] = navigation_snapshot()
+            raise
+        diagnostic["analytics_navigation_step"] = "playback_decoded"
+        event_frames = page.locator("#playback-video").evaluate(
+            "video => video.getVideoPlaybackQuality().totalVideoFrames"
         )
-    except Exception:
-        diagnostic["analytics_navigation_snapshot"] = navigation_snapshot()
+        diagnostic["analytics_navigation_step"] = "analytics_status_fetch"
+        status = client.json(route + "/analytics")
+        diagnostic["analytics_navigation_step"] = "analytics_status_verified"
+        _require(
+            status.get("processed_frames", 0) >= 1 and status.get("event_count", 0) >= 1,
+            "Installed detector reported an event without processing recorded frames",
+        )
+        diagnostic["analytics_navigation_step"] = "person_publisher_stop"
+        helpers._stop_owned(publishers[0])
+        diagnostic["analytics_navigation_step"] = "red_publisher_restart"
+        publishers[0] = _publish_fixture(
+            parent, ffmpeg, source_uri, helpers, credentials=publisher_credentials
+        )
+        processes.append(publishers[0])
+        diagnostic["analytics_navigation_step"] = "red_live_watch_open"
+        browser_helpers._open_camera_watch(page, camera_id)
+        diagnostic["analytics_navigation_step"] = "red_live_decode"
+        browser_helpers._decoded_color(page, "live-video", "red")
+    except BaseException:
+        try:
+            diagnostic["analytics_event_failure_ui"] = _native_failure_ui(page, occurred=occurred)
+        except BaseException:
+            diagnostic["analytics_event_ui_probe_failed"] = True
         raise
-    diagnostic["analytics_navigation_step"] = "playback_decoded"
-    event_frames = page.locator("#playback-video").evaluate(
-        "video => video.getVideoPlaybackQuality().totalVideoFrames"
-    )
-    diagnostic["analytics_navigation_step"] = "analytics_status_fetch"
-    status = client.json(route + "/analytics")
-    diagnostic["analytics_navigation_step"] = "analytics_status_verified"
-    _require(
-        status.get("processed_frames", 0) >= 1 and status.get("event_count", 0) >= 1,
-        "Installed detector reported an event without processing recorded frames",
-    )
-    diagnostic["analytics_navigation_step"] = "person_publisher_stop"
-    helpers._stop_owned(publishers[0])
-    diagnostic["analytics_navigation_step"] = "red_publisher_restart"
-    publishers[0] = _publish_fixture(
-        parent, ffmpeg, source_uri, helpers, credentials=publisher_credentials
-    )
-    processes.append(publishers[0])
-    diagnostic["analytics_navigation_step"] = "red_live_watch_open"
-    browser_helpers._open_camera_watch(page, camera_id)
-    diagnostic["analytics_navigation_step"] = "red_live_decode"
-    browser_helpers._decoded_color(page, "live-video", "red")
     diagnostic["analytics_stage"] = "complete"
     diagnostic["analytics_navigation_step"] = "complete"
     return {
@@ -1940,6 +3880,7 @@ def _installed_analytics_journey(
         "analytics_mock_inference": False,
         "analytics_accuracy_acceptance": False,
         "analytics_public_fixture_only": True,
+        **sampled_evidence,
     }, detected
 
 
@@ -2065,6 +4006,7 @@ def _vm_clock_phase(
     helpers,
     browser_helpers,
     app,
+    cohort,
     setup_sha256,
     diagnostic,
     publisher,
@@ -2259,8 +4201,25 @@ def _vm_clock_phase(
                 mark_clock_phase(direction + "_two_maintenance_cycles")
                 diagnostic["vm_clock_stage"] = direction + "_live"
                 diagnostic["vm_clock_stage"] = direction + "_live_media"
-                live_status = context.request.get(live_url, timeout=5000).status
+                try:
+                    live_response = context.request.get(live_url, timeout=5000)
+                    live_status = live_response.status
+                except Exception:
+                    # Classify the local gateway independently after the
+                    # original browser request has failed. Never count this as
+                    # accepted media or grant another browser attempt.
+                    diagnostic["vm_clock_live_gateway_probe"] = _clock_live_gateway_probe(
+                        live_url, original_token
+                    )
+                    raise
                 diagnostic["vm_clock_media_http_status"] = live_status
+                if live_status != 200:
+                    try:
+                        diagnostic["vm_clock_failure_snapshot"] = _native_clock_failure_snapshot(
+                            live_response, client=client, camera_id=camera_id, cohort=cohort
+                        )
+                    except BaseException:
+                        diagnostic["vm_clock_failure_probe_failed"] = True
                 _require(live_status == 200, "VM clock step expired authenticated live media")
                 _require(
                     page.locator("#workspace").is_visible(),
@@ -2402,11 +4361,28 @@ def _vm_clock_phase(
     diagnostic["vm_clock_stage"] = "restored_history_query"
     try:
         restored_history = client.json(route + "/history" + history_query)["spans"]
-    finally:
-        # The local client reports transport failures as RuntimeError. Retain
-        # only its bounded, route-free exception class and elapsed time.
+    except RuntimeError:
+        # Preserve the failed history request and its three-second deadline.
+        # After UTC restoration, probe health once, without retrying history.
+        # Only retain finite status/error types, never routes or camera data.
         if client.transport_failure is not None:
             diagnostic["vm_clock_history_transport"] = dict(client.transport_failure)
+        try:
+            observed = {}
+            ready = _healthy(client, observed)
+            diagnostic["vm_clock_postfailure_health"] = {
+                "reachable": True,
+                "ready": ready,
+                "status": observed.get("health_http_status", 0),
+            }
+        except RuntimeError:
+            failure = client.transport_failure or {}
+            diagnostic["vm_clock_postfailure_health"] = {
+                "reachable": False,
+                "exception_type": failure.get("exception_type", "other"),
+                "elapsed_seconds": failure.get("elapsed_seconds"),
+            }
+        raise
     diagnostic["vm_clock_stage"] = "restored_history_unchanged"
     _require(
         all(span in restored_history for span in before_history),
@@ -2491,7 +4467,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
     parent = Path(os.environ["LOCALAPPDATA"]) / ("K5 Desktop Proof-" + uuid4().hex)
     identity_state.validate_new_identity_directory(parent)
     parent.mkdir(mode=0o700)
-    installed, profile = parent / "installed app with spaces", parent / "profile with spaces"
+    installed, profile = _machine_paths()
     username, password = "fixture-admin", secrets.token_urlsafe(32)
     processes, reservations = [], []
     admin_executor = None
@@ -2530,7 +4506,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         "physical_camera_acceptance": False,
         "capacity_acceptance": False,
         "endurance_acceptance": False,
-        "windows_service": False,
+        "windows_service": True,
         "host_clock_step_acceptance": False,
         "mocked_gui": False,
         "user_terminal_required": False,
@@ -2688,7 +4664,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         receipt["installed_worker_bundle_verified"] = True
         receipt["actual_gui_installer"] = True
         reservations, ports = helpers._reserve_ports(5)
-        port, upstream_ports = ports[0], ports[1:]
+        port, upstream_ports = 8000, ports[1:]
         for listener in reservations:
             listener.close()
         _enter_stage("first_account_screen")
@@ -2733,7 +4709,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
             timeout=10,
         )
         receipt.update(_default_browser_handoff(api, form, port, diagnostic=readiness_diagnostic))
-        identity = identity_state.load_identity_state(profile / "identity")
+        identity = _profile_identity(profile)
         python_processes = [
             process
             for process in cohort.snapshot()
@@ -3068,6 +5044,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
             helpers=helpers,
             browser_helpers=browser_helpers,
             app=app,
+            cohort=cohort,
             publisher_credentials=primary_publisher_credentials,
             diagnostic=nvr_diagnostic,
         )
@@ -3209,6 +5186,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
                     helpers=helpers,
                     browser_helpers=browser_helpers,
                     app=app,
+                    cohort=cohort,
                     setup_sha256=setup_sha256,
                     diagnostic=vm_clock_diagnostic,
                     publisher=publishers[0],
@@ -3413,7 +5391,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         )
         _install_gui(setup, installed, api, diagnostic=readiness_diagnostic)
         _require(
-            identity_state.load_identity_state(profile / "identity").site_id == identity.site_id,
+            _profile_identity(profile).site_id == identity.site_id,
             "Stopped reinstall replaced the existing account identity",
         )
         _require(
@@ -3460,7 +5438,7 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
             "Native restart lost the operator's paused recording choice",
         )
         _require(
-            identity_state.load_identity_state(profile / "identity").site_id == identity.site_id,
+            _profile_identity(profile).site_id == identity.site_id,
             "Desktop restart changed the durable account site",
         )
         _require(all(path.is_file() for path in saved_files), "Restart removed recorded files")
@@ -3587,13 +5565,25 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         _require(result.returncode == 0, "Native desktop uninstall failed")
         _require(not (installed / "K5Vision.exe").exists(), "Uninstall left the installed app")
         _require(
-            identity_state.load_identity_state(profile / "identity").site_id == identity.site_id,
+            _profile_identity(profile).site_id == identity.site_id,
             "Uninstall removed or changed durable account state",
         )
         _require(all(path.is_file() for path in saved_files), "Uninstall removed recording files")
         receipt["uninstall_preserves_profile_and_media"] = True
         receipt["no_console_windows"] = not cohort.console_seen and not cohort.failed
     except BaseException as error:
+        try:
+            nvr_diagnostic["failure_frames"] = _native_failure_frames(error)
+        except BaseException:
+            nvr_diagnostic["failure_frame_probe_failed"] = True
+        if page is not None and not any(
+            key in nvr_diagnostic
+            for key in ("analytics_event_failure_ui", "analytics_event_ui_probe_failed")
+        ):
+            try:
+                nvr_diagnostic["failure_ui"] = _native_failure_ui(page)
+            except BaseException:
+                nvr_diagnostic["failure_ui_probe_failed"] = True
         nvr_diagnostic["failure_type"] = (
             type(error).__name__
             if type(error).__name__
@@ -3626,6 +5616,46 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
                 nvr_diagnostic["wall_state_at_failure"] = browser_helpers._wall_state(page)
             except BaseException:
                 nvr_diagnostic["wall_state_probe_failed"] = True
+        if failure is not None and stage == "installed_continuous_person_analytics":
+            # Reproduce a camera-free native model prime in the *installed*
+            # runtime while the failing desktop instance remains alive. The
+            # packaged-payload smoke does not exercise this installed context.
+            # Capture only a finite outcome; never stdout, stderr, model paths,
+            # credentials, request content, recording bytes or source URIs.
+            probe = (
+                "from k5vision.operator_events import _RecordedNativeWorker\n"
+                "from k5vision.operator_analytics_person import "
+                "load_installed_person_configuration\n"
+                "config = load_installed_person_configuration({})\n"
+                "assert config is not None\n"
+                "worker = _RecordedNativeWorker(config)\n"
+                "try:\n"
+                "    assert worker.request(None) is None and worker._person_ready\n"
+                "finally:\n"
+                "    worker.close()\n"
+            )
+            try:
+                completed = subprocess.run(
+                    [str(installed / "runtime/python.exe"), "-I", "-B", "-c", probe],
+                    cwd=installed,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    timeout=22,
+                    check=False,
+                )
+                nvr_diagnostic["analytics_installed_native_child_probe"] = (
+                    "passed"
+                    if completed.returncode == 0
+                    else "refused"
+                    if completed.returncode in {1, 2}
+                    else "abnormal_exit"
+                )
+            except subprocess.TimeoutExpired:
+                nvr_diagnostic["analytics_installed_native_child_probe"] = "timed_out"
+            except (OSError, ValueError):
+                nvr_diagnostic["analytics_installed_native_child_probe"] = "unavailable"
         if failure is not None and stage.startswith("actual_wall"):
             try:
                 status, body, _ = client.get("/api/v1/operator/cameras")
@@ -3654,53 +5684,108 @@ def test_native_windows_click_install_account_browser_tray_restart_uninstall(
         except BaseException:
             desktop_status = "unresponsive"
             desktop_probe = {"available": False}
+
+        def record_cleanup_failure(phase, error):
+            # First finite failure stage and type only: never an OS exception
+            # message, local path, process command, credential or source URI.
+            stages = {
+                "admin_executor",
+                "permissions_executor",
+                "browser_context",
+                "browser",
+                "playwright",
+                "cohort_process",
+                "publisher_process",
+                "onvif_fixture",
+                "temporary_files",
+            }
+            if phase not in stages:
+                phase = "other"
+            kind = type(error).__name__
+            kinds = {
+                "OSError",
+                "PermissionError",
+                "FileNotFoundError",
+                "TimeoutExpired",
+                "RuntimeError",
+                "AccessDenied",
+                "Error",
+                "ValueError",
+            }
+            nvr_diagnostic.setdefault("cleanup_failure_phase", phase)
+            nvr_diagnostic.setdefault("cleanup_failure_type", kind if kind in kinds else "other")
+            nvr_diagnostic["cleanup_failure_count"] = min(
+                9, nvr_diagnostic.get("cleanup_failure_count", 0) + 1
+            )
+
         if admin_executor is not None:
             try:
                 admin_executor.shutdown(wait=True, cancel_futures=True)
-            except Exception:
+            except Exception as error:
                 cleanup_failed = True
+                record_cleanup_failure("admin_executor", error)
         if permissions_executor is not None:
             try:
                 permissions_executor.shutdown(wait=True, cancel_futures=True)
-            except Exception:
+            except Exception as error:
                 cleanup_failed = True
-        process_counts = _cohort_diagnostic(cohort)
+                record_cleanup_failure("permissions_executor", error)
+        try:
+            process_counts = _cohort_diagnostic(cohort)
+        except BaseException as error:
+            process_counts = None
+            cleanup_failed = True
+            record_cleanup_failure("cohort_process", error)
         app_exit_code = app.poll() if app else None
         form_alive = bool(form and api.api.IsWindow(form))
         form_visible = bool(form and api.api.IsWindowVisible(form))
         cohort.finish()
-        for resource in (context, browser, playwright):
+        for name, resource in (
+            ("browser_context", context),
+            ("browser", browser),
+            ("playwright", playwright),
+        ):
             if resource is not None:
                 try:
-                    resource.stop() if resource is playwright else resource.close()
-                except Exception:
+                    resource.stop() if name == "playwright" else resource.close()
+                except Exception as error:
                     cleanup_failed = True
-        for process in reversed(cohort.snapshot()):
+                    record_cleanup_failure(name, error)
+        try:
+            cleanup_processes = cohort.snapshot()
+        except BaseException as error:
+            cleanup_processes = []
+            cleanup_failed = True
+            record_cleanup_failure("cohort_process", error)
+        nvr_diagnostic["process_ownership"] = cohort.ownership_diagnostic()
+        for process in reversed(cleanup_processes):
             try:
-                if process.is_running():
-                    process.kill()
-                    process.wait(timeout=10)
+                cohort.terminate_owned(process)
             except psutil.NoSuchProcess:
                 pass
-            except Exception:
+            except Exception as error:
                 cleanup_failed = True
+                record_cleanup_failure("cohort_process", error)
         for process in reversed(processes):
             try:
                 helpers._stop_owned(process)
-            except Exception:
+            except Exception as error:
                 cleanup_failed = True
+                record_cleanup_failure("publisher_process", error)
         for camera_fixture in onvif_cameras:
             try:
                 camera_fixture.close()
-            except Exception:
+            except Exception as error:
                 cleanup_failed = True
+                record_cleanup_failure("onvif_fixture", error)
         for listener in reservations:
             listener.close()
         if parent.exists():
             try:
-                shutil.rmtree(parent)
-            except Exception:
+                _remove_owned_temporary_tree(parent)
+            except Exception as error:
                 cleanup_failed = True
+                record_cleanup_failure("temporary_files", error)
         stage_durations.append(("cleanup", round(time.monotonic() - cleanup_started, 2)))
         diagnostic = {
             "stage": stage,

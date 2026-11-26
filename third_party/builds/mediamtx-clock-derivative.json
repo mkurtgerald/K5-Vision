@@ -1,0 +1,78 @@
+{
+  "schema_version": 1,
+  "scope": "experimental_native_derivative_not_product_qualification",
+  "derivative_version": "v1.21.2-k5-monotonic1",
+  "mediamtx": {
+    "repository": "https://github.com/bluenviron/mediamtx",
+    "revision": "914e39535ece709919ac325aaeed98d394ed9093",
+    "version": "v1.21.2",
+    "license_sha256": "ecae73b0a23185a35a1222edc0aae5245bb9739420bad0125b0c42e935301a80"
+  },
+  "gortsplib": {
+    "repository": "https://github.com/bluenviron/gortsplib",
+    "revision": "09cc2060a7188c1f5f58498a8ede1e56338cd804",
+    "version": "v5.6.7",
+    "module": "github.com/bluenviron/gortsplib/v5",
+    "module_sum": "h1:0o0Ays+oereZwmeOP66t154lmrvXJsON/4iCxDnjgmw=",
+    "go_mod_sum": "h1:5aF0ncI3gp3OjaOfJEL4qBOFiheEgrLWp2nc13rHt2c="
+  },
+  "patch": {
+    "path": "third_party/patches/gortsplib-5.6.7-monotonic-tcp-watchdog.patch",
+    "sha256": "1ed5d2e402c16223d0d9fdac2bb19be15bdc856f06ca96ede1f0d9422a78a0e5",
+    "manifest_path": "third_party/patches/gortsplib-5.6.7-monotonic-tcp-watchdog.json",
+    "manifest_sha256": "07f48c37a9e7fe2d27b7d15a179e3105f3d601931a32e36b716eff8cd1655dc1"
+  },
+  "go": {
+    "version": "go1.27.0",
+    "url": "https://go.dev/dl/go1.27.0.windows-amd64.zip",
+    "archive_sha256": "f0c0a0d33ba94f4d2c5dbc887334ce678b21813504ddb3aafcb06e60a5a667c4",
+    "archive_bytes": 78924880
+  },
+  "hls_js": {
+    "version": "v1.7.3",
+    "revision": "e5ff3583965e3af16c4a4b4d2b5f7bd1ffb5b7de",
+    "url": "https://github.com/video-dev/hls.js/releases/download/v1.7.3/release.zip",
+    "archive_sha256": "abbda85f3e9b8325fc6b8dbf4fa612ea87144ebad93c2150594e64aad58ec529",
+    "archive_bytes": 7704258,
+    "license_path": "third_party/licenses/hls.js-LICENSE.txt",
+    "license_sha256": "ca8773cf798c7ed997d4dd7c8e23c348699f8d5b7462636694cc14de6cda12db",
+    "license": "Apache-2.0",
+    "apache_license_path": "third_party/licenses/Apache-2.0.txt",
+    "apache_license_sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+  },
+  "build": {
+    "goos": "windows",
+    "goarch": "amd64",
+    "cgo_enabled": "0",
+    "flags": [
+      "-trimpath",
+      "-buildvcs=false",
+      "-mod=readonly",
+      "-ldflags=-s -w -buildid="
+    ],
+    "additional_targets": [
+      {
+        "goos": "linux",
+        "goarch": "amd64",
+        "scope": "cross_build_with_separate_native_ubuntu_smoke",
+        "reproducibility_claimed": false
+      }
+    ]
+  },
+  "regression": {
+    "baseline_test_file": "client_tcp_watchdog_clock_test.go",
+    "baseline_regex": "^TestClientTCPWatchdogWallClock",
+    "baseline_required_failures": [
+      "TestClientTCPWatchdogWallClockForward",
+      "TestClientTCPWatchdogWallClockBackward"
+    ],
+    "test_regex": "^TestClientTCPWatchdog",
+    "required_tests": [
+      "TestClientTCPWatchdogWallClockForward",
+      "TestClientTCPWatchdogWallClockBackward",
+      "TestClientTCPWatchdogElapsedDeadline",
+      "TestClientTCPWatchdogEOFDoesNotRefresh",
+      "TestClientTCPWatchdogConcurrentRefresh"
+    ]
+  }
+}

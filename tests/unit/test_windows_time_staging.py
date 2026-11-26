@@ -4,7 +4,9 @@ import hashlib
 import importlib.util
 import json
 import os
+import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import test_operator_time_admin as time_helpers
@@ -99,3 +101,214 @@ def test_different_supervisor_is_rejected_without_rebuilding_or_repinning(payloa
     with pytest.raises(AssertionError):
         _HELPERS._stage_private_payload(source, parent, **pins)
     assert not (parent / "sealed native payload").exists()
+
+
+@pytest.fixture
+def installer_candidate(payload):
+    source, pins, _ = payload
+    setup = source / "K5VisionSetup.exe"
+    setup.write_bytes(b"original generated installer")
+    setup_sha = hashlib.sha256(setup.read_bytes()).hexdigest()
+    metadata = {
+        "schema_version": 1,
+        "qualification_status": "unqualified",
+        "head_sha": "a" * 40,
+        "setup_sha256": setup_sha,
+        "setup_bytes": setup.stat().st_size,
+        "launcher_sha256": pins["supervisor_sha"],
+        "payload_manifest_sha256": pins["manifest_sha"],
+    }
+    path = source / "desktop-package.json"
+    path.write_text(json.dumps(metadata))
+    return setup, setup_sha, metadata, path
+
+
+def test_installed_time_candidate_binds_original_installer_and_payload_before_install(
+    installer_candidate,
+):
+    setup, setup_sha, metadata, _ = installer_candidate
+    actual, package, manifest = _HELPERS._candidate(setup, "a" * 40, setup_sha)
+    assert actual == setup and package == metadata
+    assert hashlib.sha256(manifest).hexdigest() == metadata["payload_manifest_sha256"]
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("qualification_status", "qualified"),
+        ("head_sha", "b" * 40),
+        ("setup_sha256", "0" * 64),
+        ("setup_bytes", 1),
+        ("launcher_sha256", "unsealed executable"),
+        ("payload_manifest_sha256", "0" * 64),
+    ],
+)
+def test_installed_time_candidate_cannot_change_pins_or_claim_prior_qualification(
+    installer_candidate, field, value
+):
+    setup, setup_sha, metadata, path = installer_candidate
+    metadata[field] = value
+    path.write_text(json.dumps(metadata))
+    with pytest.raises(AssertionError):
+        _HELPERS._candidate(setup, "a" * 40, setup_sha)
+
+
+@pytest.mark.parametrize("primary_type", [RuntimeError, pytest.fail.Exception])
+def test_uninstaller_timeout_cannot_replace_original_installer_failure(primary_type):
+    primary = primary_type("Original installer deadline")
+    attempted, records = [], []
+
+    def uninstall():
+        attempted.append("uninstall")
+        raise subprocess.TimeoutExpired(["private-uninstaller-path"], 45)
+
+    with pytest.raises(primary_type, match="Original installer deadline") as failure:
+        try:
+            raise primary
+        finally:
+            _HELPERS._cleanup_fixture(
+                (
+                    ("uninstall", uninstall),
+                    ("temporary_state", lambda: attempted.append("temporary_state")),
+                ),
+                lambda name, value: records.append((name, value)),
+                primary_error=primary,
+            )
+    assert failure.value is primary
+    assert attempted == ["uninstall", "temporary_state"]
+    assert records[0][0] == "k5_native_time_cleanup_diagnostic"
+    diagnostic = json.loads(records[0][1])
+    assert diagnostic["primary_failed"] is True
+    assert diagnostic["cleanup_timeout"] is True
+    assert diagnostic["cleanup_error_type"] == "TimeoutExpired"
+    assert diagnostic["cleanup_error_stage"] == "uninstall"
+    assert "private-uninstaller-path" not in records[0][1]
+
+
+def test_installer_failure_evidence_precedes_teardown_and_preserves_primary():
+    primary = pytest.fail.Exception("Actual installer wizard exceeded its deadline")
+    events, records = [], []
+
+    def install(setup, installed, api, *, diagnostic):
+        diagnostic.update(installer_action="install_wait", installer_install_posted=True)
+        raise primary
+
+    def snapshot(installed, profile):
+        events.append("snapshot")
+        return {"service_registered": True, "scm": {"state": 2}}
+
+    desktop = SimpleNamespace(
+        _install_gui=install,
+        _helpers=lambda name: SimpleNamespace(installer_failure_snapshot=snapshot),
+    )
+    with pytest.raises(pytest.fail.Exception) as failure:
+        try:
+            _HELPERS._install_fixture(
+                desktop, None, None, None, None, lambda name, value: records.append((name, value))
+            )
+        finally:
+            events.append("teardown")
+    assert failure.value is primary
+    assert events == ["snapshot", "teardown"]
+    assert records[0][0] == "k5_native_time_installer_diagnostic"
+    diagnostic = json.loads(records[0][1])
+    assert diagnostic["installer_action"] == "install_wait"
+    assert diagnostic["installer_install_posted"] is True
+    assert diagnostic["installation_snapshot"]["scm"] == {"state": 2}
+
+
+@pytest.mark.parametrize("evidence_failure", ["snapshot", "record"])
+def test_secondary_installer_evidence_errors_cannot_mask_deadline(evidence_failure):
+    primary = RuntimeError("Actual installer wizard exceeded its deadline")
+    records = []
+
+    def install(setup, installed, api, *, diagnostic):
+        diagnostic["installer_action"] = "next"
+        raise primary
+
+    def snapshot(installed, profile):
+        if evidence_failure == "snapshot":
+            raise OSError("private profile path and credential")
+        return {"service_registered": False}
+
+    def record(name, value):
+        if evidence_failure == "record":
+            raise RuntimeError("Private artifact output path")
+        records.append((name, value))
+
+    desktop = SimpleNamespace(
+        _install_gui=install,
+        _helpers=lambda name: SimpleNamespace(installer_failure_snapshot=snapshot),
+    )
+    with pytest.raises(RuntimeError) as failure:
+        _HELPERS._install_fixture(desktop, None, None, None, None, record)
+    assert failure.value is primary
+    if evidence_failure == "snapshot":
+        assert json.loads(records[0][1])["installation_snapshot_unavailable"] is True
+        assert "private" not in records[0][1].casefold()
+
+
+def test_successful_installer_retains_diagnostic_without_failure_snapshot():
+    records = []
+
+    def install(setup, installed, api, *, diagnostic):
+        diagnostic.update(installer_action="finish", installer_next_clicks=2)
+
+    def unexpected_snapshot(name):
+        pytest.fail("Successful install must not collect a failure snapshot")
+
+    desktop = SimpleNamespace(_install_gui=install, _helpers=unexpected_snapshot)
+    _HELPERS._install_fixture(
+        desktop, None, None, None, None, lambda name, value: records.append((name, value))
+    )
+    assert records == [
+        (
+            "k5_native_time_installer_diagnostic",
+            '{"installer_action": "finish", "installer_next_clicks": 2}',
+        )
+    ]
+
+
+def test_cleanup_timeout_after_success_is_still_a_failed_native_time_test():
+    records = []
+
+    def uninstall():
+        raise subprocess.TimeoutExpired(["private-command"], 45)
+
+    with pytest.raises(
+        pytest.fail.Exception, match="Native time fixture cleanup failed"
+    ) as failure:
+        _HELPERS._cleanup_fixture(
+            (("uninstall", uninstall),), lambda name, value: records.append(value)
+        )
+    diagnostic = json.loads(records[0])
+    assert diagnostic["primary_failed"] is False and diagnostic["cleanup_failed"] is True
+    assert diagnostic["cleanup_timeout"] is True
+    assert "private-command" not in str(failure.value)
+
+
+def test_secondary_cleanup_errors_are_finite_and_do_not_skip_later_cleanup():
+    attempted, records = [], []
+
+    class PrivateError(Exception):
+        pass
+
+    def stop():
+        attempted.append("client")
+        raise PrivateError("private source, credential and path")
+
+    primary = RuntimeError("Original failure")
+    _HELPERS._cleanup_fixture(
+        (
+            ("client", stop),
+            ("cohort", lambda: attempted.append("cohort")),
+            ("temporary_state", lambda: attempted.append("temporary_state")),
+        ),
+        lambda name, value: records.append(value),
+        primary_error=primary,
+    )
+    assert attempted == ["client", "cohort", "temporary_state"]
+    diagnostic = json.loads(records[0])
+    assert diagnostic["cleanup_error_type"] == "other"
+    assert diagnostic["cleanup_timeout"] is False
+    assert "PrivateError" not in records[0] and "credential" not in records[0]

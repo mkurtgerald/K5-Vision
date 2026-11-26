@@ -1,0 +1,411 @@
+name: Windows recorder source compilation
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [codex/unattended-windows-20261121]
+    paths:
+      - .github/workflows/windows-service-compile.yml
+      - .github/actions/prepare-windows-browser/**
+      - windows/desktop/**
+      - scripts/compile_desktop_launcher.py
+      - tests/integration/windows_standard_user_probe.cs
+      - scripts/probe_windows_machine_admission.cs
+      - scripts/probe_windows_machine_admission.py
+      - scripts/probe_windows_recorder_wire.cs
+      - scripts/probe_windows_browser_launch.cs
+      - scripts/probe_windows_client_singleton.cs
+      - scripts/probe_windows_legacy_profiles.py
+      - tests/unit/test_windows_legacy_profiles_probe.py
+      - src/k5vision/legacy_migration_copy.py
+      - scripts/probe_windows_directory_pin.py
+      - tests/unit/test_windows_directory_pin_probe.py
+      - src/k5vision/operator_storage_directory.py
+      - scripts/probe_windows_clock_storage_pins.py
+      - tests/unit/test_windows_clock_storage_pin_probe.py
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/windows-service-compile.yml
+      - .github/actions/prepare-windows-browser/**
+      - windows/desktop/**
+      - scripts/compile_desktop_launcher.py
+      - tests/integration/windows_standard_user_probe.cs
+      - scripts/probe_windows_machine_admission.cs
+      - scripts/probe_windows_machine_admission.py
+      - scripts/probe_windows_recorder_wire.cs
+      - scripts/probe_windows_browser_launch.cs
+      - scripts/probe_windows_client_singleton.cs
+      - scripts/probe_windows_legacy_profiles.py
+      - tests/unit/test_windows_legacy_profiles_probe.py
+      - src/k5vision/legacy_migration_copy.py
+      - scripts/probe_windows_directory_pin.py
+      - tests/unit/test_windows_directory_pin_probe.py
+      - src/k5vision/operator_storage_directory.py
+      - scripts/probe_windows_clock_storage_pins.py
+      - tests/unit/test_windows_clock_storage_pin_probe.py
+
+permissions:
+  contents: read
+
+concurrency:
+  group: recorder-source-compile-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  clock-storage-pins:
+    name: Verify actual clock and storage directory sharing
+    runs-on: windows-2025
+    timeout-minutes: 5
+    steps:
+      - name: Checkout exact clock and storage source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Checkout exact zero-access clock and storage source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: 23a24e57679534d77a5ea3881902f24a2d8e8e5f
+          path: native-clock-storage-baseline
+          persist-credentials: false
+      - name: Use the exact packaged Python version
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12.10"
+          architecture: x64
+      - name: Exercise extracted real native directory opens
+        shell: pwsh
+        timeout-minutes: 2
+        env:
+          K5_NATIVE_PROBE_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          python -I scripts/probe_windows_clock_storage_pins.py
+          if ($LASTEXITCODE -ne 0) { throw "Native clock/storage directory sharing validation failed" }
+      - name: Retain only source-bound native sharing facts
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: native-clock-storage-pins-${{ github.run_id }}
+          path: native-clock-storage-pins.json
+          if-no-files-found: error
+          retention-days: 14
+  directory-pin:
+    name: Verify actual Windows directory pins deny deletion access
+    runs-on: windows-2025
+    timeout-minutes: 5
+    steps:
+      - name: Checkout exact directory pin source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Checkout the exact metadata-only pin that failed native qualification
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: f96c828f4fdeb63596e2b6a27da9b29487387160
+          path: native-copy-baseline
+          persist-credentials: false
+      - name: Use the exact packaged Python version
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12.10"
+          architecture: x64
+      - name: Exercise actual historical and current Win32 directory handle access
+        shell: pwsh
+        timeout-minutes: 2
+        env:
+          K5_NATIVE_PROBE_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          python -I scripts/probe_windows_directory_pin.py
+          if ($LASTEXITCODE -ne 0) { throw "Native directory pin sharing validation failed" }
+      - name: Retain only source-bound directory pin facts
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: native-directory-pin-${{ github.run_id }}
+          path: native-directory-pin.json
+          if-no-files-found: error
+          retention-days: 14
+  legacy-profiles:
+    name: Verify native legacy markers and service readiness protocol
+    runs-on: windows-2025
+    timeout-minutes: 5
+    steps:
+      - name: Checkout exact native legacy consumers
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Checkout exact historical bridge for causal runtime refusal
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: 0bc10f5aacaa45903b33d9f2dfb23c9d8d197868
+          path: native-bridge-baseline
+          persist-credentials: false
+      - name: Use the exact packaged Python version
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12.10"
+          architecture: x64
+      - name: Compile actual constructor context and Receive baseline and candidate
+        shell: pwsh
+        timeout-minutes: 2
+        env:
+          K5_NATIVE_PROBE_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          python -I scripts/probe_windows_legacy_profiles.py
+          if ($LASTEXITCODE -ne 0) { throw "Native legacy marker validation failed" }
+      - name: Retain only source-bound native marker facts
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: native-legacy-profiles-${{ github.run_id }}
+          path: native-legacy-profiles.json
+          if-no-files-found: error
+          retention-days: 14
+  client-singleton:
+    name: Verify native client singleton and session activation without starting K5
+    runs-on: windows-2025
+    timeout-minutes: 5
+    steps:
+      - name: Checkout exact client and native singleton regression
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Compile and run actual client mutex and activation events across processes
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $compiler = Join-Path $env:WINDIR 'Microsoft.NET/Framework64/v4.0.30319/csc.exe'
+          New-Item -ItemType Directory -Path client-proof | Out-Null
+          @'
+          namespace K5VisionDesktop {
+            internal static class PayloadIdentity {
+              internal const string ManifestSha256 = "0000000000000000000000000000000000000000000000000000000000000000";
+              internal const string HeadSha = "0000000000000000000000000000000000000000";
+            }
+          }
+          '@ | Set-Content -LiteralPath client-proof/PayloadIdentity.cs -Encoding utf8
+          $identity = (Resolve-Path -LiteralPath client-proof/PayloadIdentity.cs).Path
+          $fixture = (Resolve-Path -LiteralPath scripts/probe_windows_client_singleton.cs).Path
+          $sources = @('K5Vision.cs', 'K5RecorderHost.cs', 'K5ServiceInstallation.cs', 'K5VisionClient.cs') |
+            ForEach-Object { (Resolve-Path -LiteralPath (Join-Path 'windows/desktop' $_)).Path }
+          $references = @('System.dll', 'System.Core.dll', 'System.Drawing.dll', 'System.Windows.Forms.dll',
+            'System.Web.Extensions.dll', 'System.IO.Compression.dll', 'System.IO.Compression.FileSystem.dll')
+          $referenceFlags = @($references | ForEach-Object { '/reference:' + $_ })
+          $output = Join-Path (Resolve-Path -LiteralPath client-proof).Path 'ClientSingletonProbe.exe'
+          & $compiler /nologo /target:exe /main:K5VisionDesktop.ClientSingletonProbe /platform:x64 /optimize+ /warn:4 /warnaserror+ /codepage:65001 @referenceFlags "/out:$output" @sources $identity $fixture
+          if ($LASTEXITCODE -ne 0) { throw 'Actual client singleton regression compilation failed' }
+          # Only the QA entry point runs. It creates actual production leases
+          # and launches its own duplicate children; no product Main or engine.
+          & $output | Tee-Object -FilePath client-singleton-native.json
+          if ($LASTEXITCODE -ne 0) { throw 'Actual client singleton regression failed' }
+          $evidence = Get-Content -LiteralPath client-singleton-native.json -Raw | ConvertFrom-Json
+          if ($evidence.schema_version -ne 1 -or $evidence.status -ne 'passed') {
+            throw 'Actual client singleton regression did not pass'
+          }
+          Remove-Item -LiteralPath client-proof -Recurse -Force
+      - name: Retain finite native singleton observations
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: client-singleton-${{ github.run_id }}
+          path: client-singleton-native.json
+          if-no-files-found: warn
+          retention-days: 14
+  browser:
+    name: Observe actual Windows default-browser dispatch independently
+    runs-on: windows-2025
+    timeout-minutes: 5
+    steps:
+      - name: Checkout exact candidate browser client and native observation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Prepare the disposable CI user's default browser
+        uses: ./.github/actions/prepare-windows-browser
+      - name: Compile and run actual client browser dispatch against owned local HTML
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $compilerRoot = Join-Path $env:WINDIR 'Microsoft.NET/Framework64/v4.0.30319'
+          $compiler = Join-Path $compilerRoot 'csc.exe'
+          New-Item -ItemType Directory -Path browser-proof | Out-Null
+          @'
+          namespace K5VisionDesktop {
+            internal static class PayloadIdentity {
+              internal const string ManifestSha256 = "0000000000000000000000000000000000000000000000000000000000000000";
+              internal const string HeadSha = "0000000000000000000000000000000000000000";
+            }
+          }
+          '@ | Set-Content -LiteralPath browser-proof/PayloadIdentity.cs -Encoding utf8
+          $identity = (Resolve-Path -LiteralPath browser-proof/PayloadIdentity.cs).Path
+          $fixture = (Resolve-Path -LiteralPath scripts/probe_windows_browser_launch.cs).Path
+          $sources = @('K5Vision.cs', 'K5RecorderHost.cs', 'K5ServiceInstallation.cs', 'K5VisionClient.cs') |
+            ForEach-Object { (Resolve-Path -LiteralPath (Join-Path 'windows/desktop' $_)).Path }
+          $references = @('System.dll', 'System.Core.dll', 'System.Drawing.dll', 'System.Windows.Forms.dll',
+            'System.Web.Extensions.dll', 'System.IO.Compression.dll', 'System.IO.Compression.FileSystem.dll')
+          $referenceFlags = @($references | ForEach-Object { '/reference:' + $_ })
+          $referenceFlags += '/reference:' + (Join-Path $compilerRoot 'WPF/UIAutomationClient.dll')
+          $referenceFlags += '/reference:' + (Join-Path $compilerRoot 'WPF/UIAutomationTypes.dll')
+          $referenceFlags += '/reference:' + (Join-Path $compilerRoot 'WPF/WindowsBase.dll')
+          $output = Join-Path (Resolve-Path -LiteralPath browser-proof).Path 'BrowserLaunchProbe.exe'
+          & $compiler /nologo /target:exe /main:K5VisionDesktop.BrowserLaunchProbe /platform:x64 /optimize+ /warn:4 /warnaserror+ /codepage:65001 @referenceFlags "/out:$output" @sources $identity $fixture
+          if ($LASTEXITCODE -ne 0) { throw 'Actual client browser observation compilation failed' }
+          # Only QA Main executes. It invokes the real OpenDashboard against
+          # its own static HTML listener; no product Main, profile or service.
+          # Match the installed-client acceptance's deliberately minimal env.
+          $env:PATH = (Join-Path $env:SYSTEMROOT 'System32') + ';' + $env:SYSTEMROOT
+          $env:PYTHONHOME = Join-Path (Resolve-Path -LiteralPath browser-proof).Path 'no external Python'
+          $env:PYTHONPATH = Join-Path (Resolve-Path -LiteralPath browser-proof).Path 'no external modules'
+          & $output | Tee-Object -FilePath browser-dispatch-native.json
+          if ($LASTEXITCODE -ne 0) { throw 'Native browser observation did not complete' }
+          $browserEvidence = Get-Content -LiteralPath browser-dispatch-native.json -Raw | ConvertFrom-Json
+          if ($browserEvidence.schema_version -ne 1 -or $browserEvidence.status -ne 'diagnostic_complete') {
+            throw 'Native browser observation did not produce a completed receipt'
+          }
+          foreach ($field in @('actual_product_dispatch', 'origin_request_observed', 'origin_response_sent', 'browser_window_visible', 'browser_title_matches')) {
+            if ($browserEvidence.$field -isnot [bool] -or $browserEvidence.$field -ne $true) {
+              throw "Prepared default-browser acceptance failed: $field"
+            }
+          }
+          Remove-Item -LiteralPath browser-proof -Recurse -Force
+      - name: Retain finite default-browser observations without claiming product qualification
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: browser-dispatch-${{ github.run_id }}
+          path: browser-dispatch-native.json
+          if-no-files-found: warn
+          retention-days: 14
+  wire:
+    name: Reproduce and fix the actual Framework async pipe lifecycle
+    runs-on: windows-2025
+    timeout-minutes: 5
+    steps:
+      - name: Checkout exact candidate wire and native regression
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Checkout immutable source that reproduced the readiness failure
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: d9f6a49099760485fb4b968cca309715cecf7885
+          path: wire-baseline
+          persist-credentials: false
+          sparse-checkout: windows/desktop
+      - name: Checkout immutable source with the unread-response disconnect race
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: 6556833488ea51f246254185cd988f5873da35a1
+          path: wire-delivery-baseline
+          persist-credentials: false
+          sparse-checkout: windows/desktop
+      - name: Compile and run the real production wire against native asynchronous pipes
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $compiler = Join-Path $env:WINDIR 'Microsoft.NET/Framework64/v4.0.30319/csc.exe'
+          $fixture = (Resolve-Path -LiteralPath scripts/probe_windows_recorder_wire.cs).Path
+          New-Item -ItemType Directory -Path wire-proof | Out-Null
+          @'
+          namespace K5VisionDesktop {
+            internal static class PayloadIdentity {
+              internal const string ManifestSha256 = "0000000000000000000000000000000000000000000000000000000000000000";
+              internal const string HeadSha = "0000000000000000000000000000000000000000";
+            }
+          }
+          '@ | Set-Content -LiteralPath wire-proof/PayloadIdentity.cs -Encoding utf8
+          $identity = (Resolve-Path -LiteralPath wire-proof/PayloadIdentity.cs).Path
+          $references = @('System.dll', 'System.Core.dll', 'System.Drawing.dll', 'System.Windows.Forms.dll',
+            'System.Web.Extensions.dll', 'System.IO.Compression.dll', 'System.IO.Compression.FileSystem.dll')
+          $referenceFlags = @($references | ForEach-Object { '/reference:' + $_ })
+          foreach ($variant in @('baseline', 'delivery-baseline', 'fixed')) {
+            $sourceRoot = if ($variant -eq 'baseline') { 'wire-baseline/windows/desktop' }
+              elseif ($variant -eq 'delivery-baseline') { 'wire-delivery-baseline/windows/desktop' }
+              else { 'windows/desktop' }
+            $sources = @('K5Vision.cs', 'K5RecorderHost.cs', 'K5ServiceInstallation.cs', 'K5VisionClient.cs') |
+              ForEach-Object { (Resolve-Path -LiteralPath (Join-Path $sourceRoot $_)).Path }
+            $output = Join-Path (Resolve-Path -LiteralPath wire-proof).Path ($variant + '.exe')
+            & $compiler /nologo /target:exe /main:K5VisionDesktop.RecorderWireProbe /platform:x64 /optimize+ /warn:4 /warnaserror+ /codepage:65001 @referenceFlags "/out:$output" @sources $identity $fixture
+            if ($LASTEXITCODE -ne 0) { throw 'Actual native wire fixture compilation failed' }
+            # Only the fixture's Main executes: private generated pipes, no
+            # product entry point, service, profile, account or clock operation.
+            & $output ('--' + $variant) | Tee-Object -FilePath ('recorder-wire-' + $variant + '.json')
+            $observed = $LASTEXITCODE
+            $expected = if ($variant -eq 'baseline') { 10 } elseif ($variant -eq 'delivery-baseline') { 11 } else { 0 }
+            if ($observed -ne $expected) { throw "Native wire $variant did not establish its required result" }
+          }
+          Remove-Item -LiteralPath wire-proof -Recurse -Force
+      - name: Retain finite native wire red and green observations
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: recorder-wire-${{ github.run_id }}
+          path: |
+            recorder-wire-baseline.json
+            recorder-wire-delivery-baseline.json
+            recorder-wire-fixed.json
+          if-no-files-found: warn
+          retention-days: 14
+  compile:
+    name: Compile native recorder and client without building an installer
+    runs-on: windows-2025
+    timeout-minutes: 5
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Set up development Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+      - name: Compile all native entry points with warnings as errors
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path compile-only/payload -Force | Out-Null
+          @'
+          namespace K5VisionDesktop {
+            internal static class PayloadIdentity {
+              internal const string ManifestSha256 = "0000000000000000000000000000000000000000000000000000000000000000";
+              internal const string HeadSha = "0000000000000000000000000000000000000000";
+            }
+          }
+          '@ | Set-Content -LiteralPath compile-only/PayloadIdentity.generated.cs -Encoding utf8
+          python scripts/compile_desktop_launcher.py --build compile-only
+          if ($LASTEXITCODE -ne 0) { throw "Native recorder source compilation failed" }
+          $compiler = Join-Path $env:WINDIR 'Microsoft.NET/Framework64/v4.0.30319/csc.exe'
+          $probeSource = (Resolve-Path -LiteralPath tests/integration/windows_standard_user_probe.cs).Path
+          $probeOutput = Join-Path (Resolve-Path -LiteralPath compile-only).Path 'OrdinaryUserProbe.exe'
+          & $compiler /nologo /target:winexe /platform:x64 /optimize+ /warn:4 /warnaserror+ /codepage:65001 /reference:System.dll /reference:System.Core.dll /reference:System.Web.Extensions.dll "/out:$probeOutput" $probeSource
+          if ($LASTEXITCODE -ne 0) { throw "Ordinary Windows account probe compilation failed" }
+          $admissionSource = (Resolve-Path -LiteralPath scripts/probe_windows_machine_admission.cs).Path
+          $admissionOutput = Join-Path (Resolve-Path -LiteralPath compile-only).Path 'MachineAdmissionProbe.exe'
+          & $compiler /nologo /target:exe /platform:x64 /warn:4 /warnaserror+ /reference:System.dll /reference:System.Core.dll /reference:System.Web.Extensions.dll "/out:$admissionOutput" $admissionSource
+          if ($LASTEXITCODE -ne 0) { throw "Read-only admission probe compilation failed" }
+          $launcher = (Resolve-Path -LiteralPath compile-only/payload/K5Vision.exe).Path
+          & $admissionOutput $launcher | Tee-Object -FilePath machine-admission-native.json
+          if ($LASTEXITCODE -ne 0) { throw "Read-only native admission observation failed" }
+          python scripts/probe_windows_machine_admission.py | Tee-Object -FilePath machine-admission-python.json
+          if ($LASTEXITCODE -ne 0) { throw "Read-only Python admission observation failed" }
+          # The probe invokes only the actual guard's read-only admission method.
+          # Never launch or distribute this placeholder product executable, or
+          # treat a completed diagnostic as installed-service qualification.
+          Remove-Item -LiteralPath compile-only -Recurse -Force
+      - name: Retain finite machine-admission observations
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: machine-admission-${{ github.run_id }}
+          path: |
+            machine-admission-native.json
+            machine-admission-python.json
+          if-no-files-found: warn
+          retention-days: 14

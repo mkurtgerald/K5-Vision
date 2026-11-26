@@ -19,7 +19,8 @@ _CASE = "test_native_windows_click_install_account_browser_tray_restart_uninstal
 _HEAD = "a" * 40
 _INSTALLER = "b" * 64
 _TRUE = (
-    "native_windows_execution generated_media_only actual_gui_installer actual_gui_account_setup "
+    "native_windows_execution windows_service generated_media_only "
+    "actual_gui_installer actual_gui_account_setup "
     "administrator_login embedded_python_independent_of_path actual_edge_login_enrollment_live "
     "close_hides_to_tray recording_continues_after_browser_and_window_close "
     "second_click_reopens_single_instance graceful_owned_process_cleanup "
@@ -29,7 +30,7 @@ _TRUE = (
     "onvif_time_health_displayed recorder_time_health_displayed host_clock_step_acceptance"
 ).split()
 _FALSE = (
-    "physical_camera_acceptance capacity_acceptance endurance_acceptance windows_service "
+    "physical_camera_acceptance capacity_acceptance endurance_acceptance "
     "mocked_gui user_terminal_required"
 ).split()
 _MISSING = object()

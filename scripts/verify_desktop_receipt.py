@@ -23,7 +23,8 @@ _SETTINGS_TRUE = (
     "settings_oidc_existing_role settings_restored_before_restart"
 ).split()
 _TRUE = (
-    "native_windows_execution generated_media_only actual_gui_installer actual_gui_account_setup "
+    "native_windows_execution windows_service generated_media_only "
+    "actual_gui_installer actual_gui_account_setup "
     "installed_worker_bundle_verified "
     "administrator_login embedded_python_independent_of_path actual_edge_login_enrollment_live "
     "close_hides_to_tray recording_continues_after_browser_and_window_close "
@@ -52,12 +53,14 @@ _TRUE = (
     "export_download_opened_in_edge "
     "product_analytics_enablement analytics_bundled_native_inference analytics_gui_configuration "
     "analytics_person_event_recorded analytics_event_utc_playback analytics_public_fixture_only "
+    "analytics_sampled_native_boxes analytics_sampled_same_frame_overlay "
+    "analytics_sampled_canvas_cleared "
     "analytics_browser_closed_detection analytics_role_camera_permissions "
     "analytics_settings_events_persisted"
 ).split()
 _TRUE += _SETTINGS_TRUE
 _FALSE = (
-    "physical_camera_acceptance capacity_acceptance endurance_acceptance windows_service "
+    "physical_camera_acceptance capacity_acceptance endurance_acceptance "
     "mocked_gui user_terminal_required host_clock_step_acceptance analytics_mock_inference "
     "analytics_accuracy_acceptance"
 ).split()
@@ -176,6 +179,8 @@ def _nvr_journey(receipt):
         ("analytics_event_playback_decoded_frames", 4, 100000),
         ("analytics_positive_person_count", 1, 32),
         ("analytics_processed_frames", 1, 100000),
+        ("analytics_sampled_overlay_pixels", 12, 544 * 320),
+        ("analytics_sampled_live_decoded_frames", 4, 1_000_000),
         ("analytics_background_event_count_before", 1, 100000),
         ("analytics_background_event_count_after", 2, 100000),
     ):

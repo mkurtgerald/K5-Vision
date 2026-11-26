@@ -67,6 +67,7 @@ def camera():
         clock_status=None,
         clock_body=None,
         clock_delay=0,
+        clock_wait_for_auth=None,
         clock_requests=[],
         clock_sequence=None,
         clock_mode=None,
@@ -88,7 +89,10 @@ def camera():
                 settings.clock_requests.append((self.path, root, self.headers.get("Authorization")))
                 assert not _text(root, "Username") and not _text(root, "Password")
                 assert self.headers.get("Authorization") is None
-                time.sleep(settings.clock_delay)
+                if settings.clock_wait_for_auth is not None:
+                    settings.clock_wait_for_auth.wait(timeout=1.2)
+                else:
+                    time.sleep(settings.clock_delay)
                 offset = settings.clock_offset
                 if settings.clock_sequence is not None:
                     index = min(len(settings.clock_requests) - 1, len(settings.clock_sequence) - 1)
@@ -122,6 +126,8 @@ def camera():
                     pass
                 return
             settings.requests.append((self.path, action, root, self.headers.get("Authorization")))
+            if settings.clock_wait_for_auth is not None:
+                settings.clock_wait_for_auth.set()
             if settings.digest:
                 authorization = self.headers.get("Authorization", "")
                 if not authorization:
@@ -330,13 +336,18 @@ def test_malformed_camera_clock_falls_back_to_local_time_without_exposing_data(c
 def test_optional_clock_subdeadline_leaves_budget_for_successful_authentication(
     camera, monkeypatch
 ):
-    camera.clock_delay = 0.3
+    # The clock reply is gated past the full probe deadline. Success requires
+    # the authenticated camera request to overtake the optional clock read.
+    # Unlike a sub-500ms wall assertion, this proves the budget separation
+    # even under unrelated hosted-runner CPU scheduling delays.
+    camera.clock_wait_for_auth = threading.Event()
     monkeypatch.setattr(onvif, "_CLOCK_READ_SECONDS", 0.05)
     connector = onvif.OnvifConnector(timeout_seconds=1)
     started = time.monotonic()
     profiles = asyncio.run(connector.probe("127.0.0.1", camera.port, False, _USERNAME, _PASSWORD))
     assert len(profiles) == 1
-    assert time.monotonic() - started < 0.5
+    assert time.monotonic() - started < 1.0
+    assert camera.clock_wait_for_auth.is_set()
     assert len(camera.clock_requests) == 1
 
 

@@ -85,11 +85,13 @@ def create_operator_product_app(
     analytics_status = "disabled"
     try:
         person_config = load_installed_person_configuration(os.environ)
-        if person_config is not None and PERSON_CONFIG_ENV in os.environ:
-            # Preserve the explicitly opted-in engineering sample overlay.
-            # Installed users get recorder-owned events without this second,
-            # browser-supplied inference path or another native CPU allocation.
-            analytics = OperatorAnalyticsBroker(person_config)
+        if person_config is not None:
+            # The sealed installed person model supports both recorder-owned
+            # background events and opt-in, transient, same-frame sample boxes.
+            # Limit the additional native view worker to one in installed mode;
+            # the engineering override retains its four-view test capacity.
+            views = 4 if PERSON_CONFIG_ENV in os.environ else 1
+            analytics = OperatorAnalyticsBroker(person_config, max_views=views)
             analytics_status = "configured"
     except OperatorPersonConfigurationError:
         # An optional rejected detector cannot prevent camera recording. It
@@ -115,12 +117,14 @@ def create_operator_product_app(
     from k5vision.operator_identity_security import AccountSecurityService, AccountSecurityStore
     from k5vision.operator_integrations import OperatorIntegrationStore
     from k5vision.operator_oidc import OIDCService, OIDCStore
+    from k5vision.operator_recording_policy import RecordingPolicyStore
     from k5vision.operator_role_policy import OperatorRolePolicy
     from k5vision.operator_time_admin import TimeAdministrationService
 
     # Account security and access policy are mandatory: damaged state cannot
     # silently restore password-only login or the account's broader base role.
     security_store = security = roles = audit = integrations = oidc = time_admin = None
+    recording_policies = None
     try:
         security_store = AccountSecurityStore(identity.directory, identity.site_id)
         security = AccountSecurityService(
@@ -131,12 +135,21 @@ def create_operator_product_app(
         integrations = OperatorIntegrationStore(identity.directory, identity.site_id)
         oidc = OIDCService(store=OIDCStore(security_store), users=application.state.user_registry)
         time_admin = TimeAdministrationService(identity.directory)
+        recording_policies = RecordingPolicyStore(identity.directory, identity.site_id)
+        service.set_recording_policy_store(recording_policies)
     except BaseException:
         with ExitStack() as cleanup:
             cleanup.callback(cameras.close)
             if "event_store" in locals():
                 cleanup.callback(event_store.close)
-            for component in (security or security_store, roles, audit, integrations, oidc):
+            for component in (
+                security or security_store,
+                roles,
+                audit,
+                integrations,
+                oidc,
+                recording_policies,
+            ):
                 if component is not None:
                     cleanup.callback(component.close)
         raise
@@ -146,10 +159,24 @@ def create_operator_product_app(
     application.state.operator_integrations = integrations
     application.state.operator_oidc = oidc
     application.state.operator_time_admin = time_admin
+    application.state.operator_recording_policies = recording_policies
+    from k5vision.operator_recorder_faults import RecorderFaultMonitor
+
+    # Optional alert persistence cannot prevent camera recording or sign-in.
+    recorder_faults = RecorderFaultMonitor(service, audit)
+    application.state.operator_recorder_faults = recorder_faults
 
     def close_admin_state():
         with ExitStack() as cleanup:
-            for component in (cameras, audit, security, roles, integrations, oidc):
+            for component in (
+                cameras,
+                audit,
+                security,
+                roles,
+                integrations,
+                oidc,
+                recording_policies,
+            ):
                 cleanup.callback(component.close)
 
     install_operator_product_api(
@@ -159,10 +186,35 @@ def create_operator_product_app(
         public_port=service.public_port,
         analytics=analytics,
         analytics_status=analytics_status,
+        prepare_native_person_on_camera=(
+            analytics is not None and PERSON_CONFIG_ENV not in os.environ
+        ),
         state_root=identity.directory,
     )
     previous_lifespan = application.router.lifespan_context
     profile_lock = profile_lease or OperatorProfileLock(identity.directory)
+
+    async def close_camera_settings():
+        try:
+            motion_settings = getattr(application.state, "operator_motion_preview_vault", None)
+            if motion_settings is not None:
+                await motion_settings.aclose()
+        finally:
+            try:
+                video_settings = getattr(application.state, "operator_camera_settings_vault", None)
+                if video_settings is not None:
+                    await video_settings.aclose()
+            finally:
+                remove_listener = getattr(
+                    application.state, "operator_camera_settings_revocation_cleanup", None
+                )
+                if remove_listener is not None:
+                    remove_listener()
+                remove_motion_listener = getattr(
+                    application.state, "operator_motion_settings_revocation_cleanup", None
+                )
+                if remove_motion_listener is not None:
+                    remove_motion_listener()
 
     @asynccontextmanager
     async def lifespan(app):
@@ -176,16 +228,23 @@ def create_operator_product_app(
                 return
             cleaned = True
             try:
-                if integration_task is not None:
-                    integration_task.cancel()
-                    with suppress(asyncio.CancelledError):
-                        await integration_task
-                if analytics_task is not None:
-                    analytics_task.cancel()
-                    with suppress(asyncio.CancelledError):
-                        await analytics_task
+                try:
+                    # Join pending fault writes before the audit authority closes.
+                    await recorder_faults.aclose()
+                finally:
+                    if integration_task is not None:
+                        integration_task.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await integration_task
+                    if analytics_task is not None:
+                        analytics_task.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await analytics_task
             finally:
                 try:
+                    preparation = getattr(app.state, "operator_person_preparation", None)
+                    if preparation is not None:
+                        preparation.close()
                     if analytics is not None:
                         await analytics.aclose()
                 finally:
@@ -202,9 +261,12 @@ def create_operator_product_app(
                                 await time_admin.aclose()
                             finally:
                                 try:
-                                    await service.stop()
+                                    await close_camera_settings()
                                 finally:
-                                    close_admin_state()
+                                    try:
+                                        await service.stop()
+                                    finally:
+                                        close_admin_state()
 
         try:
             if profile_lease is None:
@@ -217,12 +279,14 @@ def create_operator_product_app(
             if events is not None:
                 await events.aclose()
             await time_admin.aclose()
+            await close_camera_settings()
             close_admin_state()
             raise
         try:
             async with previous_lifespan(app):
                 try:
                     await service.start(cameras.list_sources())
+                    recorder_faults.start()
                     if events is not None:
                         await events.start()
 

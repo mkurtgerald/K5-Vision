@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "patch_id": "gortsplib-5.6.7-monotonic-tcp-watchdog",
+  "upstream_module": "github.com/bluenviron/gortsplib/v5",
+  "upstream_version": "v5.6.7",
+  "upstream_repository": "https://github.com/bluenviron/gortsplib",
+  "upstream_commit_sha": "09cc2060a7188c1f5f58498a8ede1e56338cd804",
+  "upstream_tree_sha": "875bddc78e1498438be971588bb024ab0835937a",
+  "upstream_module_sum": "h1:0o0Ays+oereZwmeOP66t154lmrvXJsON/4iCxDnjgmw=",
+  "upstream_go_mod_sum": "h1:5aF0ncI3gp3OjaOfJEL4qBOFiheEgrLWp2nc13rHt2c=",
+  "upstream_go_mod_sha256": "719a8f94d23cc8af801d278735596ff32a1dd7f25757d4f4fec126922c10107c",
+  "consumer_repository": "https://github.com/bluenviron/mediamtx",
+  "consumer_version": "v1.21.2",
+  "consumer_commit_sha": "914e39535ece709919ac325aaeed98d394ed9093",
+  "patch_path": "third_party/patches/gortsplib-5.6.7-monotonic-tcp-watchdog.patch",
+  "patch_sha256": "1ed5d2e402c16223d0d9fdac2bb19be15bdc856f06ca96ede1f0d9422a78a0e5",
+  "source_files": {
+    "client.go": {
+      "upstream_sha256": "3d538cb088a397a70493d8f1b5428260b8f83b0e8ad40bdd6e6fc48b5fe90887",
+      "patched_sha256": "45809c4223f60071d5a1667a1f06b96253c44c3e94852192de4dba1a28a028e7"
+    },
+    "client_reader.go": {
+      "upstream_sha256": "fb727d6b364df545a95cf5c9ab6e67a063cb1b8175c9cc6778022c6e94f5f751",
+      "patched_sha256": "93e3e634a3ddccb257392f086223d4ea51470c9292e88ddbea7ce4f242123f9e"
+    }
+  },
+  "baseline_regression_test_file": "client_tcp_watchdog_clock_test.go",
+  "candidate_unit_test_file": "client_tcp_watchdog_elapsed_test.go",
+  "test_file_sha256": {
+    "client_tcp_watchdog_clock_test.go": "fb621faf7d73641e910ff6238ce2fb409aea43666d39d4c73f79cac5fc9fd604",
+    "client_tcp_watchdog_elapsed_test.go": "e74b5d44eb9a5f77fcc61173dd1aa5e3a5c6f65b1e81ad6008d24513c5c47e49"
+  },
+  "baseline_test_regex": "^TestClientTCPWatchdogWallClock",
+  "candidate_test_regex": "^TestClientTCPWatchdog",
+  "required_baseline_failed_tests": [
+    "TestClientTCPWatchdogWallClockForward",
+    "TestClientTCPWatchdogWallClockBackward"
+  ],
+  "required_candidate_passed_tests": [
+    "TestClientTCPWatchdogWallClockForward",
+    "TestClientTCPWatchdogWallClockBackward",
+    "TestClientTCPWatchdogElapsedDeadline",
+    "TestClientTCPWatchdogEOFDoesNotRefresh",
+    "TestClientTCPWatchdogConcurrentRefresh"
+  ],
+  "baseline_scope": "Exact original upstream production sources plus only the identical baseline-compatible regression test file; behavioral failures required, compile failure is insufficient. Candidate-only elapsed-clock tests are not overlaid on original source.",
+  "license": {
+    "spdx": "MIT",
+    "path": "third_party/licenses/gortsplib-MIT.txt",
+    "sha256": "fa584448e3023627b43c85c80e02a793e6f48e8267636727161202b6bec053d9",
+    "copyright": "Copyright (c) 2020 aler9",
+    "modification_attribution": "K5 Vision contributors (2026): TCP inbound watchdog uses an independent per-client monotonic elapsed clock."
+  },
+  "behavior": {
+    "elapsed_clock": "Private per-client time.Since(epoch), epoch from unmodified real time.Now; retained across reconnects. Atomic liveness values are duration nanoseconds, never Unix timestamps.",
+    "actual_utc_for_rtcp_and_media": "Existing timeNow and all its protocol timestamp consumers are unchanged.",
+    "read_timeout": "Existing ReadTimeout and exact >= boundary retained; no grace interval added.",
+    "tcp_socket_and_eof": "Reader and socket lifecycle unchanged; only the successful-inbound liveness stamp changes.",
+    "udp": "Unchanged; K5 configures its pulled RTSP sources for TCP.",
+    "public_api": "Unchanged; new clock field is private.",
+    "current_native_failure_correlation": "Not established by these source regressions. Actual Windows derivative and installed product qualification remain required.",
+    "concurrent_refresh": "Sample monotonic now before loading the atomic last-packet stamp, preserving upstream ordering; a concurrent newer stamp cannot falsely expire."
+  }
+}

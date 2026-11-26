@@ -65,6 +65,12 @@ input[type="date"], input[type="datetime-local"] { font-size: 12px; }
 .sign-in-card .primary { margin-top: 4px; justify-content: space-between; }
 .sign-in-footnote { margin-top: 32px; color: #65748a; font-size: 11px; text-align: center; }
 .workspace { min-height: 100vh; }
+.recorder-alerts { margin: 14px 28px 0; padding: 14px 18px; border: 1px solid #dc9d4b; border-radius: 8px; background: #33251b; font-size: 13px; }
+.recorder-alerts p { margin: 6px 0; }
+.recorder-alerts ul { margin: 8px 0; padding-left: 20px; }
+.recorder-alerts li { margin: 4px 0; }
+.recorder-alerts details { margin-top: 10px; color: var(--muted); }
+.recorder-alerts.clear { background: var(--panel); border-color: var(--border); }
 .topbar { height: 73px; border-bottom: 1px solid var(--border); background: #101721; display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 0 28px; }
 .user-menu { display: flex; align-items: center; gap: 12px; font-size: 12px; }
 .role-tag { padding: 4px 8px; border: 1px solid var(--border); border-radius: 5px; font-size: 10px; color: var(--muted); text-transform: capitalize; }
@@ -243,3 +249,20 @@ dialog::backdrop { background: #05080ebd; backdrop-filter: blur(5px); }
   .day-picker { flex-wrap: wrap; }
   .video-footer { flex-wrap: wrap; }
 }
+
+/* Per-camera encoder controls use the existing native-installed workspace. */
+#camera-video-dialog { width: 700px; }
+#camera-video-target { overflow-wrap: anywhere; }
+.camera-video-values { margin: 18px 0 12px; padding: 14px; border: 1px solid var(--border); border-radius: 8px; min-width: 0; }
+.camera-video-values legend { color: var(--muted); font-size: 12px; padding: 0 5px; }
+.camera-video-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 18px; }
+.camera-video-grid label { margin-top: 10px; }
+.camera-video-grid .field-help { min-height: 28px; }
+.camera-video-check { display: flex; gap: 10px; align-items: flex-start; line-height: 1.5; }
+.camera-video-check input { width: 17px; height: 17px; flex: 0 0 17px; margin-top: 1px; }
+#camera-video-verification { white-space: pre-line; }
+#camera-video-account { padding: 0 14px 14px; border: 1px solid var(--border); border-radius: 8px; }
+#camera-video-dialog .dialog-actions { flex-wrap: wrap; }
+@media (max-width: 600px) { .camera-video-grid { grid-template-columns: minmax(0, 1fr); } }
+
+.camera-video-values input:invalid { border-color: var(--red); }

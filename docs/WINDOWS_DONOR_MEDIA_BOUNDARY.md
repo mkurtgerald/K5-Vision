@@ -1,16 +1,21 @@
 # Architecture decision: native Windows donor media boundary
 
-Status: engineering evaluation; existing application defaults and qualified
-installer identities are unchanged. Native Windows integrated acceptance remains
-required before making this the installed default.
+Status: candidate integration with exact derivative dependency identities.
+Native Windows integrated acceptance remains required before qualifying a new
+installer for beta testing.
 
 ## Decision
 
-Use MediaMTX `v1.21.2`, commit
-`914e39535ece709919ac325aaeed98d394ed9093`, as the independently owned continuous
-media worker. Use its official native Windows amd64 executable; Linux, WSL and
-Docker are not part of the target installation. The initial Linux execution is a
-portable protocol and recording regression only.
+Use the reviewed MediaMTX derivative `v1.21.2-k5-monotonic1`, based on upstream
+`v1.21.2`, commit `914e39535ece709919ac325aaeed98d394ed9093`, as the independently
+owned continuous media worker. Its pinned gortsplib `v5.6.7` patch retains
+monotonic elapsed time for the TCP inactivity watchdog. UTC/RTCP timestamps,
+configured timeouts and socket EOF handling remain unchanged. Exact patch,
+source, toolchain and binary identities accompany the dependency archives.
+
+The target installation uses the native Windows amd64 executable. Linux, WSL and
+Docker are not part of that installation; the same source and patch also produce
+a Linux binary for portable development regression checks.
 
 K5 already uses MediaMTX to generate an ephemeral alpha source. This evaluation
 extends the donor's responsibility to always-on enrolled-camera ingestion,
@@ -27,8 +32,9 @@ K5's API does not copy media bytes into its control-plane event loop.
 | Reviewed detection and source-attributed overlay results | Existing K5 analytics boundary |
 | Native process ownership, restart policy and disk admission | K5 installed supervisor |
 
-This is a service integration, not a source fork. `mediamtx_provider.py` translates
-fixed donor read APIs into K5-owned records. `mediamtx_config.py` creates a private
+K5 maintains one narrowly scoped upstream watchdog patch and identifies its
+binaries as a derivative. `mediamtx_provider.py` translates fixed donor read APIs
+into K5-owned records. `mediamtx_config.py` creates a private
 configuration from admitted site/device/source bindings. No donor objects or raw
 configuration are returned to operator clients.
 

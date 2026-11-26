@@ -360,6 +360,7 @@ def test_ready_signal_requires_successful_native_start_and_owned_profile(
         tmp_path / "identity", username="recovery-admin", password=password
     )
     events = []
+    recording_policy_stores = []
 
     class Cameras:
         def __init__(self, *_args, **_kwargs):
@@ -388,10 +389,18 @@ def test_ready_signal_requires_successful_native_start_and_owned_profile(
         events.append("ready")
 
     monkeypatch.setattr(product, "OperatorCameraStore", Cameras)
-    service = SimpleNamespace(site_id=identity.site_id, public_port=8080, start=start, stop=stop)
+    service = SimpleNamespace(
+        site_id=identity.site_id,
+        public_port=8080,
+        start=start,
+        stop=stop,
+        set_recording_policy_store=recording_policy_stores.append,
+    )
     app = product.create_operator_product_app(
         identity_directory=identity.directory, service=service, ready_callback=ready
     )
+    assert len(recording_policy_stores) == 1
+    assert recording_policy_stores[0] is app.state.operator_recording_policies
     if fail_start:
         with pytest.raises(RuntimeError, match="startup"):
             with TestClient(app):
