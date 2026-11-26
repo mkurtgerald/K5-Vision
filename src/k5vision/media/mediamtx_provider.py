@@ -15,6 +15,8 @@ import json
 import math
 import re
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -338,8 +340,16 @@ class MediaMTXProvider:
         self._max_bytes = max_response_bytes
         self._max_active = max_active_requests
         self._requester = requester
+        # The generic asyncio pool also runs camera, inventory and storage
+        # operations; prevent its saturation from delaying native history reads.
+        # The existing admission bound remains the only request concurrency cap.
+        self._native_read_executor = ThreadPoolExecutor(
+            max_workers=max_active_requests, thread_name_prefix="k5-native-read"
+        )
         self._requests: set[asyncio.Task] = set()
         self._version_admitted = False
+        self._admission_revision = 0
+        self._info_task: asyncio.Task[MediaWorkerInfo] | None = None
         self._snapshots: dict[tuple[MediaMTXBinding, ...], asyncio.Task] = {}
         self._closed = False
         self._close_task: asyncio.Task | None = None
@@ -390,7 +400,13 @@ class MediaMTXProvider:
             raise MediaWorkerError(MediaWorkerErrorCode.UNAVAILABLE)
         if len(self._requests) >= self._max_active:
             raise MediaWorkerError(MediaWorkerErrorCode.BUSY)
-        task = asyncio.create_task(asyncio.to_thread(self._read, origin, route))
+
+        async def native_read():
+            return await asyncio.get_running_loop().run_in_executor(
+                self._native_read_executor, copy_context().run, self._read, origin, route
+            )
+
+        task = asyncio.create_task(native_read())
         self._requests.add(task)
         task.add_done_callback(self._completed)
         timed_out = False
@@ -406,22 +422,62 @@ class MediaMTXProvider:
             raise MediaWorkerError(result)
         return result
 
-    async def info(self) -> MediaWorkerInfo:
-        self._version_admitted = False
-        result = await self._get(self._api_origin, "/v3/info")
-        if not isinstance(result, dict):
-            raise MediaWorkerError(MediaWorkerErrorCode.INVALID_RESPONSE)
-        if result.get("version") != MEDIAMTX_VERSION:
-            raise MediaWorkerError(MediaWorkerErrorCode.VERSION_MISMATCH)
-        invalid = False
+    def _info_completed(self, task: asyncio.Task) -> None:
+        # Retain the latest owner for cancellation identity checks. Completed
+        # observations are never reused: info() starts a fresh check below.
+        if not task.cancelled():
+            task.exception()
+
+    async def _check_info(self, revision: int) -> MediaWorkerInfo:
         try:
-            started = _timestamp(result.get("started"))
-        except ValueError:
-            invalid = True
-        if invalid:
-            raise MediaWorkerError(MediaWorkerErrorCode.INVALID_RESPONSE)
+            result = await self._get(self._api_origin, "/v3/info")
+            if not isinstance(result, dict):
+                raise MediaWorkerError(MediaWorkerErrorCode.INVALID_RESPONSE)
+            if result.get("version") != MEDIAMTX_VERSION:
+                raise MediaWorkerError(MediaWorkerErrorCode.VERSION_MISMATCH)
+            invalid = False
+            try:
+                started = _timestamp(result.get("started"))
+            except ValueError:
+                invalid = True
+            if invalid:
+                raise MediaWorkerError(MediaWorkerErrorCode.INVALID_RESPONSE)
+        except BaseException as error:
+            # Local capacity rejection dispatches no worker observation. Keep
+            # existing admission; cold providers remain unverified.
+            if revision == self._admission_revision and (
+                not isinstance(error, MediaWorkerError)
+                or error.code is not MediaWorkerErrorCode.BUSY
+            ):
+                self._admission_revision += 1
+                self._version_admitted = False
+            raise
+        if self._closed or revision != self._admission_revision:
+            raise MediaWorkerError(MediaWorkerErrorCode.UNAVAILABLE)
         self._version_admitted = True
         return MediaWorkerInfo(MEDIAMTX_VERSION, started)
+
+    async def info(self) -> MediaWorkerInfo:
+        # Health polling and first authenticated playback must share the same
+        # pending fixed-version check, not contend for extra native API slots.
+        # Only an in-flight check is shared; a later explicit check revalidates.
+        if self._closed:
+            raise MediaWorkerError(MediaWorkerErrorCode.UNAVAILABLE)
+        task = self._info_task
+        if task is None or task.done():
+            # A pending refresh does not revoke a verified running worker.
+            task = asyncio.create_task(self._check_info(self._admission_revision))
+            self._info_task = task
+            task.add_done_callback(self._info_completed)
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if self._info_task is task:
+                self._admission_revision += 1
+                self._version_admitted = False
+            # Keep the shared owner and its native slot joined; its late
+            # success cannot undo cancellation or a newer admission.
+            raise
 
     async def _admit(self) -> None:
         if self._closed:
@@ -523,6 +579,11 @@ class MediaMTXProvider:
             task.cancel()
         if snapshots:
             await asyncio.gather(*snapshots, return_exceptions=True)
+        # A cancelled caller cannot abandon the shared version check. Join
+        # its owner before releasing the native worker or its API listener.
+        info = self._info_task
+        if info is not None and not info.done():
+            await asyncio.gather(asyncio.shield(info), return_exceptions=True)
         # Cancelling to_thread tasks would free their tracked slots before the
         # native readers exit. Only coroutine owners are cancelled; actual reads
         # remain joined until the underlying request returns.
@@ -531,10 +592,14 @@ class MediaMTXProvider:
             await asyncio.gather(
                 *(asyncio.shield(task) for task in requests), return_exceptions=True
             )
+        # Every credential-bearing request has returned before worker teardown.
+        # Do not cancel queued reads or release an in-flight native API lease.
+        self._native_read_executor.shutdown(wait=True, cancel_futures=False)
 
     async def aclose(self) -> None:
         """Close admission and join every real native read before releasing ownership."""
         self._closed = True
+        self._admission_revision += 1
         self._version_admitted = False
         if self._close_task is None:
             self._close_task = asyncio.create_task(self._close_requests())

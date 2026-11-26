@@ -1,13 +1,16 @@
 # Video-wall roadmap
 
-Status: **Planned**, requested by the owner on 2026-11-01. These are tracked work
-items; this document does not establish installer support.
+Status: **Automatic layout implemented in candidate source; Windows installer
+qualification pending. Custom layouts and adaptive streams remain planned.**
+Requested by the owner on 2026-11-01. Source changes do not establish support in
+a released installer.
 
 The released baseline is
 [`34a77a5`](https://github.com/mkurtgerald/K5-Vision/releases/tag/k5-windows-admin-integrations-34a77a5).
 It provides manual 1/4/9-camera layouts, paging, responsive tile sizing,
-aspect-ratio preservation and individual fullscreen. Automatic layout selection,
-individual tile editing and tile-size-driven stream switching remain planned.
+aspect-ratio preservation and individual fullscreen. The candidate adds Auto
+layout selection; individual tile editing and tile-size-driven stream switching
+remain planned.
 
 ## Delivery order
 

@@ -3,7 +3,7 @@ name: Native Windows Beta Sprint
 on:
   workflow_dispatch:
   pull_request:
-    branches: [main, codex/windows-mediamtx-donor, codex/windows-operator-product, codex/windows-desktop-beta, codex/windows-onvif-onboarding, codex/windows-surveillance-workspace]
+    branches: [main, codex/windows-mediamtx-donor, codex/windows-operator-product, codex/windows-desktop-beta, codex/windows-onvif-onboarding, codex/windows-surveillance-workspace, codex/video-wall-roadmap-20261101, codex/camera-setup-beta-20261102]
     paths:
       - .github/workflows/operator-beta-windows.yml
       - .github/actions/provision-operator-tools/**
@@ -124,7 +124,10 @@ jobs:
             "person" { @("tests/integration/test_operator_beta_capacity.py", "tests/integration/test_operator_person_view_runtime.py") }
             default { throw "Unknown beta lane" }
           }
-          python -m pytest @tests --no-cov -s -o faulthandler_timeout=180 "--junitxml=operator-beta-$($env:K5_BETA_LANE).xml"
+          # A valid browser receipt may take up to 240 seconds. This optional
+          # stack-dump timer is not an acceptance deadline.
+          $diagnosticTimeout = if ($env:K5_BETA_LANE -eq "browser") { 260 } else { 180 }
+          python -m pytest @tests --no-cov -s -o "faulthandler_timeout=$diagnosticTimeout" "--junitxml=operator-beta-$($env:K5_BETA_LANE).xml"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Require actual native receipt
         shell: pwsh

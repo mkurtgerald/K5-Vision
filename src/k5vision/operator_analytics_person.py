@@ -8,6 +8,7 @@ neither this module nor application startup downloads models or dependencies.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -19,7 +20,7 @@ from pathlib import Path
 from platform import system
 
 from k5vision.analytics_config import _local_path, _unique_object
-from k5vision.analytics_runtime import OwnedAnalyticsProvider, _AnalyticsSession
+from k5vision.analytics_runtime import OwnedAnalyticsProvider, _AnalyticsSession, _protected_future
 
 PERSON_CONFIG_ENV = "K5_OPERATOR_PERSON_CONFIG"
 PERSON_PROVIDER = "openvino-omz-person-view-v1"
@@ -179,15 +180,28 @@ def _cap_windows_native_cpu_isa() -> None:
 
 
 class _PersonDetector:
-    def __init__(self, config: OperatorPersonConfiguration) -> None:
+    def __init__(
+        self,
+        config: OperatorPersonConfiguration,
+        *,
+        inference_threads: int = 2,
+        fixed_view_input: bool = False,
+    ) -> None:
         validate_person_runtime(config)
+        if type(inference_threads) is not int or inference_threads not in (1, 2):
+            raise ValueError("Person CPU thread setting was refused")
+        if type(fixed_view_input) is not bool:
+            raise ValueError("Person view input mode was refused")
         _cap_windows_native_cpu_isa()
         import numpy as np
         import openvino as ov
         from openvino.preprocess import ColorFormat, PrePostProcessor, ResizeAlgorithm
 
         xml, weights = _model_bytes(config)
-        model = ov.Core().read_model(
+        # A single native Core owns model admission and CPU compilation. Cold
+        # installed sampled views must not initialize a second OpenVINO core.
+        core = ov.Core()
+        model = core.read_model(
             model=xml.decode("utf-8"), weights=ov.Tensor(np.frombuffer(weights, dtype=np.uint8))
         )
         if (
@@ -198,15 +212,41 @@ class _PersonDetector:
         ):
             raise ValueError("Person model interface was refused")
         processing = PrePostProcessor(model)
-        processing.input().tensor().set_element_type(ov.Type.u8).set_layout(
-            ov.Layout("NHWC")
-        ).set_color_format(ColorFormat.BGR).set_spatial_dynamic_shape()
-        processing.input().preprocess().resize(ResizeAlgorithm.RESIZE_LINEAR)
-        processing.input().model().set_layout(ov.Layout("NCHW"))
-        compiled = ov.Core().compile_model(
-            processing.build(), "CPU", {"INFERENCE_NUM_THREADS": 2, "NUM_STREAMS": "1"}
+        tensor = (
+            processing.input()
+            .tensor()
+            .set_element_type(ov.Type.u8)
+            .set_layout(ov.Layout("NHWC"))
+            .set_color_format(ColorFormat.BGR)
         )
+        if not fixed_view_input:
+            # Variable-shape callers retain OpenVINO resize admission; the
+            # fixed 544x320 recording decoder and view sampler use fixed graphs.
+            tensor.set_spatial_dynamic_shape()
+            processing.input().preprocess().resize(ResizeAlgorithm.RESIZE_LINEAR)
+        # Recording snapshots and optional views both supply fixed 544x320 BGR
+        # input. Avoid extra dynamic-resize graph compilation under contention;
+        # resize the transient sampled frame in native OpenCV before inference.
+        processing.input().model().set_layout(ov.Layout("NCHW"))
+        compiled = core.compile_model(
+            processing.build(),
+            "CPU",
+            {
+                "INFERENCE_NUM_THREADS": inference_threads,
+                "NUM_STREAMS": "1",
+                # A fixed FP32 contract refuses native BF16/AMX dispatch
+                # without changing the admitted model or confidence threshold.
+                "INFERENCE_PRECISION_HINT": ov.Type.f32,
+            },
+        )
+        try:
+            precision = compiled.get_property("INFERENCE_PRECISION_HINT")
+        except Exception:
+            raise ValueError("Person CPU precision was refused") from None
+        if precision != ov.Type.f32:
+            raise ValueError("Person CPU precision was refused")
         self._numpy = np
+        self._fixed_view_input = fixed_view_input
         self._request = compiled.create_infer_request()
 
     def infer(
@@ -216,6 +256,13 @@ class _PersonDetector:
         raw = np.frombuffer(payload, dtype=np.uint8, count=height * stride)
         bgrx = raw.reshape(height, stride)[:, : width * 4].reshape(height, width, 4)
         bgr = np.ascontiguousarray(bgrx[:, :, :3])
+        if self._fixed_view_input and (width != 544 or height != 320):
+            import cv2
+
+            # The captured aspect and the detector bounding-box geometry keep
+            # their original normalized coordinate contract. No view pixels
+            # are stored or reused across frames.
+            bgr = np.ascontiguousarray(cv2.resize(bgr, (544, 320), interpolation=cv2.INTER_LINEAR))
         self._request.infer({0: bgr[np.newaxis, ...]})
         output = self._request.get_output_tensor(0).data
         if tuple(output.shape) != (1, 1, 200, 7):
@@ -245,12 +292,30 @@ class _PersonDetector:
         return tuple(sorted(selected, key=lambda item: item.confidence, reverse=True)[:32])
 
 
+# Only sealed native model compilation receives this additional background
+# startup budget. The unchanged 2s frame inference, 24s browser transport
+# and installed same-frame box acceptance remain separate hard deadlines.
+_PERSON_START_TIMEOUT_SECONDS = 22.0
+
+
 class _PersonSession(_AnalyticsSession):
     """Reuse K5's bounded native worker lifecycle, replacing all detector logic."""
 
+    async def start(self) -> None:
+        ready = await asyncio.wait_for(
+            _protected_future(self._pending), _PERSON_START_TIMEOUT_SECONDS
+        )
+        if ready is not True:
+            raise RuntimeError("Person session initialization failed.")
+
     def _initialize(self) -> bool:
         try:
-            self._backend = _PersonDetector(self._config)
+            # A transient sampled view must not consume the recorder's full
+            # two-thread native CPU budget during installed person acceptance.
+            # The recording child retains the verified two-thread default.
+            self._backend = _PersonDetector(
+                self._config, inference_threads=1, fixed_view_input=True
+            )
             return True
         except BaseException:
             # Keep native exception tracebacks/model paths out of waiter Futures.
@@ -264,12 +329,18 @@ class PersonProviderFactory:
         validate_person_runtime(config)
         self._config = config
         self._capacity = threading.BoundedSemaphore(4)
+        self.isolated = False
 
     async def __call__(self) -> OwnedAnalyticsProvider:
         if not self._capacity.acquire(blocking=False):
             raise RuntimeError("Person native capacity is unavailable.")
         try:
-            session = _PersonSession(self._config, self._capacity.release)
+            if self.isolated:
+                from k5vision.operator_person_view_process import IsolatedPersonSession
+
+                session = IsolatedPersonSession(self._config, self._capacity.release)
+            else:
+                session = _PersonSession(self._config, self._capacity.release)
         except Exception:
             self._capacity.release()
             raise RuntimeError("Person session initialization failed.") from None

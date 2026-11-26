@@ -162,6 +162,70 @@ function Get-K5Sha256 {
     }
 }
 
+# A native engineering launch may need to recover from GitHub's transient CDN
+# failures. Only the exact release, filename and manifest SHA256 are admitted.
+function Get-K5OfficialReleaseArchive {
+    param([string]$Url, [string]$Repository, [string]$Version,
+        [string]$Filename, [string]$ExpectedHash, [string]$Archive)
+    $headers = @{
+        Accept = 'application/vnd.github+json'
+        'User-Agent' = 'K5-Vision-pinned-launcher-admission'
+        'X-GitHub-Api-Version' = '2022-11-28'
+    }
+    $release = Invoke-RestMethod -UseBasicParsing -TimeoutSec 30 -Headers $headers -Uri (
+        'https://api.github.com/repos/' + $Repository + '/releases/tags/' + $Version)
+    if ([string]$release.tag_name -cne $Version) {
+        throw 'Pinned native tool release identity mismatch.'
+    }
+    $digest = 'sha256:' + $ExpectedHash
+    $assets = @($release.assets | Where-Object {
+        $_.name -ceq $Filename -and
+        $_.browser_download_url -ceq $Url -and
+        $_.digest -ceq $digest
+    })
+    if ($assets.Count -ne 1 -or [long]$assets[0].id -le 0) {
+        throw 'Pinned native tool release asset mismatch.'
+    }
+    $headers.Accept = 'application/octet-stream'
+    Invoke-WebRequest -UseBasicParsing -TimeoutSec 120 -Headers $headers -Uri (
+        'https://api.github.com/repos/' + $Repository + '/releases/assets/' +
+        [string]$assets[0].id) -OutFile $Archive
+}
+
+function Get-K5PinnedArchive {
+    param([string]$Url, [string]$Repository, [string]$Version,
+        [string]$Filename, [string]$ExpectedHash, [string]$Archive)
+    # HTTP errors outside this small transient set are terminal; no fallback to
+    # alternate versions, mirrors or manifests. Keep URL and upstream text private.
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        try {
+            Invoke-WebRequest -UseBasicParsing -TimeoutSec 120 -Uri $Url -OutFile $Archive
+            break
+        } catch {
+            $response = $_.Exception.Response
+            $status = if ($null -ne $response) { [int]$response.StatusCode } else { 0 }
+            if (Test-Path -LiteralPath $Archive) { Remove-Item -LiteralPath $Archive -Force }
+            if ($status -notin @(408, 429, 502, 503, 504)) {
+                throw 'Pinned native tool download refused.'
+            }
+            if ($attempt -eq 3) {
+                try {
+                    Get-K5OfficialReleaseArchive -Url $Url -Repository $Repository `
+                        -Version $Version -Filename $Filename -ExpectedHash $ExpectedHash `
+                        -Archive $Archive
+                } catch {
+                    if (Test-Path -LiteralPath $Archive) {
+                        Remove-Item -LiteralPath $Archive -Force
+                    }
+                    throw 'Pinned native tool transport unavailable.'
+                }
+                break
+            }
+            Start-Sleep -Seconds (2 * $attempt)
+        }
+    }
+}
+
 function Get-K5PinnedTool {
     param(
         [string]$Python, [string]$Helper, [string]$ToolsRoot,
@@ -207,7 +271,8 @@ function Get-K5PinnedTool {
         $previousTls = [Net.ServicePointManager]::SecurityProtocol
         try {
             [Net.ServicePointManager]::SecurityProtocol = $previousTls -bor [Net.SecurityProtocolType]::Tls12
-            Invoke-WebRequest -UseBasicParsing -TimeoutSec 120 -Uri $artifact.url -OutFile $archive
+            Get-K5PinnedArchive -Url $artifact.url -Repository $Repository -Version $Manifest.version `
+                -Filename $artifact.filename -ExpectedHash $artifact.sha256 -Archive $archive
         } finally { [Net.ServicePointManager]::SecurityProtocol = $previousTls }
         if ((Get-K5Sha256 -Path $archive) -cne $artifact.sha256) {
             throw 'Native archive identity mismatch.'

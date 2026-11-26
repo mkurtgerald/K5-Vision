@@ -21,7 +21,7 @@
       .some(value => typeof value !== "function")) throw new TypeError("Camera wall configuration is invalid");
     const document = container.ownerDocument;
     const tiles = new Map();
-    let cameras = [], layout = 4, page = 0, visible = false, destroyed = false;
+    let cameras = [], layout = "auto", page = 0, visible = false, destroyed = false;
     let owner = null;
     const root = element(document, "section", "camera-wall");
     root.setAttribute("aria-label", "Live camera wall");
@@ -35,12 +35,12 @@
     const layoutSelect = element(document, "select", "camera-wall-layout");
     layoutSelect.id = "wall-layout";
     layoutSelect.setAttribute("aria-label", "Camera wall layout");
-    for (const count of LAYOUTS) {
-      const option = element(document, "option", "", count === 1 ? "1 camera" : `${Math.sqrt(count)} × ${Math.sqrt(count)}`);
+    for (const count of ["auto", ...LAYOUTS]) {
+      const option = element(document, "option", "", count === "auto" ? "Auto" : count === 1 ? "1 camera" : `${Math.sqrt(count)} × ${Math.sqrt(count)}`);
       option.value = String(count);
       layoutSelect.append(option);
     }
-    layoutSelect.value = "4";
+    layoutSelect.value = "auto";
     layoutLabel.append(layoutSelect);
     const previous = element(document, "button", "button secondary", "Previous");
     const next = element(document, "button", "button secondary", "Next");
@@ -357,6 +357,11 @@
       tiles.clear();
     }
 
+    function capacity() {
+      if (layout !== "auto") return layout;
+      return cameras.length === 0 ? 0 : cameras.length === 1 ? 1 : cameras.length <= 4 ? 4 : 9;
+    }
+
     function render() {
       if (!visible || destroyed) return;
       if (!sameSession(owner)) {
@@ -364,14 +369,15 @@
         owner = session();
       }
       if (!owner) { hide(); return; }
-      const count = Math.max(1, Math.ceil(cameras.length / layout));
+      const size = capacity();
+      const count = Math.max(1, Math.ceil(cameras.length / (size || 1)));
       page = Math.min(page, count - 1);
-      const shown = cameras.slice(page * layout, (page + 1) * layout);
+      const shown = cameras.slice(page * size, (page + 1) * size);
       const ids = new Set(shown.map(camera => camera.device_id));
       for (const [id, tile] of tiles) {
         if (!ids.has(id)) { tile.dispose(); tiles.delete(id); }
       }
-      grid.dataset.layout = String(layout);
+      grid.dataset.layout = String(size);
       for (const [index, camera] of shown.entries()) {
         let tile = tiles.get(camera.device_id);
         if (tile) tile.update(camera);
@@ -400,14 +406,14 @@
     }
 
     layoutSelect.addEventListener("change", () => {
-      const value = Number(layoutSelect.value);
-      if (!LAYOUTS.includes(value)) return;
+      const value = layoutSelect.value === "auto" ? "auto" : Number(layoutSelect.value);
+      if (value !== "auto" && !LAYOUTS.includes(value)) return;
       layout = value;
       page = 0;
       render();
     });
     previous.addEventListener("click", () => { if (page > 0) { page -= 1; render(); } });
-    next.addEventListener("click", () => { if ((page + 1) * layout < cameras.length) { page += 1; render(); } });
+    next.addEventListener("click", () => { if ((page + 1) * capacity() < cameras.length) { page += 1; render(); } });
 
     return {
       show(values) { if (destroyed) return; cameras = list(values); visible = true; container.hidden = false; render(); },

@@ -90,6 +90,35 @@ def test_explicit_revocation_remains_immediate_during_clock_correction(clocks, a
     asyncio.run(lifetime())
 
 
+@pytest.mark.parametrize("action", ["revoke", "revoke_user", "replace", "elapsed"])
+def test_owned_write_fence_rejects_session_change_without_durable_io(clocks, account, action):
+    async def exercise():
+        manager = auth_sessions.UserSessionManager(ttl_seconds=300)
+        token, _ = await manager.issue(account)
+        assert await manager.resolve(token) == account
+        guard = manager.current_session_guard(token, account.id)
+
+        def forbidden_read(*_args):
+            raise AssertionError("A pure write fence must not perform durable I/O")
+
+        manager._resolve_account = forbidden_read
+        clocks["wall"] += timedelta(days=2)
+        assert guard()
+        clocks["wall"] -= timedelta(days=4)
+        assert guard()
+        if action == "revoke":
+            await manager.revoke(token)
+        elif action == "revoke_user":
+            await manager.revoke_user(account.id)
+        elif action == "replace":
+            await manager.issue(account)
+        else:
+            clocks["steady"] += 300
+        assert guard() is False
+
+    asyncio.run(exercise())
+
+
 @pytest.mark.parametrize("ttl", [299, 86401, True, 300.0])
 def test_advertised_session_duration_must_be_a_bounded_integer(ttl):
     with pytest.raises(ValueError):

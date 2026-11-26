@@ -1,8 +1,13 @@
+import asyncio
 import json
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
 
 import pytest
 from fastapi.testclient import TestClient
+from httpx import ASGITransport, AsyncClient
 
+from k5vision.domain.users import UserCreate, UserRole
 from k5vision.main import (
     CONTROL_PLANE_READ_TOKEN_ENV,
     CONTROL_PLANE_SITE_ENV,
@@ -343,3 +348,67 @@ def test_user_admin_api_rejects_ambiguous_authorization_headers_without_mutation
     assert response.status_code == 401
     assert response.json() == {"detail": "Unauthorized"}
     assert remaining.json() == []
+
+
+def test_password_login_isolated_from_busy_default_asyncio_executor() -> None:
+    """A live login must not queue behind unrelated media/history disk workers."""
+    app = create_app()
+    registry = app.state.user_registry
+    assert registry is not None
+    registry.bootstrap_administrator(
+        UserCreate(
+            username="test.owner",
+            display_name="Test Owner",
+            role=UserRole.ADMINISTRATOR,
+        ),
+        password="synthetic login isolation password",
+    )
+
+    async def exercise() -> None:
+        released, entered = Event(), Event()
+
+        def occupy_default_worker() -> None:
+            entered.set()
+            released.wait(12)
+
+        loop = asyncio.get_running_loop()
+        shared_executor = ThreadPoolExecutor(max_workers=1)
+        loop.set_default_executor(shared_executor)
+        blocked = loop.run_in_executor(None, occupy_default_worker)
+        try:
+            for _ in range(100):
+                if entered.is_set():
+                    break
+                await asyncio.sleep(0.01)
+            assert entered.is_set()
+            async with app.router.lifespan_context(app):
+                async with AsyncClient(
+                    transport=ASGITransport(app=app), base_url="http://testserver"
+                ) as client:
+                    issued = await asyncio.wait_for(
+                        client.post(
+                            "/api/v1/auth/login",
+                            json={
+                                "username": "test.owner",
+                                "password": "synthetic login isolation password",
+                            },
+                        ),
+                        timeout=4,
+                    )
+                    assert issued.status_code == 200
+                    assert issued.headers["Cache-Control"] == "no-store"
+                    assert issued.json()["session_token"]
+                    denied = await asyncio.wait_for(
+                        client.post(
+                            "/api/v1/auth/login",
+                            json={"username": "test.owner", "password": "invalid"},
+                        ),
+                        timeout=4,
+                    )
+                    assert denied.status_code == 401
+        finally:
+            released.set()
+            await blocked
+            shared_executor.shutdown(wait=True)
+
+    asyncio.run(exercise())
