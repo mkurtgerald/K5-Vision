@@ -23,119 +23,139 @@ jobs:
         GH_TOKEN: ${{ github.token }}
       run: |
         $ErrorActionPreference = 'Stop'
-        if ($env:GITHUB_REPOSITORY -cne 'mkurtgerald/K5-Vision' -or
-            $env:RUNNER_OS -cne 'Windows' -or $env:RUNNER_ENVIRONMENT -cne 'github-hosted') {
-          throw 'This diagnostic requires the owned disposable Windows runner'
-        }
+        if ($env:GITHUB_REPOSITORY -cne 'mkurtgerald/K5-Vision' -or $env:RUNNER_OS -cne 'Windows' -or $env:RUNNER_ENVIRONMENT -cne 'github-hosted') { throw 'Wrong diagnostic host' }
         function Send-ProbeStatus {
-          param([string]$State, [string]$Description, [string]$TargetUrl = '')
-          $body = @{state=$State; context='k5-private-transport-diag'; description=$Description}
+          param([string]$State,[string]$Description,[string]$TargetUrl='')
+          $body=@{state=$State;context='k5-private-transport-diag';description=$Description}
           if ($TargetUrl) {
-            if ($TargetUrl -cnotmatch '^https://[a-z0-9]+(?:-[a-z0-9]+)*\.trycloudflare\.com$') {
-              throw 'Unexpected tunnel endpoint'
-            }
-            $body.target_url = $TargetUrl
+            if ($TargetUrl -cnotmatch '^https://[a-z0-9]+(?:-[a-z0-9]+)*\.trycloudflare\.com$') { throw 'Wrong endpoint shape' }
+            $body.target_url=$TargetUrl
           }
-          $headers = @{Authorization=('Bearer ' + $env:GH_TOKEN); Accept='application/vnd.github+json'; 'X-GitHub-Api-Version'='2022-11-28'}
-          $null = Invoke-RestMethod -Method Post -Uri ('https://api.github.com/repos/mkurtgerald/K5-Vision/statuses/' + $env:GITHUB_SHA) -Headers $headers -ContentType application/json -Body ($body | ConvertTo-Json -Compress) -TimeoutSec 30
+          $headers=@{Authorization=('Bearer '+$env:GH_TOKEN);Accept='application/vnd.github+json';'X-GitHub-Api-Version'='2022-11-28'}
+          $null=Invoke-RestMethod -Method Post -Uri ('https://api.github.com/repos/mkurtgerald/K5-Vision/statuses/'+$env:GITHUB_SHA) -Headers $headers -ContentType application/json -Body ($body|ConvertTo-Json -Compress) -TimeoutSec 20
         }
-        $work = Join-Path $env:RUNNER_TEMP ('k5-private-transport-diag-' + $env:GITHUB_RUN_ID + '-' + $env:GITHUB_RUN_ATTEMPT)
-        if (Test-Path -LiteralPath $work) { throw 'Diagnostic work directory already exists' }
-        New-Item -ItemType Directory -Path $work | Out-Null
-        $executable = Join-Path $work 'cloudflared-windows-amd64.exe'
-        $listener = $null
-        $tunnel = $null
-        $endpoint = ''
+        $stage='download';$reason='download_failed';$endpoint='';$listener=$null;$tunnel=$null
+        function Set-ProbeStage {
+          param([string]$Name)
+          if ($Name -cnotin @('download','hash','version','listen','tunnelallocate','hold')) { throw 'Wrong stage' }
+          $script:stage=$Name
+          Write-Host ('DIAG_STAGE='+$Name)
+          Send-ProbeStatus -State pending -Description ('Stage '+$Name+'; fixed refusal only; no files') -TargetUrl $script:endpoint
+        }
+        function Get-ProviderReason {
+          param([string]$LogPath)
+          if (-not (Test-Path -LiteralPath $LogPath)) {return 'provider_no_log'}
+          $text=[IO.File]::ReadAllText($LogPath)
+          if ($text -match '(?i)\b403\b|forbidden') {return 'provider_http403'}
+          if ($text -match '(?i)\b429\b|too many requests') {return 'provider_http429'}
+          if ($text -match '(?i)\b502\b|\b503\b|\b504\b') {return 'provider_http5xx'}
+          if ($text -match '(?i)tls|certificate|x509') {return 'provider_tls_failure'}
+          if ($text -match '(?i)refused|timeout|timed out|deadline exceeded|unreachable') {return 'provider_connection_failure'}
+          if ($text -match '(?i)failed.*request.*quick.*tunnel|failed.*register') {return 'provider_registration_failure'}
+          return 'provider_allocation_failure'
+        }
+        $work=Join-Path $env:RUNNER_TEMP ('k5-private-transport-diag-'+$env:GITHUB_RUN_ID+'-'+$env:GITHUB_RUN_ATTEMPT)
+        if (Test-Path -LiteralPath $work) {throw 'Diagnostic directory exists'}
+        New-Item -ItemType Directory -Path $work|Out-Null
+        $executable=Join-Path $work 'cloudflared-windows-amd64.exe'
+        $stdout=Join-Path $work 'tunnel.stdout.log';$stderr=Join-Path $work 'tunnel.stderr.log'
         try {
-          $url = 'https://github.com/cloudflare/cloudflared/releases/download/2026.11.2/cloudflared-windows-amd64.exe'
-          Invoke-WebRequest -Uri $url -OutFile $executable -TimeoutSec 180
-          if ((Get-Item -LiteralPath $executable).Length -ne 55470800 -or
-              (Get-FileHash -LiteralPath $executable -Algorithm SHA256).Hash.ToLowerInvariant() -cne '555b46c85582461d189cac30d14ad05480d612613801be9f110b8ce08c5b2113') {
-            throw 'Pinned diagnostic executable identity differs'
+          Set-ProbeStage download
+          Invoke-WebRequest -Uri 'https://github.com/cloudflare/cloudflared/releases/download/2026.11.2/cloudflared-windows-amd64.exe' -OutFile $executable -TimeoutSec 180
+          Set-ProbeStage hash;$reason='binary_identity_failed'
+          if ((Get-Item -LiteralPath $executable).Length -ne 55470800 -or (Get-FileHash -LiteralPath $executable -Algorithm SHA256).Hash.ToLowerInvariant() -cne '555b46c85582461d189cac30d14ad05480d612613801be9f110b8ce08c5b2113') {throw 'Identity failure'}
+          Set-ProbeStage version;$reason='binary_version_failed'
+          $version=& $executable --version 2>&1
+          $exitCode=$LASTEXITCODE
+          $line=($version -join ' ').Trim()
+          $safe=[regex]::Replace($line,'[^A-Za-z0-9 .():+/_-]','?')
+          Write-Host ('DIAG_VERSION='+$safe.Substring(0,[Math]::Min(220,$safe.Length)))
+          if ($exitCode -ne 0 -or $line -cnotmatch '^cloudflared version 2026\.11\.2(?:\s|$)') {throw 'Version failure'}
+          Set-ProbeStage listen;$reason='listener_start_failed'
+          if (@(Get-NetTCPConnection -LocalPort 39091 -State Listen -ErrorAction SilentlyContinue).Count -ne 0) {$reason='listener_port_in_use';throw 'Port in use'}
+          Add-Type -TypeDefinition @'
+        using System;
+        using System.Net;
+        using System.Text;
+        using System.Threading;
+        public sealed class K5DiagRefusalServer : IDisposable {
+          private readonly HttpListener server = new HttpListener();
+          private readonly Thread worker;
+          private volatile bool stopping;
+          private volatile bool failed;
+          public bool Healthy { get { return !stopping && !failed && server.IsListening; } }
+          public K5DiagRefusalServer() {
+            server.Prefixes.Add("http://127.0.0.1:39091/");
+            server.IgnoreWriteExceptions = true;
+            server.Start();
+            worker = new Thread(Serve);
+            worker.IsBackground = true;
+            worker.Start();
           }
-          $version = & $executable --version 2>&1
-          if ($LASTEXITCODE -ne 0 -or ($version -join "`n") -cnotmatch '^cloudflared version 2026\.11\.2(?:\s|$)') {
-            throw 'Pinned diagnostic executable version differs'
-          }
-          if (@(Get-NetTCPConnection -LocalPort 39091 -State Listen -ErrorAction SilentlyContinue).Count -ne 0) {
-            throw 'Diagnostic loopback port already has a listener'
-          }
-          $listener = Start-Job -ScriptBlock {
-            $ErrorActionPreference = 'Stop'
-            $server = [Net.HttpListener]::new()
-            $server.Prefixes.Add('http://127.0.0.1:39091/')
-            $server.IgnoreWriteExceptions = $true
-            $body = [Text.Encoding]::UTF8.GetBytes('{"error":"authentication_required"}')
+          private void Serve() {
+            byte[] body = Encoding.UTF8.GetBytes("{\"error\":\"authentication_required\"}");
             try {
-              $server.Start()
-              while ($server.IsListening) {
-                $context = $server.GetContext()
+              while (!stopping) {
+                HttpListenerContext context = server.GetContext();
                 try {
-                  $context.Response.StatusCode = 401
-                  $context.Response.ContentType = 'application/json'
-                  $context.Response.Headers['Cache-Control'] = 'private, no-store'
-                  $context.Response.Headers['WWW-Authenticate'] = 'Bearer'
-                  $context.Response.ContentLength64 = $body.Length
-                  if ($context.Request.HttpMethod -cne 'HEAD') {
-                    $context.Response.OutputStream.Write($body, 0, $body.Length)
-                  }
-                } finally { $context.Response.Close() }
+                  context.Response.StatusCode = 401;
+                  context.Response.ContentType = "application/json";
+                  context.Response.Headers["Cache-Control"] = "private, no-store";
+                  context.Response.Headers["WWW-Authenticate"] = "Bearer";
+                  context.Response.KeepAlive = false;
+                  context.Response.ContentLength64 = body.Length;
+                  if (context.Request.HttpMethod != "HEAD") context.Response.OutputStream.Write(body,0,body.Length);
+                } finally { context.Response.Close(); }
               }
-            } finally { $server.Close() }
+            } catch { if (!stopping) failed=true; }
           }
-          $localReady = $false
-          for ($attempt=0; $attempt -lt 30; $attempt++) {
-            try {
-              $probe = Invoke-WebRequest -Uri 'http://127.0.0.1:39091/' -TimeoutSec 3 -SkipHttpErrorCheck
-              if ($probe.StatusCode -eq 401 -and $probe.Content -ceq '{"error":"authentication_required"}') {
-                $localReady = $true
-                break
-              }
-            } catch {}
-            if ($listener.State -eq 'Failed') { break }
-            Start-Sleep -Seconds 1
+          public void Dispose() {
+            stopping=true;
+            try { server.Stop(); } catch {}
+            try { server.Close(); } catch {}
+            if (worker!=null) worker.Join(1500);
           }
-          if (-not $localReady) { throw 'Fixed refusal origin did not start' }
-          $stdout = Join-Path $work 'tunnel.stdout.log'
-          $stderr = Join-Path $work 'tunnel.stderr.log'
-          $tunnel = Start-Process -FilePath $executable -ArgumentList @('tunnel','--url','http://127.0.0.1:39091','--protocol','http2','--edge-ip-version','4','--http-host-header','127.0.0.1:39091','--no-autoupdate','--loglevel','info') -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru -WindowStyle Hidden
-          $deadline = [DateTime]::UtcNow.AddMinutes(3)
+        }
+        '@
+          $listener=[K5DiagRefusalServer]::new()
+          $probe=Invoke-WebRequest -Uri 'http://127.0.0.1:39091/' -TimeoutSec 5 -SkipHttpErrorCheck
+          if ($probe.StatusCode -ne 401) {$reason='listener_not401';throw 'Wrong refusal'}
+          $content=$probe.Content
+          if ($content -is [byte[]]) {$content=[Text.Encoding]::UTF8.GetString($content)}
+          if ([string]$content -cne '{"error":"authentication_required"}') {$reason='listener_body_differed';throw 'Wrong refusal body'}
+          Write-Host 'DIAG_ORIGIN=fixed401_verified'
+          Set-ProbeStage tunnelallocate;$reason='provider_allocation_failure'
+          $tunnel=Start-Process -FilePath $executable -ArgumentList @('tunnel','--url','http://127.0.0.1:39091','--protocol','http2','--edge-ip-version','4','--http-host-header','127.0.0.1:39091','--no-autoupdate','--loglevel','info') -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru -WindowStyle Hidden
+          $deadline=[DateTime]::UtcNow.AddMinutes(3)
           while ([DateTime]::UtcNow -lt $deadline) {
-            $tunnel.Refresh()
-            $text = ''
-            foreach ($file in @($stdout,$stderr)) {
-              if (Test-Path -LiteralPath $file) { $text += [IO.File]::ReadAllText($file) }
-            }
-            $match = [regex]::Match($text, 'https://[a-z0-9]+(?:-[a-z0-9]+)*\.trycloudflare\.com')
-            if ($match.Success) {
-              $endpoint = $match.Value
-              break
-            }
-            if ($tunnel.HasExited) { throw 'Quick tunnel exited before endpoint allocation' }
+            $tunnel.Refresh();$text=''
+            foreach ($file in @($stdout,$stderr)) {if (Test-Path -LiteralPath $file) {$text+=[IO.File]::ReadAllText($file)}}
+            $match=[regex]::Match($text,'https://[a-z0-9]+(?:-[a-z0-9]+)*\.trycloudflare\.com')
+            if ($match.Success) {$endpoint=$match.Value;break}
+            if ($tunnel.HasExited) {$reason=Get-ProviderReason $stderr;throw 'Provider exited'}
             Start-Sleep -Seconds 2
           }
-          if (-not $endpoint) { throw 'Quick tunnel endpoint allocation timed out' }
-          Send-ProbeStatus -State pending -Description 'Fixed 401-only origin; no files served; probe active' -TargetUrl $endpoint
-          Write-Host ('Fixed-refusal transport probe active: ' + $endpoint)
-          $holdDeadline = [DateTime]::UtcNow.AddMinutes(40)
-          while ([DateTime]::UtcNow -lt $holdDeadline) {
+          if (-not $endpoint) {$reason=Get-ProviderReason $stderr;throw 'Provider deadline'}
+          Set-ProbeStage hold;$reason='provider_stopped'
+          Write-Host ('DIAG_ENDPOINT='+$endpoint)
+          $deadline=[DateTime]::UtcNow.AddMinutes(40)
+          while ([DateTime]::UtcNow -lt $deadline) {
             $tunnel.Refresh()
-            if ($tunnel.HasExited -or $listener.State -eq 'Failed') { throw 'Diagnostic transport stopped' }
+            if ($tunnel.HasExited -or -not $listener.Healthy) {throw 'Probe stopped'}
             Start-Sleep -Seconds 10
           }
-          Send-ProbeStatus -State success -Description 'Fixed-refusal transport probe completed; no build files served' -TargetUrl $endpoint
+          Send-ProbeStatus -State success -Description 'Refusal-only transport probe completed; no files served' -TargetUrl $endpoint
         } catch {
-          try { Send-ProbeStatus -State failure -Description 'Transport diagnostic failed; no build files exposed' -TargetUrl $endpoint } catch {}
-          throw 'Windows connectivity diagnostic failed; no build files were exposed'
+          $httpCode=0
+          try {$httpCode=[int]$_.Exception.Response.StatusCode} catch {}
+          if ($httpCode -ge 400 -and $httpCode -le 599) {$reason=('http'+$httpCode)}
+          Write-Host ('DIAG_FAILURE_STAGE='+$stage+' REASON='+$reason)
+          try {Send-ProbeStatus -State failure -Description ('Failed stage '+$stage+': '+$reason+'; no files') -TargetUrl $endpoint} catch {}
+          throw ('Connectivity diagnostic failed at '+$stage+' ('+$reason+'); no files exposed')
         } finally {
           if ($null -ne $tunnel) {
-            try {
-              $tunnel.Refresh()
-              if (-not $tunnel.HasExited) { $tunnel.Kill($true); $null = $tunnel.WaitForExit(10000) }
-            } catch {}
+            try {$tunnel.Refresh();if (-not $tunnel.HasExited) {$tunnel.Kill($true);$null=$tunnel.WaitForExit(1500)}} catch {}
           }
-          if ($null -ne $listener) {
-            Stop-Job -Job $listener -ErrorAction SilentlyContinue
-            Remove-Job -Job $listener -Force -ErrorAction SilentlyContinue
-          }
+          if ($null -ne $listener) {try {$listener.Dispose()} catch {}}
+          Write-Host 'DIAG_CLEANUP=owned_listener_and_tunnel_closed'
         }
