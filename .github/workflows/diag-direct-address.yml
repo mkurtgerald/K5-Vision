@@ -1,0 +1,74 @@
+name: Private Windows owned-compute address metadata diagnostic
+'on':
+  push:
+    branches:
+    - codex/private-direct-address-20261127
+    paths:
+    - .github/workflows/diag-direct-address.yml
+  workflow_dispatch: null
+permissions:
+  contents: read
+  statuses: write
+jobs:
+  address-probe:
+    runs-on: windows-2025
+    timeout-minutes: 3
+    steps:
+    - name: Read only owned public address metadata and IPv6 availability
+      shell: pwsh
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        $ErrorActionPreference='Stop'
+        if ($env:GITHUB_REPOSITORY -cne 'mkurtgerald/K5-Vision' -or $env:RUNNER_OS -cne 'Windows' -or $env:RUNNER_ENVIRONMENT -cne 'github-hosted') {throw 'Wrong diagnostic host'}
+        function Test-PublicIPv4 {
+          param([Net.IPAddress]$Address)
+          if ($Address.AddressFamily -ne [Net.Sockets.AddressFamily]::InterNetwork) {return $false}
+          $b=$Address.GetAddressBytes()
+          if ($b[0] -eq 0 -or $b[0] -eq 10 -or $b[0] -eq 127 -or $b[0] -ge 224) {return $false}
+          if ($b[0] -eq 100 -and $b[1] -ge 64 -and $b[1] -le 127) {return $false}
+          if ($b[0] -eq 169 -and $b[1] -eq 254) {return $false}
+          if ($b[0] -eq 172 -and $b[1] -ge 16 -and $b[1] -le 31) {return $false}
+          if ($b[0] -eq 192 -and (($b[1] -eq 168) -or ($b[1] -eq 0 -and $b[2] -in @(0,2)) -or ($b[1] -eq 88 -and $b[2] -eq 99))) {return $false}
+          if ($b[0] -eq 198 -and (($b[1] -in @(18,19)) -or ($b[1] -eq 51 -and $b[2] -eq 100))) {return $false}
+          if ($b[0] -eq 203 -and $b[1] -eq 0 -and $b[2] -eq 113) {return $false}
+          return $true
+        }
+        function Test-GlobalIPv6 {
+          param([Net.IPAddress]$Address)
+          if ($Address.AddressFamily -ne [Net.Sockets.AddressFamily]::InterNetworkV6 -or $Address.IsIPv6LinkLocal -or $Address.IsIPv6SiteLocal -or $Address.IsIPv6Multicast -or $Address.IsIPv4MappedToIPv6 -or [Net.IPAddress]::IsLoopback($Address)) {return $false}
+          $b=$Address.GetAddressBytes()
+          if (($b[0] -band 224) -ne 32) {return $false}
+          if ($b[0] -eq 32 -and $b[1] -eq 1 -and $b[2] -eq 13 -and $b[3] -eq 184) {return $false}
+          if ($b[0] -eq 32 -and $b[1] -eq 1 -and $b[2] -lt 2) {return $false}
+          return $true
+        }
+        $hasPublicIPv4=$false;$hasGlobalIPv6=$false;$publicIPv4='';$metadataRead=$false;$ipv6Read=$false
+        try {
+          # Exactly one noncredential field on this owned Azure Windows compute.
+          # No identity, token, secrets, arbitrary paths, or complete metadata requests.
+          $response=Invoke-WebRequest -Uri 'http://169.254.169.254/metadata/instance/network/interface/0/ipv4/ipAddress/0/publicIpAddress?api-version=2021-02-01&format=text' -Headers @{Metadata='true'} -TimeoutSec 5
+          $raw=$response.Content
+          if ($raw -is [byte[]]) {$raw=[Text.Encoding]::UTF8.GetString($raw)}
+          if ($response.StatusCode -eq 200 -and ([string]$raw).Length -le 64) {
+            $metadataRead=$true
+            $value=([string]$raw).Trim();$address=$null
+            if ($value -and [Net.IPAddress]::TryParse($value,[ref]$address) -and $address.ToString() -ceq $value -and (Test-PublicIPv4 $address)) {$hasPublicIPv4=$true;$publicIPv4=$value}
+          }
+        } catch {} finally {$response=$null;$raw=$null;$value=$null;$address=$null}
+        try {
+          $records=@(Get-NetIPAddress -AddressFamily IPv6 -Type Unicast -ErrorAction Stop)
+          $ipv6Read=$true
+          foreach ($record in $records) {
+            $address=$null
+            if ($record.AddressState -eq 'Preferred' -and [Net.IPAddress]::TryParse($record.IPAddress,[ref]$address) -and (Test-GlobalIPv6 $address)) {$hasGlobalIPv6=$true;break}
+          }
+        } catch {} finally {$records=$null;$record=$null;$address=$null}
+        $description='hasPublicIPv4='+$hasPublicIPv4.ToString().ToLowerInvariant()+' hasGlobalIPv6='+$hasGlobalIPv6.ToString().ToLowerInvariant()
+        Write-Host $description
+        $state=if ($metadataRead -and $ipv6Read) {'success'} else {'failure'}
+        $body=@{state=$state;context='k5-private-direct-address';description=$description}
+        if ($hasPublicIPv4) {$body.target_url='http://'+$publicIPv4}
+        $headers=@{Authorization=('Bearer '+$env:GH_TOKEN);Accept='application/vnd.github+json';'X-GitHub-Api-Version'='2022-11-28'}
+        $null=Invoke-RestMethod -Method Post -Uri ('https://api.github.com/repos/mkurtgerald/K5-Vision/statuses/'+$env:GITHUB_SHA) -Headers $headers -ContentType application/json -Body ($body|ConvertTo-Json -Compress) -TimeoutSec 20
+        if (-not ($metadataRead -and $ipv6Read)) {throw 'Bounded address diagnostic could not complete both read-only checks'}
