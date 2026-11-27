@@ -1,0 +1,141 @@
+name: Private Windows transport connectivity diagnostic
+'on':
+  push:
+    branches:
+    - codex/private-transport-diag-20261127
+    paths:
+    - .github/workflows/diag-windows-connectivity.yml
+  workflow_dispatch: null
+permissions:
+  contents: read
+  statuses: write
+concurrency:
+  group: private-transport-diag-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  transport-probe:
+    runs-on: windows-2025
+    timeout-minutes: 48
+    steps:
+    - name: Probe Windows QuickTunnel against a fixed refusal-only loopback origin
+      shell: pwsh
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+        if ($env:GITHUB_REPOSITORY -cne 'mkurtgerald/K5-Vision' -or
+            $env:RUNNER_OS -cne 'Windows' -or $env:RUNNER_ENVIRONMENT -cne 'github-hosted') {
+          throw 'This diagnostic requires the owned disposable Windows runner'
+        }
+        function Send-ProbeStatus {
+          param([string]$State, [string]$Description, [string]$TargetUrl = '')
+          $body = @{state=$State; context='k5-private-transport-diag'; description=$Description}
+          if ($TargetUrl) {
+            if ($TargetUrl -cnotmatch '^https://[a-z0-9]+(?:-[a-z0-9]+)*\.trycloudflare\.com$') {
+              throw 'Unexpected tunnel endpoint'
+            }
+            $body.target_url = $TargetUrl
+          }
+          $headers = @{Authorization=('Bearer ' + $env:GH_TOKEN); Accept='application/vnd.github+json'; 'X-GitHub-Api-Version'='2022-11-28'}
+          $null = Invoke-RestMethod -Method Post -Uri ('https://api.github.com/repos/mkurtgerald/K5-Vision/statuses/' + $env:GITHUB_SHA) -Headers $headers -ContentType application/json -Body ($body | ConvertTo-Json -Compress) -TimeoutSec 30
+        }
+        $work = Join-Path $env:RUNNER_TEMP ('k5-private-transport-diag-' + $env:GITHUB_RUN_ID + '-' + $env:GITHUB_RUN_ATTEMPT)
+        if (Test-Path -LiteralPath $work) { throw 'Diagnostic work directory already exists' }
+        New-Item -ItemType Directory -Path $work | Out-Null
+        $executable = Join-Path $work 'cloudflared-windows-amd64.exe'
+        $listener = $null
+        $tunnel = $null
+        $endpoint = ''
+        try {
+          $url = 'https://github.com/cloudflare/cloudflared/releases/download/2026.11.2/cloudflared-windows-amd64.exe'
+          Invoke-WebRequest -Uri $url -OutFile $executable -TimeoutSec 180
+          if ((Get-Item -LiteralPath $executable).Length -ne 55470800 -or
+              (Get-FileHash -LiteralPath $executable -Algorithm SHA256).Hash.ToLowerInvariant() -cne '555b46c85582461d189cac30d14ad05480d612613801be9f110b8ce08c5b2113') {
+            throw 'Pinned diagnostic executable identity differs'
+          }
+          $version = & $executable --version 2>&1
+          if ($LASTEXITCODE -ne 0 -or ($version -join "`n") -cnotmatch '^cloudflared version 2026\.11\.2(?:\s|$)') {
+            throw 'Pinned diagnostic executable version differs'
+          }
+          if (@(Get-NetTCPConnection -LocalPort 39091 -State Listen -ErrorAction SilentlyContinue).Count -ne 0) {
+            throw 'Diagnostic loopback port already has a listener'
+          }
+          $listener = Start-Job -ScriptBlock {
+            $ErrorActionPreference = 'Stop'
+            $server = [Net.HttpListener]::new()
+            $server.Prefixes.Add('http://127.0.0.1:39091/')
+            $server.IgnoreWriteExceptions = $true
+            $body = [Text.Encoding]::UTF8.GetBytes('{"error":"authentication_required"}')
+            try {
+              $server.Start()
+              while ($server.IsListening) {
+                $context = $server.GetContext()
+                try {
+                  $context.Response.StatusCode = 401
+                  $context.Response.ContentType = 'application/json'
+                  $context.Response.Headers['Cache-Control'] = 'private, no-store'
+                  $context.Response.Headers['WWW-Authenticate'] = 'Bearer'
+                  $context.Response.ContentLength64 = $body.Length
+                  if ($context.Request.HttpMethod -cne 'HEAD') {
+                    $context.Response.OutputStream.Write($body, 0, $body.Length)
+                  }
+                } finally { $context.Response.Close() }
+              }
+            } finally { $server.Close() }
+          }
+          $localReady = $false
+          for ($attempt=0; $attempt -lt 30; $attempt++) {
+            try {
+              $probe = Invoke-WebRequest -Uri 'http://127.0.0.1:39091/' -TimeoutSec 3 -SkipHttpErrorCheck
+              if ($probe.StatusCode -eq 401 -and $probe.Content -ceq '{"error":"authentication_required"}') {
+                $localReady = $true
+                break
+              }
+            } catch {}
+            if ($listener.State -eq 'Failed') { break }
+            Start-Sleep -Seconds 1
+          }
+          if (-not $localReady) { throw 'Fixed refusal origin did not start' }
+          $stdout = Join-Path $work 'tunnel.stdout.log'
+          $stderr = Join-Path $work 'tunnel.stderr.log'
+          $tunnel = Start-Process -FilePath $executable -ArgumentList @('tunnel','--url','http://127.0.0.1:39091','--protocol','http2','--edge-ip-version','4','--http-host-header','127.0.0.1:39091','--no-autoupdate','--loglevel','info') -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru -WindowStyle Hidden
+          $deadline = [DateTime]::UtcNow.AddMinutes(3)
+          while ([DateTime]::UtcNow -lt $deadline) {
+            $tunnel.Refresh()
+            $text = ''
+            foreach ($file in @($stdout,$stderr)) {
+              if (Test-Path -LiteralPath $file) { $text += [IO.File]::ReadAllText($file) }
+            }
+            $match = [regex]::Match($text, 'https://[a-z0-9]+(?:-[a-z0-9]+)*\.trycloudflare\.com')
+            if ($match.Success) {
+              $endpoint = $match.Value
+              break
+            }
+            if ($tunnel.HasExited) { throw 'Quick tunnel exited before endpoint allocation' }
+            Start-Sleep -Seconds 2
+          }
+          if (-not $endpoint) { throw 'Quick tunnel endpoint allocation timed out' }
+          Send-ProbeStatus -State pending -Description 'Fixed 401-only origin; no files served; probe active' -TargetUrl $endpoint
+          Write-Host ('Fixed-refusal transport probe active: ' + $endpoint)
+          $holdDeadline = [DateTime]::UtcNow.AddMinutes(40)
+          while ([DateTime]::UtcNow -lt $holdDeadline) {
+            $tunnel.Refresh()
+            if ($tunnel.HasExited -or $listener.State -eq 'Failed') { throw 'Diagnostic transport stopped' }
+            Start-Sleep -Seconds 10
+          }
+          Send-ProbeStatus -State success -Description 'Fixed-refusal transport probe completed; no build files served' -TargetUrl $endpoint
+        } catch {
+          try { Send-ProbeStatus -State failure -Description 'Transport diagnostic failed; no build files exposed' -TargetUrl $endpoint } catch {}
+          throw 'Windows connectivity diagnostic failed; no build files were exposed'
+        } finally {
+          if ($null -ne $tunnel) {
+            try {
+              $tunnel.Refresh()
+              if (-not $tunnel.HasExited) { $tunnel.Kill($true); $null = $tunnel.WaitForExit(10000) }
+            } catch {}
+          }
+          if ($null -ne $listener) {
+            Stop-Job -Job $listener -ErrorAction SilentlyContinue
+            Remove-Job -Job $listener -Force -ErrorAction SilentlyContinue
+          }
+        }
